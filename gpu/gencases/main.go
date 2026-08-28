@@ -1,0 +1,293 @@
+// gencases translates the 256-case byte-op switch in AstroBWTv3's pow.go into
+// CUDA and writes gpu/stage1_cases.inc.
+//
+//	go run ./gpu/gencases -pow ../derohe-main/astrobwt/astrobwtv3/pow.go -out gpu/stage1_cases.inc
+//
+// Hand-porting 2,300 lines of near-identical Go would be a transcription-error
+// machine. Generating instead makes the port auditable: every source line has
+// to match one of the known op forms exactly, and an unrecognised line is a
+// hard error rather than a quietly wrong hash. Re-run it if pow.go ever moves.
+//
+// The output is a plain statement block, not a macro, so it is included inside
+// the stage-1 loop body and stays readable in compiler diagnostics.
+package main
+
+import (
+	"bufio"
+	"flag"
+	"fmt"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+)
+
+// storeMarker stands in for "flush the register copy of step_3[i] here".
+// rawPrefix marks a line that is emitted verbatim and does not touch x, so it
+// neither dirties the register copy nor forces it to be reloaded.
+const (
+	storeMarker = "\x00store"
+	rawPrefix   = "\x01"
+)
+
+// The whole in-loop vocabulary. Survey of pow.go: 18 forms, nothing else.
+// "x" is the working copy of step_3[i]; "s" is step_3.
+var ops = map[string]string{
+	`step_3[i] = step_3[i] ^ byte(bits.OnesCount8(step_3[i]))`: `x ^= (uint8_t)__popc(x);`,
+	`step_3[i] = bits.RotateLeft8(step_3[i], 1)`:               `x = rotl8(x, 1);`,
+	`step_3[i] = bits.RotateLeft8(step_3[i], 2)`:               `x = rotl8(x, 2);`,
+	`step_3[i] = bits.RotateLeft8(step_3[i], 3)`:               `x = rotl8(x, 3);`,
+	`step_3[i] = bits.RotateLeft8(step_3[i], 4)`:               `x = rotl8(x, 4);`,
+	`step_3[i] = bits.RotateLeft8(step_3[i], 5)`:               `x = rotl8(x, 5);`,
+	`step_3[i] = bits.RotateLeft8(step_3[i], int(step_3[i]))`:  `x = rotl8(x, x & 7);`,
+	`step_3[i] = step_3[i] ^ bits.RotateLeft8(step_3[i], 2)`:   `x ^= rotl8(x, 2);`,
+	`step_3[i] = step_3[i] ^ bits.RotateLeft8(step_3[i], 4)`:   `x ^= rotl8(x, 4);`,
+	`step_3[i] = bits.Reverse8(step_3[i])`:                     `x = rev8(x);`,
+	`step_3[i] = step_3[i] << (step_3[i] & 3)`:                 `x = (uint8_t)(x << (x & 3));`,
+	`step_3[i] = step_3[i] >> (step_3[i] & 3)`:                 `x = (uint8_t)(x >> (x & 3));`,
+	`step_3[i] = step_3[i] ^ step_3[pos2]`:                     `x ^= s[pos2];`,
+	`step_3[i] = step_3[i] & step_3[pos2]`:                     `x &= s[pos2];`,
+	`step_3[i] += step_3[i]`:                                   `x = (uint8_t)(x + x);`,
+	`step_3[i] *= step_3[i]`:                                   `x = (uint8_t)(x * x);`,
+	`step_3[i] = ^step_3[i]`:                                   `x = (uint8_t)(~x);`,
+	`step_3[i] -= (step_3[i] ^ 97)`:                            `x = (uint8_t)(x - (uint8_t)(x ^ 97));`,
+}
+
+// Statements that are not plain byte ops. These touch state outside step_3[i],
+// so the register copy is flushed first.
+var specials = map[string][]string{
+	`step_3[pos2], step_3[pos1] = bits.Reverse8(step_3[pos1]), bits.Reverse8(step_3[pos2])`: {
+		storeMarker,
+		rawPrefix + `{ uint8_t a = rev8(s[pos1]), b = rev8(s[pos2]); s[pos2] = a; s[pos1] = b; }`,
+	},
+	`prev_lhash = lhash + prev_lhash`:     {rawPrefix + `prev_lhash = lhash + prev_lhash;`},
+	`lhash = xxhash.Sum64(step_3[:pos2])`: {storeMarker, rawPrefix + `lhash = xxhash64(s, pos2);`},
+}
+
+// Statements legal only before the loop.
+var preLoop = map[string]string{
+	`rc4s = NewCipher(step_3[:])`: `rc4Init(&rc4s, s, 256);`,
+}
+
+// Lines that exist only for CPU instrumentation or bounds-check elimination.
+var ignored = map[string]bool{
+	`ops[op]++`:                   true,
+	`_ = step_3[pos1:pos2]`:       true,
+	`if CALCULATE_DISTRIBUTION {`: true,
+}
+
+var caseRe = regexp.MustCompile(`^case ([0-9, ]+):$`)
+
+type caseBlock struct {
+	labels []int
+	pre    []string // emitted before the for loop
+	body   []string // emitted inside the for loop
+}
+
+func main() {
+	pow := flag.String("pow", "../derohe-main/astrobwt/astrobwtv3/pow.go", "path to pow.go")
+	out := flag.String("out", "gpu/stage1_cases.inc", "output include")
+	flag.Parse()
+
+	raw, err := os.ReadFile(*pow)
+	if err != nil {
+		die(err)
+	}
+	lines := strings.Split(string(raw), "\n")
+
+	start, end := -1, -1
+	for i, l := range lines {
+		t := strings.TrimSpace(l)
+		if t == "switch op {" && start < 0 {
+			start = i + 1
+		}
+		if start >= 0 && t == "default:" {
+			end = i
+			break
+		}
+	}
+	if start < 0 || end < 0 {
+		die(fmt.Errorf("could not locate the op switch in %s", *pow))
+	}
+
+	blocks, err := parse(lines, start, end)
+	if err != nil {
+		die(err)
+	}
+
+	seen := map[int]bool{}
+	for _, b := range blocks {
+		for _, l := range b.labels {
+			if seen[l] {
+				die(fmt.Errorf("duplicate case %d", l))
+			}
+			seen[l] = true
+		}
+	}
+	missing := 0
+	for i := 0; i < 256; i++ {
+		if !seen[i] {
+			missing++
+		}
+	}
+
+	f, err := os.Create(*out)
+	if err != nil {
+		die(err)
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+
+	header := "" +
+		"// stage1_cases.inc -- GENERATED by gpu/gencases. Do not edit.\n" +
+		"//\n" +
+		"// Source: %s, the op switch at lines %d-%d.\n" +
+		"// %d case labels covered; %d fall through to the no-op default, as in Go.\n" +
+		"//\n" +
+		"// Included inside the stage-1 loop body, which must provide:\n" +
+		"//   uint8_t*  s                  step_3, 256 bytes\n" +
+		"//   uint8_t   op, pos1, pos2\n" +
+		"//   uint64_t  lhash, prev_lhash\n" +
+		"//   RC4       rc4s\n" +
+		"// plus rotl8/rev8/xxhash64/rc4Init from stage1.cuh.\n" +
+		"//\n" +
+		"// pos1 <= pos2 always holds, so the uint8_t loop counter cannot wrap.\n" +
+		"\nswitch (op) {\n"
+	fmt.Fprintf(w, header, *pow, start+1, end, len(seen), missing)
+
+	for _, b := range blocks {
+		emit(w, b)
+	}
+	fmt.Fprintln(w, "default: break;")
+	fmt.Fprintln(w, "}")
+
+	if err := w.Flush(); err != nil {
+		die(err)
+	}
+	fmt.Fprintf(os.Stderr, "wrote %s: %d case labels in %d blocks, %d default\n",
+		*out, len(seen), len(blocks), missing)
+}
+
+func parse(lines []string, start, end int) ([]*caseBlock, error) {
+	var blocks []*caseBlock
+	var cur *caseBlock
+	inLoop := false
+
+	for ln := start; ln < end; ln++ {
+		t := clean(lines[ln])
+		if t == "" {
+			continue
+		}
+
+		if m := caseRe.FindStringSubmatch(t); m != nil {
+			cur = &caseBlock{}
+			for _, fld := range strings.Split(m[1], ",") {
+				fld = strings.TrimSpace(fld)
+				if fld == "" {
+					continue
+				}
+				n, err := strconv.Atoi(fld)
+				if err != nil {
+					return nil, fmt.Errorf("line %d: bad case label %q", ln+1, fld)
+				}
+				cur.labels = append(cur.labels, n)
+			}
+			blocks = append(blocks, cur)
+			inLoop = false
+			continue
+		}
+		if cur == nil {
+			continue // preamble between "switch op {" and "case 0:"
+		}
+		if ignored[t] {
+			continue
+		}
+		if t == "for i := pos1; i < pos2; i++ {" {
+			if inLoop {
+				return nil, fmt.Errorf("line %d: nested loop, not supported", ln+1)
+			}
+			inLoop = true
+			continue
+		}
+		if t == "}" {
+			inLoop = false
+			continue
+		}
+
+		if !inLoop {
+			c, ok := preLoop[t]
+			if !ok {
+				return nil, fmt.Errorf("line %d: unhandled pre-loop statement %q", ln+1, t)
+			}
+			cur.pre = append(cur.pre, c)
+			continue
+		}
+		if c, ok := ops[t]; ok {
+			cur.body = append(cur.body, c)
+			continue
+		}
+		if cs, ok := specials[t]; ok {
+			cur.body = append(cur.body, cs...)
+			continue
+		}
+		return nil, fmt.Errorf("line %d: unhandled statement %q", ln+1, t)
+	}
+	if len(blocks) == 0 {
+		return nil, fmt.Errorf("no case blocks found")
+	}
+	return blocks, nil
+}
+
+// emit writes one case block. x is a register copy of s[i]; a special statement
+// may read or write s[pos1]/s[pos2], either of which can alias s[i], so x is
+// flushed before one and reloaded afterwards if further ops follow.
+func emit(w *bufio.Writer, b *caseBlock) {
+	for _, l := range b.labels {
+		fmt.Fprintf(w, "case %d:\n", l)
+	}
+	for _, p := range b.pre {
+		fmt.Fprintf(w, "    %s\n", p)
+	}
+	fmt.Fprintln(w, "    for (uint8_t i = pos1; i < pos2; i++) {")
+	fmt.Fprintln(w, "        uint8_t x = s[i];")
+
+	dirty, live := true, true
+	for _, c := range b.body {
+		if c == storeMarker {
+			if dirty {
+				fmt.Fprintln(w, "        s[i] = x;")
+				dirty = false
+			}
+			live = false
+			continue
+		}
+		if strings.HasPrefix(c, rawPrefix) {
+			fmt.Fprintf(w, "        %s\n", strings.TrimPrefix(c, rawPrefix))
+			continue
+		}
+		if !live {
+			fmt.Fprintln(w, "        x = s[i];")
+			live, dirty = true, true
+		}
+		fmt.Fprintf(w, "        %s\n", c)
+		dirty = true
+	}
+	if dirty {
+		fmt.Fprintln(w, "        s[i] = x;")
+	}
+	fmt.Fprintln(w, "    }")
+	fmt.Fprintln(w, "    break;")
+}
+
+// clean strips indentation, line comments and trailing space.
+func clean(l string) string {
+	if i := strings.Index(l, "//"); i >= 0 {
+		l = l[:i]
+	}
+	return strings.TrimSpace(l)
+}
+
+func die(err error) {
+	fmt.Fprintln(os.Stderr, "gencases:", err)
+	os.Exit(1)
+}

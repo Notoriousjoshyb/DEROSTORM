@@ -1,0 +1,643 @@
+# DeroStorm
+
+An AstroBWTv3 miner for DERO. Mines on the CPU and, when an NVIDIA card is
+present, on the GPU as well. Live themed console, guided first-run setup.
+
+The proof-of-work output is bit-for-bit identical to the reference
+implementation — every optimisation here is a faster route to the same 32 bytes,
+and `astrobwt/difftest` compares the two on every build.
+
+```
+╭─ DEROSTORM ──────────────────────────────────────── AstroBWTv3 · v1.1.0 ─╮
+│                                                                          │
+│  ◆ MINING                      28.12 KH/s                 15 CPU · 1 GPU │
+│       ▁▂▃▄▅▆▇▇▇▇▇▇▇▇▇▇█▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   60s │
+│                                                                          │
+│    CPU ████████████████████████████▌░░░░░░░░░░░░░░░░░░░    18.03 KH/s  64% │
+│    GPU ██████████████████████████████████▌░░░░░░░░░░░   10.09 KH/s  36% │
+│                                                                          │
+├──────────────────────────────────────────────────────────────────────────┤
+│  HEIGHT      2,481,903                NETWORK     120.00 KH/s            │
+│  BLOCKS      9                        DIFFICULTY  132,000                │
+│  MINIBLOCKS  89                       SHARE       12.92% · ~8.5s         │
+│  UPTIME      00:12:47                 REJECTED    1                      │
+│  NODE        minernode1.dero.live:10100                                  │
+╰──────────────────────────────────────────────────────────────────────────╯
+  ▸ 11:04:00  connect    connected to minernode1.dero.live:10100
+  ▸ 11:04:17  job        height 2481903 · difficulty 132000
+  ▸ 11:04:24  accepted   miniblock 89 at height 2481903
+  ▸ 11:04:36  block      block 9 found at height 2481903
+
+  › threads 12▏
+```
+
+The two bars are the row worth having. A single combined hashrate cannot tell
+you that a GPU stopped contributing an hour ago; this can. `SHARE` is your slice
+of the network and the mean gap between shares at the current difficulty, which
+is what says whether a change to the settings actually helped.
+
+---
+
+## Quick start
+
+Run it. There is nothing to configure first.
+
+```
+derostorm
+```
+
+On the first run it asks five questions — network, wallet address, node, threads, theme — and saves the answers to `derostorm.json` **next to the executable**. If an NVIDIA card is present it names it and asks a sixth: whether to mine on it as well. Every run after that starts straight into mining.
+
+To change any of it later:
+
+```
+derostorm --setup
+```
+
+---
+
+## Runtime commands
+
+Type a command and press Enter while it is mining.
+
+| Command | What it does |
+|---|---|
+| `threads <n>` | Change the thread count live. Also accepts `+2` or `-4`. |
+| `theme <name>` | Switch colour theme: `default`, `copper`, `mono`. |
+| `save` | Write the current settings to the config file. |
+| `config` | Show the active settings and where they came from. |
+| `help` | List the commands. |
+| `quit` | Stop mining and print a session summary. |
+
+Thread changes take effect immediately and are remembered for the session; run `save` to make them permanent.
+
+`Ctrl-C` also quits cleanly.
+
+---
+
+## Themes
+
+Five themes ship with it. See them side by side without connecting to anything:
+
+```
+derostorm --preview
+derostorm --preview --theme=copper
+```
+
+| Theme | Look |
+|---|---|
+| `default` | cyan accent, violet secondary, near-black ground. The default. |
+| `copper` | burnt copper accent, slate secondary, charcoal ground. |
+| `aurora` | emerald and ice on a deep green-black. |
+| `ember` | amber and rose on a warm black. |
+| `mono` | no colour at all. |
+
+Colour is switched off automatically when output is not a terminal or when `NO_COLOR` is set, so piping to a log file or running as a service produces clean text. A `theme` command cannot override that.
+
+### Window size
+
+The panel needs about **98 columns by 36 rows** — the banner, the panel at its
+tallest (which is with a GPU running, since the CPU/GPU split rows only exist
+then), the event log and the command line.
+
+DeroStorm asks the terminal for that on start-up, and only ever asks for more
+than it has, so a window someone has deliberately made large is left alone. Two
+mechanisms are tried, because neither covers both consoles: classic `conhost`
+honours the Win32 console calls and ignores the ANSI resize, Windows Terminal is
+the other way round.
+
+If the terminal refuses, or the screen is too small to grow into, the event log
+is trimmed until the panel fits. This is not cosmetic — the panel is redrawn by
+moving the cursor up over its own height, so one that is taller than the window
+would walk down the screen leaving a copy of itself behind on every frame. If it
+cannot fit even a two-line log, DeroStorm says so and prints plain scrolling
+output instead.
+
+---
+
+## Options
+
+```
+derostorm [options]
+
+  --setup                           Re-run the guided setup.
+  --config=<path>                   Use a different config file.
+  --wallet-address=<addr>           Override the saved wallet.
+  --daemon-rpc-address=<host:port>  Override the saved node.
+  --mining-threads=<n>              Override the saved thread count.
+  --gpu=<list>                      Mine on these NVIDIA devices: 0, 0,1,
+                                    all or off.
+  --gpu-batch=<n>                   Nonces per GPU launch.
+  --gpu-blocks=<n>                  Resident blocks in the GPU suffix kernel.
+                                    Default: measure it while mining.
+  --theme=<name>                    default, copper, aurora, ember or mono.
+  --no-dashboard                    Plain scrolling output, no live panel.
+  --testnet                         Use the DERO testnet.
+  --debug                           Verbose logging to the log file.
+  --bench                           Benchmark the hash function and exit.
+                                    Add --gpu=all to benchmark the GPU too.
+  --run-for=<sec>                   Mine for this long, then print a summary.
+  --preview                         Show the console with sample data and exit.
+```
+
+Command-line flags override the config file for that run; they do not rewrite it unless you run `save`.
+
+Logs go to `derostorm.exe.log` beside the executable — never to the console, so nothing scribbles over the live panel.
+
+---
+
+## Building
+
+Requires **Go 1.22 or newer**. Everything is vendored, so no network access is needed to build.
+
+**Windows**
+
+```powershell
+.\build.ps1              # build for this machine into .\bin
+.\build.ps1 -All         # cross-compile every supported platform
+```
+
+**Linux / macOS / Git Bash**
+
+```bash
+./build.sh               # build for this machine into ./bin
+./build.sh --all         # cross-compile every supported platform
+```
+
+Targets built by `--all`: `windows/amd64`, `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`.
+
+### What the build flags do
+
+The build scripts pass two non-default flags. Both are deliberate and both matter.
+
+**`-gcflags '…/astrobwtv3=-B'` — bounds checks off, in one package only.**
+
+The suffix-sort package is ~90% of mining CPU time and its inner loops carry two or three bounds checks each. Removing them is worth **+7.8%** hashrate.
+
+This is safe *only because it is tested*. `AstroBWTv3` wraps its body in `recover()` and returns a falsified hash on panic, so an out-of-range index would be silent rather than a crash. The package therefore counts recovered panics, and the test suite asserts that counter stays at zero across millions of hashes built with this same flag. **The build scripts run the tests before building — do not use `--skip-tests` for a build you intend to mine with.**
+
+**`-pgo=auto` — profile-guided optimisation.**
+
+Uses `cmd/derostorm/default.pgo`. Worth a few percent. Regenerate it with the `pow-bench` tool in the derohe tree if you change the hash code.
+
+### Building the native libraries
+
+Two of them are embedded in the executable and bound at run time: the CUDA
+kernels, and libsais for the suffix sort. Both are checked in under
+`cmd/derostorm/` as the copies `go:embed` picks up, so an ordinary build needs
+neither a C toolchain nor CUDA. They only need rebuilding when their sources
+change:
+
+```
+.\build.ps1 -Native      # both, then the miner
+```
+
+or one at a time:
+
+```
+gpu\buildlib.bat         # CUDA kernels  -> cmd\derostorm\derostorm_gpu.dll
+native\build.bat         # libsais       -> cmd\derostorm\derostorm_sa.dll
+```
+
+Each script copies its result into `cmd\derostorm\` itself, because doing that
+by hand is how a stale library gets shipped. `build.ps1` refuses to build if
+either copy is missing, since `go:embed` fails with no hint as to the cause.
+
+The CUDA half needs the toolkit and the MSVC host compiler; the libsais half
+needs only MSVC.
+
+`gpu\build.bat` builds the test harnesses instead. `gpu\hash_parallel_test.exe
+gpu\vectors.bin` is the one that matters: it runs 512 real vectors through the
+whole GPU hash and compares every byte against the CPU, then reports the block
+count curve. Run it after any kernel change.
+
+### Running the tests
+
+```bash
+go test ./cmd/derostorm/
+```
+
+These cover the console (box geometry, height stability, redraw cleanup when the
+frame changes height, colour suppression), the command parser, the CPU-pinning
+map, and — most importantly — that the fast difficulty check is bit-for-bit
+identical to the reference `big.Int` one. The three `TestGPU*` cases run the card
+through the same API the miner uses and check it agrees with the CPU on both the
+hash and the difficulty comparison; they skip when there is no CUDA device.
+
+The hash itself is covered in the derohe tree, and this is the suite to run
+after touching anything under `astrobwt/`:
+
+```bash
+cd ../derohe-main
+go test -gcflags='github.com/deroproject/derohe/astrobwt/astrobwtv3=-B' ./astrobwt/...
+```
+
+`astrobwt/difftest` compares the optimised package against an untouched copy of
+the reference implementation, and `astrobwt/difftest/soak_test.go` asserts the
+recovered-panic counter stays at zero across millions of hashes built with bounds
+checks off — which is what makes that flag sound.
+
+---
+
+## Where the speed comes from
+
+The hash itself is unchanged. `AstroBWTv3` produces exactly the same 32 bytes it
+always did; the suffix array of a string is unique, so a faster way of computing
+it cannot change the result. `astrobwt/difftest` holds that line: it compares
+every output against an untouched copy of the reference implementation over known
+answers, random inputs, nonce sweeps, every length, and boundary bytes. The GPU
+is checked the same way — `gpu/hash_parallel_test.exe` against 512 real CPU
+vectors, and the miner re-verifies each device against the CPU at start-up before
+it will submit anything from it.
+
+Measured on a Ryzen 7 9800X3D (8C/16T) and an RTX 5080.
+
+### CPU
+
+| | Before | After | |
+|---|---:|---:|---:|
+| 1 thread | 700 H/s | 1,875 H/s | +168% |
+| 15 threads | 8.09 KH/s | 18.03 KH/s | +123% |
+
+Three changes.
+
+**A suffix sort that knows how the text was made.** This is the large one, and
+it replaces libsais on the fast path rather than tuning it.
+
+libsais treats the stage-1 text as arbitrary bytes. It is not arbitrary: stage 1
+writes out its whole 256-byte state after each of ~277 iterations and an
+iteration rewrites at most 32 of those bytes, so consecutive blocks are
+near-copies. Take a run of blocks as 256 columns and walk them right to left,
+keeping the run's blocks ordered by the suffixes starting at the current column.
+Stepping one column left prepends one byte to each of those suffixes, so the new
+order is the old one re-sorted by that byte, stably — and if the column is
+constant across the run, the sort is the identity and there is nothing to do.
+Roughly 70% of columns are constant across two blocks, so most of the ordering
+is inherited rather than computed.
+
+That gives, per run and column, a small list of suffixes already in true order.
+Those are grouped by their leading four bytes into descriptors, radix sorted on
+that key, and the groups that collide on all four bytes are merged — a merge and
+not a sort, because each descriptor's list is already ordered.
+
+Against libsais on the same 512 texts (`native\sabench.exe`):
+
+```
+  libsais       0.415 s    1234 texts/s    84.8 MB/s
+  descriptor    0.195 s    2620 texts/s   180.1 MB/s   +112%
+```
+
+Two things decide whether it pays, and both are measurements rather than
+arguments. Runs must be long — 4 blocks is 47% *slower* than libsais, 32 blocks
+is 68% faster — because what saves the global sort is the size of the
+pre-ordered group, not the column skips. And runs must be cut where stage 1's
+RC4 rekey rewrites all 256 bytes: carrying a run through one makes almost every
+column non-constant and the per-column insertion sort quadratic in an unbounded
+length, which measured 443 texts/s against 2,139.
+
+The idea is from the Dirtybird C miner (MIT), which got there first. The
+implementation is ours, and it is checked against libsais over all 512 texts
+before any timing is reported — a suffix array is unique, so that is the whole
+correctness question.
+
+**libsais replaces the Go suffix sort**, and is now the fallback behind the
+descriptor sort above rather than the fast path. The suffix array is ~90% of a hash, and
+the Go SA-IS in `astrobwtv3` is not the fastest way to build one. libsais is,
+on this data, by a consistent margin:
+
+| threads | built-in | libsais | |
+|---:|---:|---:|---:|
+| 1 | 733 H/s | 877 H/s | +19.6% |
+| 4 | 2,640 H/s | 3,255 H/s | +23.3% |
+| 8 | 5,257 H/s | 6,111 H/s | +16.2% |
+| 15 | 8,212 H/s | 9,721 H/s | +18.4% |
+
+The 15-thread row is the mean of three runs (+17.3%, +17.8%, +20.0%). An earlier
+figure of +30% for this change was measured while another miner was running on
+the same machine, which flatters it: the Go sort degrades further under
+contention than libsais does, so the gap widens for reasons that have nothing to
+do with mining alone. `--bench` prints this comparison on your own machine, and
+it interleaves the two sorts rather than running one after the other, because on
+a desktop doing anything else a sequential A-then-B mostly measures which one
+ran while the machine was quieter.
+
+Correctness is not a judgement call here. The suffix array of a string is
+unique, so a faster one that is *correct* produces the same array and therefore
+the same hash; one that is *wrong* changes every hash it touches, and because
+AstroBWTv3 swallows panics the symptom would be a miner at full hashrate that
+never finds a share. So the library is proved before it is trusted: it runs a
+self-test on load, and `sa_test.go` puts 332 inputs through both sorts — nonce
+sweeps, random data, every length from 1 to 80, all-zero, all-0xff — and
+compares the final 32 bytes. Anything at all going wrong, from a missing DLL to
+a failed self-test, falls back to the Go sort and says so on the console.
+
+**The four SA-IS induction scans no longer cache the bucket cursor in a
+register.** This one is small.
+
+The stock code kept a copy of `bucket[c]` and only touched the table when the
+character changed, on the reasoning that suffixes arrive in sorted order so the
+character has good locality. It does — but the character here is derived from RC4
+output, and "good locality" still leaves the branch mispredicting often enough
+that it costs more than the L1 access it was avoiding. The table is 256 entries.
+Reading and writing it every iteration is unconditional and pipelines; the branch
+did not.
+
+Why +21% on one thread and only +3% on sixteen: SMT was already hiding those
+mispredicts. With two threads per core, one thread's stall is the other thread's
+opportunity, so the core was near capacity either way. The win is real but it is
+a latency win, and at 16 threads this machine is not latency bound.
+
+Two things that looked promising and were not, both measured and both discarded:
+
+- **Branchless type detection** in the same loops, the trick that
+  `placeLMSrec` already uses. 1-2% *slower*: the mask arithmetic lands on the
+  critical path, and unlike the bucket test this branch predicts well.
+- **Software-pipelining the random reads in `assignID`**, which is 12% of the
+  hash and every read of it is an L2 or L3 hit. No measurable change — the
+  out-of-order engine was already running those loads ahead.
+
+Everything before this release still applies and is the larger part of the total:
+removing the stock suffix sort's three redundant text walks (+17.7%), bounds
+checks off in that package (+7.8%), gathering the recursion's subproblem instead
+of scanning for it (+3.2%), branchless LMS detection in `placeLMS` (+2.6%), and
+profile-guided optimisation (+1.2%).
+
+### GPU
+
+| | Before | After | |
+|---|---:|---:|---:|
+| RTX 5080 | 7.45 KH/s | 12.28 KH/s | +65% |
+
+Both figures are the GPU on its own, on the real mining path
+(`--mining-threads=1 --gpu=0 --run-for=90`). The suffix sort is ~95% of GPU hash
+time, so everything below is about it.
+
+**The sort carried a 64-bit key beside a 32-bit value; both fit in one word.**
+A rank and a suffix index are each a position in [0, n), which for a 71 KB text
+is 17 bits. The key is two ranks and the payload is one index — 51 bits
+together. So the pass now moves one 8-byte word per element instead of a
+12-byte pair, and the radix sort is told to order by a bit *range* and leave the
+bits below it alone, which carries the index along for nothing. Two whole
+n-sized arrays disappeared with it.
+
+**The doubling started at one byte; it now starts at four.** Prefix doubling has
+to seed somewhere, and the first two rounds after a one-byte seed are the most
+expensive in the run, because nothing has been resolved and the active set is
+still the whole array — measured over 512 real texts, 100% of suffixes are still
+tied going into k=1 and 93% into k=2. A four-byte first sort replaces both. In
+passes over n: 2 + 5 + 4.65 = 11.65 becomes 6.
+
+| | suffix arrays/s |
+|---|---:|
+| before | 6,910 |
+| one packed word | 9,881 |
+| four-byte seed | 13,390 |
+
+Five bytes was tried and is worse (10.8k): it needs a seventh pass and the extra
+resolution does not pay for it. Radix widths of 6 and 8 bits were tried and are
+both slightly worse than 7.
+
+One near miss worth recording, because it was caught by the vector check and
+would not have been caught by anything else. The seed packs each byte into
+*nine* bits, so that "ran off the end of the text" is a value below every real
+byte. Eight bits and a zero pad looks sufficient — a tie at round 0 is harmless,
+since the doubling loop resolves whatever groups it is handed. It is not. Two
+suffixes that both run off the end within k get the same past-the-end marker for
+their second rank too, so the doubling cannot separate them either, and the tie
+survives to the end. It broke 3 of 512 texts, in the first entry of the array
+only. A miner would have looked completely healthy and produced a wrong hash
+about half a percent of the time.
+
+### Memory
+
+`ScratchData`, one per mining thread, carried 768 KB of buffers for a counting
+sort AstroBWTv3 does not call — allocated, zeroed by the runtime, never read.
+They are gone, with the dead sort itself. Per thread it is 2.06 MB down to
+1.27 MB; at sixteen threads, 12 MB less resident and 12 MB fewer pages to fault
+in at start-up. It did not change the hashrate, and it was never going to: a
+buffer nothing touches is never in cache.
+
+### What does not help
+
+Recorded because they are the obvious next guesses, and all three are wrong.
+Measured on a 9800X3D with DDR5-6000 CL30 and an RTX 5080.
+
+**Faster system RAM.** The CPU hash is not memory bound, and it is not close.
+Testing it takes multiplying the footprint without changing the work: give each
+thread N scratch buffers instead of one and rotate through them, one per hash.
+Same inputs, same instruction stream, more memory.
+
+```
+ buffers   footprint         H/s   vs one
+       1       18 MB      7115.7     0.0%
+       2       37 MB      6819.1    -4.2%
+       4       73 MB      6518.3    -8.4%
+       8      146 MB      6686.0    -6.0%
+      16      293 MB      6579.0    -7.5%
+      32      585 MB      6568.1    -7.7%
+      64     1170 MB      6492.7    -8.8%
+```
+
+Running the whole thing out of DRAM — 1.17 GB, sixty-six times past this chip's
+96 MB of L3 — costs **8.8%**. That is the entire distance between "every access
+is a cache hit" and "every access is a DRAM round trip". At its natural
+footprint, 15 threads share 18 MB and sit comfortably inside L3, which is the top
+row of that table.
+
+So faster RAM cannot buy 8.8%; it can only buy some fraction of the gap between
+DDR5-6000 and the next kit up, on a workload that has already shown it barely
+notices a 66× working-set increase. The reason is the access pattern: the
+induction scans walk `sa` linearly and the bucket scatter has only 256
+destinations, and streams like that prefetch about as well from DRAM as from
+cache.
+
+The thing that *does* matter is the 3D V-Cache, and it is already doing its job.
+
+Two later measurements, taken a different way, agree. The first is the cleanest
+evidence in this file, because it does not measure the miner at all — it
+measures what the miner leaves for everything else:
+
+```
+a 4-thread DRAM streamer, buffers far past L3, read-modify-write
+
+  running alone                27.5 GB/s
+  running beside 12 mining threads   27.5 GB/s
+```
+
+Mining takes **no measurable bandwidth away from it**. The bus saturates at
+about 28 GB/s counted, which is ~56 GB/s of real traffic once each cache line is
+counted as a fill plus a writeback, and it saturates from two threads onward.
+A workload competing for that would show up here. This one does not appear at
+all.
+
+The second separates cache pressure from bandwidth pressure by giving the miner
+a control to be measured against — a load that takes the same four cores and
+touches almost nothing:
+
+| 12 mining threads, plus | H/s | vs alone | vs the control |
+|---|---:|---:|---:|
+| nothing | 8,796 | | |
+| 4 threads of pure compute (control) | 7,869 | −10.5% | — |
+| 4 threads streaming DRAM | 7,206 | −18.1% | −8.4% |
+| 4 threads thrashing L3 | 7,705 | −12.4% | −2.1% |
+
+Most of every drop is simply the four cores taken. What is left over after the
+control is the memory effect, and the DRAM streamer's extra 8.4% is not it
+buying bandwidth the miner wanted — the first measurement rules that out. It is
+the streamer walking 2 GB through L3 and evicting the miner's resident working
+set, which then has to be fetched back. The L3 thrasher costs less because 96 MB
+of stride-walk evicts less than 2 GB of streaming does.
+
+Put together: **AstroBWT on this CPU is L3-resident, not DRAM-bound.** Faster or
+larger DDR5 cannot help a workload that is not waiting on DDR5. What can hurt it
+is anything that evicts it from L3, which is an argument for not running a
+second memory-heavy program beside the miner, and not an argument for a memory
+kit.
+
+**Host RAM as GPU scratch.** Unified or pinned host memory would put the suffix
+scratch on the far side of PCIe 5.0 x16 — about 64 GB/s against roughly 960 GB/s
+of VRAM. Fifteen times slower for the array that every round of the sort streams
+through. It would also buy nothing even if it were free: the block-count curve is
+flat past 84 blocks, so more hashes in flight, which is what more memory buys, is
+not what the card is short of.
+
+**A bigger batch.** `--gpu-batch` is a latency knob, not a throughput one. The
+whole batch is already one kernel launch, and a batch that takes longer only
+means longer before the miner notices a new job.
+
+**Compiler flags on libsais.** It is 84% of CPU hash time and contains no SIMD
+intrinsics at all, so a wider instruction set for the auto-vectoriser looked
+like free money. `native\sabench.exe` times it on the real texts:
+
+```
+  /arch:AVX2      1234 texts/s      /GL (whole program)   1227 texts/s
+  /arch:AVX512    1235 texts/s      no /arch              1228 texts/s
+```
+
+Nothing, in either direction. The sort is pointer chasing and unpredictable
+branches, and there is nothing in its inner loops for a vector unit to do.
+
+**Hashing two nonces' suffix arrays as interleaved SHA-256 chains.** SHA-256 is
+9.3% of a CPU hash and `sha256rnds2` is latency bound, so one chain leaves the
+unit part idle and two would fill it. Worth about +3%, on paper.
+
+The paper is wrong, and one measurement says why. SHA-256 throughput on this
+machine, one thread per core against two:
+
+```
+   8 threads    16,798 MB/s
+  16 threads    27,532 MB/s     +64%
+```
+
+If a single chain were saturating the unit, the second thread on each core would
+add nothing. It adds 64%, because the two mining threads sharing a core are
+*already* two independent SHA-256 chains interleaved on that unit — SMT is doing
+the trick by hand. What is left is about 1% of total hashrate, for a second
+scratch buffer per thread, hand-written SHA-NI intrinsics, and a change to the
+consensus-critical path. Left alone.
+
+## Tuning
+
+- **Use every logical CPU.** SMT genuinely helps here, because the sort is
+  latency bound. Sixteen threads beat eight by 69% on the test machine.
+- **Do not oversubscribe.** Past the logical CPU count it gets slower.
+- **The default leaves one CPU free**, which the benchmark disagrees with — it
+  measures 16 threads faster than 15. The benchmark has nothing else to run;
+  mining has the getwork socket, the console, and the thread that feeds a GPU.
+  Ask for the last one with `--mining-threads=16` if the machine is doing
+  nothing else.
+- **Let the GPU tune itself once**, then pin the result with `--gpu-blocks=<n>`
+  so later starts skip the sweep. The console prints the value it chose.
+- Threads are pinned to CPUs automatically, spreading over physical cores before
+  using SMT siblings.
+- **Faster RAM is not worth buying for this.** See *What does not help* above:
+  running the CPU hash entirely out of DRAM costs 8.8%, and at its natural
+  footprint it never leaves L3.
+
+### Profiling the GPU further
+
+`gpu/prof/` gives phase shares without any special permission — see the GPU
+section above. What it cannot give is *why* a phase is slow, and for that Nsight
+Compute needs a driver permission:
+
+> NVIDIA Control Panel → Desktop → Developer settings → *Manage GPU Performance
+> Counters* → allow access to all users. Needs admin, and takes effect on the
+> next launch.
+
+Then:
+
+```
+ncu --section SpeedOfLight --section WarpStateStats ^
+    --kernel-name suffix_kernel --launch-count 1 --clock-control none ^
+    gpu\hash_parallel_test.exe gpu\vectors.bin
+```
+
+The note at the top of `gpu/blockradix.cuh` carries the full record: what the
+phase shares were, what was changed, and what was tried and thrown away.
+
+## Layout
+
+```
+derostorm/
+├── bin/                    built binaries
+├── cmd/derostorm/          the miner
+│   ├── main.go             flags, startup order, run loop, benchmark, preview
+│   ├── setup.go            first-run wizard
+│   ├── config.go           the derostorm.json file
+│   ├── engine.go           getwork + the mining threads
+│   ├── target.go           allocation-free difficulty check
+│   ├── dashboard.go        the live console
+│   ├── theme.go            palettes
+│   ├── commands.go         runtime command line
+│   ├── affinity.go         CPU-slot → logical-CPU map
+│   ├── gpu_windows.go      loads the CUDA library, binds its entry points
+│   ├── gpu_worker.go       the GPU mining worker
+│   ├── gpu_tune.go         measures the suffix kernel's block count
+│   ├── gpu_bench.go        --bench for the GPU
+│   ├── sa_windows.go       loads libsais, proves it, installs the hook
+│   ├── sa_test.go          332 inputs through both sorts, hashes compared
+│   ├── sa_bench.go         --bench: the two sorts, interleaved
+│   └── default.pgo         profile for -pgo=auto
+├── native/                 the C suffix sort
+│   ├── derostorm_sa.c      the C API: sort, version, self-test
+│   ├── descriptor.c        the structure-exploiting suffix sort
+│   ├── sabench.c           checks and times both sorts on the real texts
+│   └── libsais/            upstream libsais, unmodified (Apache-2.0)
+├── gpu/                    the CUDA kernels and their test harnesses
+│   ├── derostorm_gpu.cu    the three kernels and the C API
+│   ├── stage1.cuh          the 256-way state machine, thread per hash
+│   ├── sa_doubling.cuh     suffix array by prefix doubling, block per hash
+│   ├── blockradix.cuh      the block-wide radix sort under it
+│   ├── hash_parallel_test.cu  whole hash against 512 real CPU vectors
+│   ├── prof.cuh            phase timers, compiled out unless DS_PROF
+│   └── prof/               cycle attribution for the suffix kernel
+├── vendor/                 all dependencies, including the optimised derohe
+├── build.ps1 / build.sh
+└── README.md
+```
+
+`vendor/` contains the full optimised `derohe` source, so this folder builds standalone. If you re-point `go.mod`'s `replace` at a newer derohe checkout, re-run `go mod vendor`.
+
+---
+
+## Licence
+
+derostorm's own code — `cmd/derostorm/`, `gpu/`, the C files directly under
+`native/`, the build scripts and this README — is MIT. See `LICENSE`.
+
+Everything it is built on is not, and the restrictions are real:
+
+**DERO (`vendor/github.com/deroproject/derohe/`) is under the DERO Project's
+RESEARCH licence.** That licence covers research, evaluation, teaching and
+personal use, and expressly excludes commercial use or distribution. Commercial
+use needs a separate licence from the DERO Project. Since derostorm builds on
+that code, the restriction reaches any build that includes it.
+
+`native/libsais/` is libsais by Ilya Grebnov, under Apache-2.0 and unmodified —
+see `native/libsais/LICENSE`. Only the small C wrapper around it in
+`native/derostorm_sa.c` is ours.
+
+Full detail in `THIRD-PARTY-NOTICES.md`.
+
+Mining rewards go to whatever address you configure and to nobody else; there is
+no developer fee.

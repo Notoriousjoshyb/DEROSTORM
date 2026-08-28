@@ -1,0 +1,36 @@
+MIT License
+
+Copyright (c) 2026 Notoriousjoshyb
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+IMPORTANT: The MIT licence above covers ONLY the original derostorm code:
+
+  cmd/derostorm/          the Go miner
+  gpu/                    the CUDA kernels and their test harnesses
+  native/derostorm_sa.c   the C API wrapper
+  native/descriptor.c     the structure-exploiting suffix sort
+  native/sabench.c        the benchmark harness
+  native/sha256ni.c       the SHA-256-NI helper
+  build.ps1, build.sh, README.md
+
+It does NOT cover the third-party code shipped in this repository.
+See THIRD-PARTY-NOTICES.md for those licences, which are more restrictive.

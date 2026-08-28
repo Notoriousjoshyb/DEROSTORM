@@ -1,0 +1,106 @@
+# github.com/blang/semver/v4 v4.0.0
+## explicit; go 1.14
+github.com/blang/semver/v4
+# github.com/caarlos0/env/v6 v6.10.1
+## explicit; go 1.17
+github.com/caarlos0/env/v6
+# github.com/cespare/xxhash v1.1.0
+## explicit
+github.com/cespare/xxhash
+# github.com/dchest/siphash v1.2.3
+## explicit; go 1.16
+github.com/dchest/siphash
+# github.com/deroproject/derohe v0.0.0-00010101000000-000000000000 => ../derohe-main
+## explicit; go 1.17
+github.com/deroproject/derohe/astrobwt
+github.com/deroproject/derohe/astrobwt/astrobwt_fast
+github.com/deroproject/derohe/astrobwt/astrobwtv3
+github.com/deroproject/derohe/block
+github.com/deroproject/derohe/config
+github.com/deroproject/derohe/cryptography/bn256
+github.com/deroproject/derohe/cryptography/crypto
+github.com/deroproject/derohe/globals
+github.com/deroproject/derohe/rpc
+github.com/deroproject/derohe/transaction
+# github.com/deroproject/graviton v0.0.0-20220130070622-2c248a53b2e1
+## explicit; go 1.14
+github.com/deroproject/graviton
+# github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815
+## explicit
+github.com/docopt/docopt-go
+# github.com/fxamacker/cbor/v2 v2.9.3
+## explicit; go 1.20
+github.com/fxamacker/cbor/v2
+# github.com/go-logr/logr v1.3.0
+## explicit; go 1.18
+github.com/go-logr/logr
+github.com/go-logr/logr/slogr
+# github.com/go-logr/zapr v1.3.0
+## explicit; go 1.18
+github.com/go-logr/zapr
+# github.com/gorilla/websocket v1.5.3
+## explicit; go 1.12
+github.com/gorilla/websocket
+# github.com/klauspost/cpuid/v2 v2.2.3
+## explicit; go 1.15
+github.com/klauspost/cpuid/v2
+# github.com/minio/sha256-simd v1.0.1
+## explicit; go 1.17
+github.com/minio/sha256-simd
+# github.com/robfig/cron/v3 v3.0.1
+## explicit; go 1.12
+github.com/robfig/cron/v3
+# github.com/satori/go.uuid v1.2.0
+## explicit
+github.com/satori/go.uuid
+# github.com/segmentio/fasthash v1.0.3
+## explicit; go 1.11
+github.com/segmentio/fasthash/fnv1a
+# github.com/stretchr/testify v1.12.1
+## explicit; go 1.17
+github.com/stretchr/testify/assert
+github.com/stretchr/testify/assert/yaml
+github.com/stretchr/testify/internal/difflib
+github.com/stretchr/testify/internal/spew
+# github.com/x448/float16 v0.8.4
+## explicit; go 1.11
+github.com/x448/float16
+# go.uber.org/multierr v1.10.0
+## explicit; go 1.19
+go.uber.org/multierr
+# go.uber.org/zap v1.28.0
+## explicit; go 1.19
+go.uber.org/zap
+go.uber.org/zap/buffer
+go.uber.org/zap/internal
+go.uber.org/zap/internal/bufferpool
+go.uber.org/zap/internal/color
+go.uber.org/zap/internal/exit
+go.uber.org/zap/internal/pool
+go.uber.org/zap/internal/stacktrace
+go.uber.org/zap/zapcore
+# go.yaml.in/yaml/v3 v3.0.5
+## explicit; go 1.16
+go.yaml.in/yaml/v3
+# golang.org/x/crypto v0.55.0
+## explicit; go 1.25.0
+golang.org/x/crypto/blake2s
+golang.org/x/crypto/chacha20
+golang.org/x/crypto/internal/alias
+golang.org/x/crypto/salsa20/salsa
+golang.org/x/crypto/sha3
+# golang.org/x/net v0.58.0
+## explicit; go 1.25.0
+golang.org/x/net/internal/socks
+golang.org/x/net/proxy
+# golang.org/x/sys v0.47.0
+## explicit; go 1.25.0
+golang.org/x/sys/cpu
+golang.org/x/sys/unix
+# golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da
+## explicit; go 1.18
+golang.org/x/xerrors
+golang.org/x/xerrors/internal
+# gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c
+## explicit; go 1.11
+# github.com/deroproject/derohe => ../derohe-main

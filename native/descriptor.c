@@ -1,0 +1,1046 @@
+/* descriptor.c -- a suffix sort that exploits how AstroBWTv3 builds its text.
+ *
+ * libsais is a general suffix sorter and treats the stage-1 text as arbitrary
+ * bytes. It is not arbitrary. Stage 1 writes out its whole 256-byte state after
+ * every one of ~277 iterations, and an iteration rewrites at most 32 of those
+ * bytes, so consecutive 256-byte blocks are near-copies of each other. Measured
+ * over 512 real texts (go test ./gpu/lcpstat -run SharedColumns): across a run
+ * of four consecutive blocks, 45.7% of the 256 byte offsets hold the same value
+ * in every block; across two, 73.2%.
+ *
+ * That is what this exploits, and the way it does is worth stating plainly
+ * because the rest of the file is bookkeeping around it.
+ *
+ * ---------------------------------------------------------------------------
+ * The idea
+ *
+ * Take a run of consecutive blocks and look at it as 256 columns. Walk the
+ * columns from right to left, keeping the run's blocks in the order of their
+ * suffixes starting at the current column:
+ *
+ *     order[] holds the run's block starts, arranged so that the suffixes
+ *     beginning at order[i] + rel are in ascending order.
+ *
+ * At rel = 255 that is just the order of the suffixes starting at each block's
+ * last byte, which is one small sort.
+ *
+ * Stepping from rel to rel-1 prepends one byte to every one of those suffixes.
+ * So the new order is the old order re-sorted by that byte, *stably* -- the
+ * existing order is exactly the right tie-break. And if the column is constant
+ * across the run, every suffix gets the same byte prepended, the stable sort is
+ * the identity, and there is nothing to do at all.
+ *
+ * That is the whole saving: for ~70% of columns the order is inherited rather
+ * than computed, and the sort never looks at those suffixes again.
+ *
+ * ---------------------------------------------------------------------------
+ * Getting from there to a suffix array
+ *
+ * The walk gives, for every (run, column), a small list of suffixes already in
+ * their true relative order. Those lists have to be merged into one array of n.
+ *
+ * Merging thousands of lists directly would cost more than it saved, so each
+ * list is first split into maximal groups sharing their leading four bytes, and
+ * each group is recorded as a descriptor: a 32-bit key, and a slice of an arena
+ * holding its positions in order. Descriptors are then radix sorted by that key
+ * -- four passes over a few tens of thousands of entries -- which puts almost
+ * every suffix in its final place, because four bytes nearly determine the
+ * order. Only descriptors that collide on all four bytes need comparing, and
+ * those groups are small.
+ *
+ * ---------------------------------------------------------------------------
+ * Correctness
+ *
+ * The suffix array of a string is unique, so this either produces exactly what
+ * libsais produces or it is wrong; there is no third option and no judgement
+ * call. It is checked against libsais over all 512 real texts by
+ * native\sabench.exe, and the miner keeps libsais as the fallback.
+ *
+ * Where the run boundaries fall does not affect correctness -- only speed. Any
+ * partition of the blocks works; a partition that follows where stage 1 rewrote
+ * everything works better.
+ *
+ * libsais is Apache-2.0, Copyright (c) 2021-2025 Ilya Grebnov. This file is
+ * part of DeroStorm and borrows the idea above from the Dirtybird C miner
+ * (MIT), which arrived at it first.
+ */
+
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "descriptor.h"
+
+/* AVX2 is used in one place, the scatter in the merge. MSVC does not define
+ * __AVX2__ from /arch:AVX2, so this asks the other way round: __AVX2__ for the
+ * compilers that do define it, and the MSVC AVX flag for the one that does not.
+ * Define DSA_NO_AVX2 to force the scalar path. */
+#if !defined(DSA_NO_AVX2) && (defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX__)))
+#define DSA_AVX2 1
+#include <immintrin.h>
+#endif
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define DSA_BSWAP32(v) _byteswap_ulong(v)
+#define DSA_BSWAP64(v) _byteswap_uint64(v)
+#elif defined(__GNUC__) || defined(__clang__)
+#define DSA_BSWAP32(v) __builtin_bswap32(v)
+#define DSA_BSWAP64(v) __builtin_bswap64(v)
+#else
+#define DSA_BSWAP32(v) (((v) >> 24) | (((v) >> 8) & 0xff00u) |                         (((v) << 8) & 0xff0000u) | ((v) << 24))
+#define DSA_BSWAP64(v) (((uint64_t)DSA_BSWAP32((uint32_t)(v)) << 32) |          (uint64_t)DSA_BSWAP32((uint32_t)((v) >> 32)))
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Phase timing, compiled to nothing unless DSA_PROF is defined.
+ *
+ * The three phases have completely different shapes -- a column walk that is
+ * linear in the text, a radix sort over descriptors, and a merge whose cost is
+ * set by how often four bytes fail to separate two suffixes -- so which one to
+ * work on is not a thing to reason about from the source.
+ * ------------------------------------------------------------------------ */
+#ifdef DSA_PROF
+#include <intrin.h>
+unsigned long long dsa_prof[5];
+unsigned long long dsa_stat[9];
+#define PROF_T0()      const unsigned long long _t0 = __rdtsc()
+#define PROF_ADD(i, t) (dsa_prof[i] += __rdtsc() - (t))
+#define PROF_MARK()    unsigned long long _m = __rdtsc()
+#define PROF_LAP(i)    do { const unsigned long long _c = __rdtsc(); \
+                            dsa_prof[i] += _c - _m; _m = _c; } while (0)
+#define PROF_STAT(i, v) (dsa_stat[i] += (unsigned long long)(v))
+#define PROF_MAX(i, v)                                              \
+    do {                                                            \
+        const unsigned long long _v = (unsigned long long)(v);       \
+        if (_v > dsa_stat[i]) dsa_stat[i] = _v;                      \
+    } while (0)
+#else
+#define PROF_T0()      ((void)0)
+#define PROF_ADD(i, t) ((void)0)
+#define PROF_MARK()    ((void)0)
+#define PROF_LAP(i)    ((void)0)
+#define PROF_STAT(i, v) ((void)0)
+#define PROF_MAX(i, v)  ((void)0)
+#endif
+
+/* dsa_prof slots */
+#define PH_RUNS   0   /* finding run boundaries */
+#define PH_WALK   1   /* the column walk, including descriptor emission */
+#define PH_RADIX  2   /* radix sorting the descriptors */
+#define PH_MERGE  3   /* resolving descriptors that share a key */
+#define PH_TAIL   4
+
+/* dsa_stat slots */
+#define ST_DESC     0  /* descriptors emitted */
+#define ST_KEYGRP   1  /* key groups in the merge */
+#define ST_COLLIDE  2  /* key groups with more than one descriptor */
+#define ST_MERGED   3  /* positions passing through the merge */
+#define ST_CMP      4  /* suffix_less calls */
+#define ST_RUNS     5  /* runs */
+#define ST_MAXDESC  6  /* high-water descriptors in one text */
+#define ST_MAXMERGE 7  /* high-water positions in one colliding key group */
+#define ST_MAXLIST  8  /* high-water descriptors in one colliding key group */
+
+/* Blocks per run.
+ *
+ * Longer runs share fewer columns -- 73.2% across two blocks, 45.7% across
+ * four, 18.8% across eight -- which argues for short ones. Measured, that is
+ * backwards: the pre-ordered group a run produces is what saves the global
+ * sort, and bigger groups win by more than the lost column skips cost.
+ * Against libsais, sweeping only this:
+ *
+ *     2 blocks   485 texts/s   -60%      32 blocks  2065 texts/s   +68%
+ *     4 blocks   643 texts/s   -47%      64 blocks  2078 texts/s   +69%
+ *     8 blocks   963 texts/s   -21%     128 blocks  2097 texts/s   +70%
+ *    16 blocks  1598 texts/s   +30%     512 blocks  2099 texts/s   +72%
+ *
+ * It plateaus past 64 because DSA_RUN_SPLIT below is what actually ends runs by
+ * then. This is left high so that threshold decides.
+ */
+#ifndef DSA_RUN_MAX
+#define DSA_RUN_MAX 512
+#endif
+
+/* A run is cut short when a block differs from its predecessor by more than
+ * this many bytes, which is what an RC4 rekey inside stage 1 looks like: it
+ * rewrites all 256 rather than the usual 32.
+ *
+ * This is not a tuning knob, it is load bearing. Carrying a run through a rekey
+ * makes almost every column of it non-constant, and the column step is an
+ * insertion sort over the run's blocks -- quadratic in a length that is then
+ * unbounded. Never splitting measured 443 texts/s against 2,139 for splitting
+ * at 160, which is a third of libsais rather than nearly double it.
+ *
+ *     64 -> 2118/s      96 -> 2097/s      160 -> 2139/s      never -> 443/s
+ */
+#ifndef DSA_RUN_SPLIT
+#define DSA_RUN_SPLIT 160
+#endif
+
+#define DSA_BLOCK 256
+
+/* Key bytes, and the radix that follows from it.
+ *
+ * Four bytes with three 11-bit passes is the starting point. Three bytes is
+ * worth testing rather than dismissing: it makes the key coarser, so more
+ * suffixes share one and there are fewer, larger groups -- fewer group
+ * iterations in the merge and only two radix passes -- at the cost of more
+ * groups needing a real comparison. The profile says collisions are nearly free
+ * here (1.3% of groups, 4,326 comparisons a text), so there is room to trade.
+ *
+ * Measured at four bytes it was flat: 3,365 texts/s at three against 3,355 at
+ * four, because the key width is not what sets the group count. A descriptor is
+ * emitted per (run, column) and there are 62 runs of 256 columns, so ~15,900
+ * groups exist before any key collides; three bytes only took 19,160 groups down
+ * to 18,511. Widening does not help either, for the same reason.
+ *
+ * Three won later, and only because something else changed. The tie-break used
+ * to call memcmp with a length of tens of thousands of bytes; once it resolved
+ * the first 32 bytes inline instead, an extra collision stopped being worth
+ * paying a radix pass to avoid, and three bytes measured 5,319 texts/s against
+ * 5,099. That is the whole reason this constant is three: a knob that measures
+ * flat is not settled, it is waiting for the thing that pays for it. */
+#ifndef DSA_KEY_BYTES
+#define DSA_KEY_BYTES 3
+#endif
+
+
+/* A descriptor is eight bytes, not twelve.
+ *
+ * The radix sort reads and writes every descriptor once per pass, three passes,
+ * twenty thousand descriptors: at twelve bytes that is 1.45 MB of traffic per
+ * text, which is about half of everything this sort moves. Packing the offset
+ * and the length into one word takes a third off it, and the effect is larger
+ * the more threads are mining, because they are all pulling on the same L3.
+ *
+ * The offset indexes the arena, which holds n positions, and n is at most
+ * MAX_LENGTH = 98,303: 17 bits. The length is the number of blocks in a run
+ * sharing four leading bytes, so at most DSA_RUN_MAX: 10 bits at 512. Twenty
+ * seven bits of the thirty two, checked below so a future DSA_RUN_MAX cannot
+ * quietly overflow it.
+ */
+#define DSA_LEN_BITS  12
+#define DSA_LEN_MASK  ((1u << DSA_LEN_BITS) - 1u)
+#define DSA_MAX_OFF   (1u << (32 - DSA_LEN_BITS))
+
+typedef struct {
+    uint32_t key;    /* the four leading bytes, big-endian so it sorts as bytes */
+    uint32_t packed; /* arena offset in the high bits, length in the low ones */
+} Desc;
+
+static inline uint32_t dsa_off(Desc d) { return d.packed >> DSA_LEN_BITS; }
+static inline uint32_t dsa_len(Desc d) { return d.packed & DSA_LEN_MASK; }
+static inline uint32_t desc_pack(uint32_t off, uint32_t len)
+{
+    return (off << DSA_LEN_BITS) | len;
+}
+/* The packing above gives the length DSA_LEN_BITS bits and the offset the rest.
+ * Both bounds are checked here rather than trusted: a run longer than the length
+ * field, or a text longer than the offset field, would corrupt descriptors
+ * silently and the only symptom would be a wrong suffix array. */
+typedef char dsa_len_fits[(DSA_RUN_MAX <= (int)DSA_LEN_MASK) ? 1 : -1];
+typedef char dsa_off_fits[((256 * 384) <= (int)DSA_MAX_OFF) ? 1 : -1];
+
+/* Scratch caps.
+ *
+ * These were all sized for their worst case, and the worst cases are absurdly
+ * far from what the texts actually do. Measured over all 512 real texts:
+ *
+ *                            worst case     really needed
+ *   descriptors              n = 68755      26992
+ *   positions in a key group n = 68755      879
+ *   lists in a key group     n = 68755      262
+ *
+ * That mattered because it is per thread. At 3.0 MB of scratch a thread, and
+ * 1.3 MB more for the hash itself, fifteen threads wanted 64 MB -- and this
+ * machine has 96 MB of L3. The hashrate curve showed it plainly: 2231 H/s on
+ * one thread, 1495 on thirteen, and *falling* past fourteen.
+ *
+ * So they are sized for what happens, with a way out when it does not:
+ *
+ *   - Descriptors start at half the worst case. On overflow the buffer grows to
+ *     the full bound and the text is redone. Costs one wasted walk, and never
+ *     happened on any of the 512.
+ *   - A key group larger than DSA_GROUP_CAP makes the whole call fail, and the
+ *     caller falls back to libsais for that hash. Nine times the observed
+ *     maximum, so this is for a text unlike anything measured, and giving up a
+ *     hash to libsais costs a few microseconds rather than being wrong.
+ */
+#ifndef DSA_GROUP_CAP
+#define DSA_GROUP_CAP 8192
+#endif
+
+typedef struct {
+    uint32_t* arena;    /* n positions, grouped by descriptor */
+    Desc*     desc;     /* descriptors, then their radix-sorted copy */
+    Desc*     desc2;
+    uint32_t* order;    /* the run's block starts, in current column order */
+    uint32_t* order2;   /* ping-pong for the counting sort in the column step */
+    uint32_t* merge;    /* ping-pong space for merging a key group */
+    uint32_t* merge2;
+    uint32_t* bnd;      /* list boundaries within the above, ping-ponged too */
+    uint32_t* bnd2;
+    size_t    cap;      /* text length this scratch was sized for */
+    size_t    desc_cap;
+} Scratch;
+
+/* One scratch per thread, kept for the life of the thread. Mining threads call
+ * runtime.LockOSThread, so that is one per mining thread, and a hash costs no
+ * allocation. */
+#if defined(_WIN32)
+#define DSA_TLS __declspec(thread)
+#else
+#define DSA_TLS __thread
+#endif
+static DSA_TLS Scratch* g_scratch = NULL;
+
+static void scratch_free(Scratch* s)
+{
+    if (!s) return;
+    free(s->arena);
+    free(s->desc);
+    free(s->desc2);
+    free(s->order);
+    free(s->order2);
+    free(s->merge);
+    free(s->merge2);
+    free(s->bnd);
+    free(s->bnd2);
+    free(s);
+}
+
+/* desc_bound is the number of descriptors a text of n bytes can possibly
+ * produce: one per (run, column), plus one per split within a column, and a
+ * split cannot make more groups than the run has blocks. Summed over runs that
+ * is 256 columns times the block count, which is n; plus the tail. */
+static size_t desc_bound(size_t n) { return n + DSA_BLOCK + 8; }
+
+static Scratch* scratch_get(size_t n, size_t want_desc)
+{
+    Scratch* s = g_scratch;
+
+    if (s && s->cap >= n && s->desc_cap >= want_desc) return s;
+    scratch_free(s);
+    g_scratch = NULL;
+
+    s = (Scratch*)calloc(1, sizeof(Scratch));
+    if (!s) return NULL;
+    s->cap = n;
+    s->desc_cap = want_desc;
+    const size_t gcap = DSA_GROUP_CAP;
+    s->arena = (uint32_t*)malloc((n + 8) * sizeof(uint32_t));
+    s->desc  = (Desc*)malloc(want_desc * sizeof(Desc));
+    s->desc2 = (Desc*)malloc(want_desc * sizeof(Desc));
+    s->order = (uint32_t*)malloc((DSA_RUN_MAX + 8) * sizeof(uint32_t));
+    s->order2 = (uint32_t*)malloc((DSA_RUN_MAX + 8) * sizeof(uint32_t));
+    s->merge = (uint32_t*)malloc((gcap + 8) * sizeof(uint32_t));
+    s->merge2 = (uint32_t*)malloc((gcap + 8) * sizeof(uint32_t));
+    s->bnd  = (uint32_t*)malloc((gcap + 8) * sizeof(uint32_t));
+    s->bnd2 = (uint32_t*)malloc((gcap + 8) * sizeof(uint32_t));
+    if (!s->arena || !s->desc || !s->desc2 || !s->order || !s->order2 ||
+        !s->merge || !s->merge2 || !s->bnd || !s->bnd2) {
+        scratch_free(s);
+        return NULL;
+    }
+    g_scratch = s;
+    return s;
+}
+
+/* key32 reads the four bytes at p, padding past the end of the text with 0.
+ *
+ * The padding has to be order preserving, and 0 is: a suffix that ends early
+ * gets zeros where a longer one has real bytes, so its key is less than or
+ * equal, and less is exactly the order a prefix should sort in. Equal falls
+ * through to a full comparison, which settles it. */
+static inline uint32_t key32(const uint8_t* t, size_t n, size_t p)
+{
+    if (p + 4 <= n) {
+        /* One unaligned load and a byte swap, not four loads and three shifts.
+         * Called about ninety thousand times per text, once per (column, block)
+         * pair plus once more per group. */
+        uint32_t v;
+        memcpy(&v, t + p, 4);
+        return DSA_BSWAP32(v) >> (8 * (4 - DSA_KEY_BYTES));
+    }
+    uint32_t k = 0;
+    for (size_t i = 0; i < DSA_KEY_BYTES; i++) {
+        k <<= 8;
+        if (p + i < n) k |= t[p + i];
+    }
+    return k;
+}
+
+/* suffix_less is the tie-break, used only where four bytes were not enough.
+ *
+ * memcmp is the obvious body and the wrong one. The length handed to it is
+ * n - max(a,b), tens of thousands of bytes, so it is a call into a routine that
+ * sets up an alignment-handling loop -- for a comparison that in this text
+ * decides within the first few bytes almost every time. Comparing 32 bytes
+ * inline first, eight at a time, settles nearly all of them without the call,
+ * and memcmp still finishes the rare pair that shares a long prefix.
+ *
+ * The byte swap is what makes an integer comparison give the byte order: on a
+ * little-endian load the first byte of the text lands in the low bits, so it
+ * has to be moved to the top before comparing as a number. */
+static inline int suffix_less(const uint8_t* t, size_t n, uint32_t a, uint32_t b)
+{
+    PROF_STAT(ST_CMP, 1);
+    const size_t la = n - a, lb = n - b;
+    const size_t m = la < lb ? la : lb;
+    const size_t q = m < 32 ? (m & ~(size_t)7) : 32;
+    for (size_t i = 0; i < q; i += 8) {
+        uint64_t x, y;
+        memcpy(&x, t + a + i, 8);
+        memcpy(&y, t + b + i, 8);
+        if (x != y) return DSA_BSWAP64(x) < DSA_BSWAP64(y);
+    }
+    const int c = memcmp(t + a + q, t + b + q, m - q);
+    if (c != 0) return c < 0;
+    return la < lb;   /* a prefix sorts before what it prefixes */
+}
+
+/* ---------------------------------------------------------------------------
+ * the column step
+ * ------------------------------------------------------------------------ */
+
+/* Stepping one column left prepends a byte to every suffix in the run, so the
+ * new order is the old one re-sorted by that byte -- *stably*, because the
+ * existing order is already the correct tie-break for everything after it.
+ *
+ * Two ways to do a stable sort by one byte, and which is cheaper depends only
+ * on how many blocks are in the run.
+ *
+ * Insertion sort is O(blocks^2) but its constant is tiny and it moves nothing
+ * when the column is nearly sorted, which it often is. Counting sort is
+ * O(blocks + 256): two passes over the run plus a 256-bucket prefix sum, so it
+ * pays a fixed ~512 operations however short the run is.
+ *
+ * Break-even is around fifty blocks, and DSA_COUNT_MIN is set from measurement
+ * rather than from that arithmetic.
+ *
+ * Why this matters beyond the column step itself: the quadratic term is what
+ * forced DSA_RUN_SPLIT to cut runs at an RC4 rekey. A rekey rewrites all 256
+ * bytes, so no column across it is constant, so every column pays the sort --
+ * quadratic in a run length that would otherwise be unbounded. With the
+ * quadratic gone, runs are free to cross a rekey, and longer runs make bigger
+ * pre-ordered groups, which is what the global merge actually wants.
+ */
+#ifndef DSA_COUNT_MIN
+#define DSA_COUNT_MIN 48
+#endif
+
+/* Above this many blocks in a run, the rank sort below stops being the cheapest
+ * way to do a column: it costs blocks*blocks comparisons, against a few times
+ * blocks for an insertion sort on nearly-sorted input.
+ *
+ * Runs average 4.4 blocks, so this is the case that matters and not a corner.
+ *
+ * Swept at one thread, three interleaved repeats, median texts/s:
+ *
+ *     off  5,321      8  5,359     16  5,439     24  5,281
+ *
+ * Sixteen, then, and +2.2% over the insertion sort. Worth recording that this
+ * was expected to be much bigger: ablating column_step out of the walk entirely
+ * said it was 54% of the walk and 21% of the whole sort, which would have made a
+ * four-times-faster column step worth 16%. It was not, so most of that 21% is
+ * not the sort at all -- removing column_step also freezes the block order,
+ * which changes what the emit loop sees. An ablation measures the phase plus
+ * everything downstream that depended on it. */
+#ifndef DSA_RANK_MAX
+#define DSA_RANK_MAX 16
+#endif
+
+static inline void column_step(const uint8_t* t, uint32_t* order, uint32_t* tmp,
+                               uint32_t blocks, uint32_t col)
+{
+    if (blocks <= DSA_RANK_MAX) {
+        /* Sort by rank: for each element, count how many sort below it, and that
+         * count is where it goes.
+         *
+         * The insertion sort below is the obvious way and, at these sizes, the
+         * expensive one. Ablation puts column_step at 54% of the column walk and
+         * 21% of the whole sort -- 40 cycles a call to put four bytes in order --
+         * and that is not the comparisons, it is the inner while loop, whose trip
+         * count is one to four and unpredictable. Four mispredicts at 20 cycles
+         * is the whole 40.
+         *
+         * This has no data-dependent branch at all: two loops of fixed length,
+         * with the comparison producing a 0 or 1 that is added. Sixteen
+         * comparisons for a four-block run beats four mispredicts.
+         *
+         * Stability comes out of the packing rather than the algorithm. The key
+         * is the column byte shifted up with the element's own index underneath,
+         * so no two packed values are equal and equal bytes are ordered by where
+         * they already were -- which is exactly the tie-break the walk needs. */
+        uint32_t v[DSA_RANK_MAX];
+        for (uint32_t x = 0; x < blocks; x++) {
+            v[x] = ((uint32_t)t[order[x] + col] << 9) | x;
+        }
+        for (uint32_t x = 0; x < blocks; x++) {
+            uint32_t r = 0;
+            for (uint32_t y = 0; y < blocks; y++) r += (v[y] < v[x]);
+            tmp[r] = order[x];
+        }
+        memcpy(order, tmp, blocks * sizeof(uint32_t));
+        return;
+    }
+
+    if (blocks < DSA_COUNT_MIN) {
+        for (uint32_t x = 1; x < blocks; x++) {
+            const uint32_t v = order[x];
+            const uint8_t key = t[v + col];
+            uint32_t y = x;
+            while (y > 0 && t[order[y - 1] + col] > key) {
+                order[y] = order[y - 1];
+                y--;
+            }
+            order[y] = v;
+        }
+        return;
+    }
+
+    uint32_t cnt[256];
+    memset(cnt, 0, sizeof(cnt));
+    for (uint32_t x = 0; x < blocks; x++) cnt[t[order[x] + col]]++;
+
+    uint32_t sum = 0;
+    for (uint32_t b = 0; b < 256; b++) {
+        const uint32_t c = cnt[b];
+        cnt[b] = sum;
+        sum += c;
+    }
+    /* Ascending x, so equal bytes keep their relative order: stable. */
+    for (uint32_t x = 0; x < blocks; x++) {
+        const uint32_t v = order[x];
+        tmp[cnt[t[v + col]]++] = v;
+    }
+    memcpy(order, tmp, blocks * sizeof(uint32_t));
+}
+
+/* ---------------------------------------------------------------------------
+ * the column walk
+ * ------------------------------------------------------------------------ */
+
+/* emit_run walks one run's columns right to left, appending descriptors.
+ *
+ * order[] is maintained as described at the top of the file: on entry to each
+ * column the suffixes at order[i] + rel are in ascending order.
+ */
+static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
+                    uint32_t blocks, Scratch* s,
+                    size_t* arena_len, size_t* desc_len)
+{
+    /* Each column emits at most `blocks` descriptors, so checking once per
+     * column keeps the check off the inner loop. */
+    const size_t desc_room = s->desc_cap;
+    const uint32_t base = first_block * DSA_BLOCK;
+    uint32_t* order = s->order;
+
+    /* Seed: the suffixes starting at each block's last byte, sorted. Insertion
+     * sort -- blocks is at most DSA_RUN_MAX. */
+    for (uint32_t i = 0; i < blocks; i++) order[i] = base + i * DSA_BLOCK + 255;
+    for (uint32_t i = 1; i < blocks; i++) {
+        const uint32_t v = order[i];
+        uint32_t j = i;
+        while (j > 0 && suffix_less(t, n, v, order[j - 1])) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = v;
+    }
+    for (uint32_t i = 0; i < blocks; i++) order[i] -= 255;
+
+    /* Which columns are constant across every block of the run.
+     *
+     * Done a column at a time this is 256 short loops with a data-dependent
+     * break, which is the worst shape a branch predictor can be given: ~46% of
+     * the columns run to the end and the rest stop after one or two blocks, with
+     * nothing to predict from. Done 32 columns at a time it is a compare and an
+     * AND per block, no branches at all, and the whole table costs
+     * 8 * (blocks - 1) vector operations.
+     *
+     * Runs only ever cover whole blocks -- the caller's full_blocks is n/256 and
+     * the remainder is handled as single-suffix descriptors -- so every one of
+     * these 32-byte loads is inside the text. */
+    uint8_t constant[DSA_BLOCK];
+#if defined(DSA_ABLATE) && DSA_ABLATE >= 1
+    /* Ablation, for measurement only: pretend every column is constant. Removes
+     * both the table and every column_step, and the suffix array it produces is
+     * wrong. Never defined in a shipped build. */
+    memset(constant, 1, sizeof(constant));
+#elif defined(DSA_AVX2)
+    {
+        const uint8_t* const b0 = t + base;
+        const __m256i one = _mm256_set1_epi8(1);
+        for (uint32_t off = 0; off < DSA_BLOCK; off += 32) {
+            const __m256i v0 = _mm256_loadu_si256((const __m256i*)(b0 + off));
+            __m256i acc = _mm256_set1_epi8((char)0xFF);
+            for (uint32_t g = 1; g < blocks; g++) {
+                const __m256i vg =
+                    _mm256_loadu_si256((const __m256i*)(b0 + g * DSA_BLOCK + off));
+                acc = _mm256_and_si256(acc, _mm256_cmpeq_epi8(v0, vg));
+            }
+            /* cmpeq leaves 0xFF where equal; the AND turns that into a 1. */
+            _mm256_storeu_si256((__m256i*)(constant + off),
+                                _mm256_and_si256(acc, one));
+        }
+    }
+#else
+    for (uint32_t rel = 0; rel < DSA_BLOCK; rel++) {
+        const uint8_t c = t[base + rel];
+        uint8_t same = 1;
+        for (uint32_t g = 1; g < blocks; g++) {
+            if (t[base + g * DSA_BLOCK + rel] != c) { same = 0; break; }
+        }
+        constant[rel] = same;
+    }
+#endif
+
+    /* Columns where the next four are all constant.
+     *
+     * Where they are, every block of the run has the same four bytes at that
+     * offset, so every suffix in the column shares its key, the whole run is one
+     * group, and the scan below cannot discover anything: it computes `blocks`
+     * identical keys and compares them. Measured, 91% of columns emit exactly
+     * one descriptor (20,124 descriptors over 62 runs x 256 columns), so this is
+     * the common case and not a special one.
+     *
+     * The last three columns are excluded because constant[] only covers this
+     * block; columns 256 and past belong to the next one. That is 3 of 256. */
+    uint8_t same4[DSA_BLOCK];
+    for (uint32_t rel = 0; rel + 4 <= DSA_BLOCK; rel++) {
+        same4[rel] = (uint8_t)(constant[rel] & constant[rel + 1] &
+                               constant[rel + 2] & constant[rel + 3]);
+    }
+    same4[DSA_BLOCK - 3] = 0;
+    same4[DSA_BLOCK - 2] = 0;
+    same4[DSA_BLOCK - 1] = 0;
+
+    for (int rel = DSA_BLOCK - 1; rel >= 0; rel--) {
+        const uint32_t r = (uint32_t)rel;
+
+        /* Split the (already ordered) suffixes into maximal groups sharing
+         * their four leading bytes, and record each as one descriptor. */
+        if (*desc_len + blocks > desc_room) return 0;   /* grow and retry */
+
+#ifndef DSA_NO_SAME4
+        if (same4[r]) {
+            /* Every block shares this column's four bytes, so there is exactly
+             * one group and the scan below would only prove it the long way. */
+            Desc* d = &s->desc[*desc_len];
+            d->key = key32(t, n, order[0] + r);
+            d->packed = desc_pack((uint32_t)*arena_len, blocks);
+            for (uint32_t x = 0; x < blocks; x++) s->arena[(*arena_len)++] = order[x] + r;
+            (*desc_len)++;
+#if !defined(DSA_ABLATE)
+            if (rel > 0 && !constant[r - 1])
+                column_step(t, order, s->order2, blocks, r - 1);
+#endif
+            continue;
+        }
+#endif
+
+        uint32_t i = 0;
+        while (i < blocks) {
+            const uint32_t k = key32(t, n, order[i] + r);
+            uint32_t j = i + 1;
+            while (j < blocks && key32(t, n, order[j] + r) == k) j++;
+
+            Desc* d = &s->desc[*desc_len];
+            d->key = k;
+            d->packed = desc_pack((uint32_t)*arena_len, j - i);
+            /* The masked store that is worth 16% in the merge does nothing here
+             * -- 3,999 texts/s against 4,013 -- and the difference is instructive.
+             * There the four stores overlapped, because they wrote a fixed four
+             * words and advanced by a variable length. Here the write advances by
+             * exactly what it wrote, so consecutive stores already abut and there
+             * was never a store-buffer conflict to remove. */
+            for (uint32_t x = i; x < j; x++) s->arena[(*arena_len)++] = order[x] + r;
+            (*desc_len)++;
+            i = j;
+        }
+
+        /* Step left. A constant column prepends the same byte to every suffix,
+         * so the order is unchanged and there is nothing to do -- this is where
+         * the time is saved. */
+#if !defined(DSA_ABLATE)
+        if (rel > 0 && !constant[r - 1]) {
+            column_step(t, order, s->order2, blocks, r - 1);
+        }
+#endif
+    }
+    return 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * the global merge
+ * ------------------------------------------------------------------------ */
+
+/* Radix sort the descriptors by key, most significant byte last so the result
+ * is ascending. Stable, so descriptors that tie keep the order they were
+ * emitted in -- which is not the answer, but is a starting point the tie-break
+ * below refines. */
+/* Eleven bits a pass, so a 32-bit key takes three passes and not four.
+ *
+ * Sorting a four-byte permutation instead of the eight-byte descriptors was
+ * tried, to halve what these passes move -- around 970 KB a text, the largest
+ * single item of traffic in this sort. The digit then comes from
+ * desc[perm[i]].key, a gather rather than a sequential read, and the bet was
+ * that trading L3 bandwidth for L2 latency would pay at fifteen threads even if
+ * it lost at one.
+ *
+ * It lost at both: 3,201 texts/s against 3,433 on one thread, and 20,223 H/s
+ * against 21,365 in the miner at fifteen. Descriptors are 161 KB for a full
+ * text, and at fifteen threads there is no L2 left for them -- so the "L2
+ * gather" is an L3 gather, and there are 40,000 of them per text.
+ *
+ * Each pass reads and writes every descriptor -- twelve bytes, twenty thousand
+ * of them -- so a pass saved is a quarter of the traffic of this phase. The cost
+ * is 2048 counters per pass instead of 256, which is 24 KB of histogram against
+ * a 48 KB L1: it fits, and it is touched once per descriptor either way.
+ *
+ * Three is odd, so the result ends up in the scratch array rather than back
+ * where it started. Returning which one it is beats copying it back, which
+ * would give away the pass this saved.
+ */
+
+
+#if DSA_KEY_BYTES == 3
+#define DSA_RBITS 12
+#define DSA_RPASS 2
+#else
+#define DSA_RBITS 11
+#define DSA_RPASS 3
+#endif
+#define DSA_RBINS (1u << DSA_RBITS)
+#define DSA_RMASK (DSA_RBINS - 1u)
+
+static Desc* sort_desc(Desc* a, Desc* b, size_t count)
+{
+    static const int shift[DSA_RPASS] = {
+        0, DSA_RBITS,
+#if DSA_RPASS > 2
+        2 * DSA_RBITS,
+#endif
+    };
+
+    uint32_t hist[DSA_RPASS][DSA_RBINS];
+    memset(hist, 0, sizeof(hist));
+    for (size_t i = 0; i < count; i++) {
+        const uint32_t k = a[i].key;
+        for (int p = 0; p < DSA_RPASS; p++) {
+            hist[p][(k >> shift[p]) & DSA_RMASK]++;
+        }
+    }
+    for (int p = 0; p < DSA_RPASS; p++) {
+        uint32_t sum = 0;
+        for (uint32_t v = 0; v < DSA_RBINS; v++) {
+            const uint32_t c = hist[p][v];
+            hist[p][v] = sum;
+            sum += c;
+        }
+    }
+    for (int p = 0; p < DSA_RPASS; p++) {
+        const int sh = shift[p];
+        for (size_t i = 0; i < count; i++) {
+            b[hist[p][(a[i].key >> sh) & DSA_RMASK]++] = a[i];
+        }
+        Desc* tmp = a; a = b; b = tmp;
+    }
+    return a;   /* the swap after the last pass leaves the result here */
+}
+
+int dsa_descriptor_suffix_array(const uint8_t* t, int32_t* sa, int32_t n_in)
+{
+    if (!t || !sa || n_in <= 0) return -1;
+    const size_t n = (size_t)n_in;
+
+    /* Half the worst case to start with; grown on the retry below. */
+    Scratch* s = scratch_get(n, n / 2 + DSA_BLOCK + 8);
+    if (!s) return -2;
+
+retry:
+
+    const uint32_t full_blocks = (uint32_t)(n / DSA_BLOCK);
+    size_t arena_len = 0, desc_len = 0;
+
+    /* Runs: consecutive blocks, cut where a block differs wholesale from its
+     * predecessor, and capped so the per-column insertion sorts stay short. */
+    PROF_MARK();
+    uint32_t g = 0;
+    while (g < full_blocks) {
+        uint32_t len = 1;
+        while (len < DSA_RUN_MAX && g + len < full_blocks) {
+            const uint8_t* a = t + (size_t)(g + len - 1) * DSA_BLOCK;
+            const uint8_t* b = t + (size_t)(g + len) * DSA_BLOCK;
+            int diff = 0;
+#if defined(DSA_AVX2)
+            /* How many of the 256 bytes differ, counted 32 at a time.
+             *
+             * The scalar version below reads a byte, compares, and checks the
+             * early-out, 256 times a block pair and 272 block pairs a text. It
+             * was 7.3% of the whole sort for what is eight compares and eight
+             * popcounts of work. The early-out is dropped with it: it saved
+             * reads only on the pairs that differ wholesale, and eight vector
+             * compares are cheaper than the branch that decided whether to
+             * bother. */
+            for (uint32_t o = 0; o < DSA_BLOCK; o += 32) {
+                const __m256i va = _mm256_loadu_si256((const __m256i*)(a + o));
+                const __m256i vb = _mm256_loadu_si256((const __m256i*)(b + o));
+                const uint32_t eq =
+                    (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb));
+                diff += 32 - (int)_mm_popcnt_u32(eq);
+            }
+#else
+            for (int i = 0; i < DSA_BLOCK && diff <= DSA_RUN_SPLIT; i++) {
+                diff += (a[i] != b[i]);
+            }
+#endif
+            if (diff > DSA_RUN_SPLIT) break;
+            len++;
+        }
+        PROF_LAP(PH_RUNS);
+        PROF_STAT(ST_RUNS, 1);
+        if (!emit_run(t, n, g, len, s, &arena_len, &desc_len)) {
+            /* Out of descriptor room. Grow to the bound nothing can exceed and
+             * do the text again; one wasted walk, and it did not happen on any
+             * of the 512 measured texts. */
+            const size_t full = desc_bound(n);
+            if (s->desc_cap >= full) return -3;   /* already at the bound */
+            s = scratch_get(n, full);
+            if (!s) return -2;
+            goto retry;
+        }
+        PROF_LAP(PH_WALK);
+        g += len;
+    }
+
+    /* The tail past the last whole block: one descriptor per suffix. */
+    if (desc_len + (n - (size_t)full_blocks * DSA_BLOCK) > s->desc_cap) {
+        const size_t full = desc_bound(n);
+        if (s->desc_cap >= full) return -3;
+        s = scratch_get(n, full);
+        if (!s) return -2;
+        goto retry;
+    }
+    for (size_t p = (size_t)full_blocks * DSA_BLOCK; p < n; p++) {
+        Desc* d = &s->desc[desc_len++];
+        d->key = key32(t, n, p);
+        d->packed = desc_pack((uint32_t)arena_len, 1);
+        s->arena[arena_len++] = (uint32_t)p;
+    }
+
+    if (arena_len != n) return -4;   /* every suffix exactly once */
+    PROF_LAP(PH_TAIL);
+    PROF_STAT(ST_DESC, desc_len);
+    PROF_MAX(ST_MAXDESC, desc_len);
+
+    Desc* const ds = sort_desc(s->desc, s->desc2, desc_len);
+    PROF_LAP(PH_RADIX);
+
+    /* Write out, resolving descriptors that share all four leading bytes.
+     *
+     * Each descriptor's positions are already in order; only their interleaving
+     * is unknown. The groups are small, so a straight insertion merge over the
+     * gathered positions is both simplest and fastest here. */
+    /* The gather out of the arena looked like it should want prefetching: this
+     * walks descriptors in key order and their offsets point all over 275 KB.
+     * Measured at distances of 1, 4, 8, 16, 32 and 64 descriptors ahead, every
+     * one of them landed within noise of no prefetch at all, so there is none.
+     * What actually cost time here was a branch, not a miss -- see below.
+     *
+     * Retried at fifteen threads, where the arena is an L3 hit rather than an L2
+     * one and the argument for prefetching is much stronger, at distances 2, 4,
+     * 8, 16 and 32. It came back inconclusive rather than negative: the spread
+     * between repeats of the *same* binary was 32,703 / 30,033 / 15,455 texts/s
+     * as background load on the machine came and went, which is far wider than
+     * anything being looked for. Not kept, because "cannot tell" is not a
+     * reason to add an instruction to the hottest loop in the sort. */
+    size_t out = 0;
+    size_t i = 0;
+    while (i < desc_len) {
+        const Desc* d0 = &ds[i];
+
+
+        /* The overwhelmingly common case, and the one that decides the cost of
+         * this loop: a key nothing else shares, so its positions go straight
+         * out. There are ~19,000 groups per text and ~98.7% of them are this,
+         * carrying about three positions each.
+         *
+         * The read out of the arena here is free, which is worth recording because
+     * it looks like it should not be: it is a gather over 275 KB at offsets that
+     * the radix sort scattered, ~19,000 of them a text, and the runs are ~14
+     * bytes so most of each cache line fetched goes unused. Replacing the read
+     * with nothing at all -- a deliberately wrong suffix array, timed only to
+     * find the ceiling -- measured 3,430 texts/s against 3,448 with it. There is
+     * nothing there to win, so the arena stays.
+     *
+     * Written as an element loop rather than memcpy on purpose. The length
+         * is a variable, so memcpy is a call, and a call to move fourteen bytes
+         * costs more than the move. Measured over the whole sort: 2,527 texts/s
+         * with memcpy here, 3,447 with this.
+         *
+         * Checking one key rather than scanning forward for the end of the
+         * group also matters -- a singleton is settled by a single comparison.
+         */
+        if (i + 1 == desc_len || ds[i + 1].key != d0->key) {
+            PROF_STAT(ST_KEYGRP, 1);
+            const uint32_t* src = s->arena + dsa_off(*d0);
+            const uint32_t len = dsa_len(*d0);
+            /* Four unconditional stores instead of a loop of `len`.
+             *
+             * len is one to a handful and unpredictable, so the loop cost a
+             * branch mispredict per group -- about twenty cycles to move
+             * fourteen bytes, times nineteen thousand groups a text.
+             *
+             * Over-copying is safe and self-correcting: the next group starts
+             * at out+len and overwrites anything written past it, the arena has
+             * eight words of slack so the reads stay in bounds, and the guard
+             * keeps the last group from running off the end of sa. */
+#if defined(DSA_AVX2)
+            /* Exactly len words, with no branch and no overlap.
+             *
+             * This is the third version of four stores. Writing len of them in a
+             * loop cost a branch mispredict per group, because len is one to a
+             * handful and unpredictable: 2,527 texts/s. Writing four
+             * unconditionally and advancing by len fixed that but made
+             * consecutive groups write overlapping 16-byte ranges -- len averages
+             * 3.4 -- so every store partially covered the one before it and the
+             * store buffer paid for it: 3,450 texts/s. A masked store writes
+             * only the lanes that count, so the ranges abut: 4,009 texts/s.
+             *
+             * Reading eight words when len is smaller is safe: the arena carries
+             * eight words of slack past n for exactly this.
+             *
+             * Two more shapes were tried later, once the rest of the sort had
+             * moved and the balance might have. A single unconditional 32-byte
+             * store, advancing by len, was wrong -- it mismatched on the 512
+             * texts -- and one unconditional 16-byte store for len <= 4 measured
+             * 4,637 texts/s against 5,412. So the overlap really is what costs
+             * here, and covering fewer words does not fix it: what matters is
+             * that consecutive stores abut exactly, which only a mask gives. */
+            if (len <= 8) {
+                static const int32_t maskTab[9][8] = {
+                    { 0,  0,  0,  0,  0,  0,  0,  0},
+                    {-1,  0,  0,  0,  0,  0,  0,  0},
+                    {-1, -1,  0,  0,  0,  0,  0,  0},
+                    {-1, -1, -1,  0,  0,  0,  0,  0},
+                    {-1, -1, -1, -1,  0,  0,  0,  0},
+                    {-1, -1, -1, -1, -1,  0,  0,  0},
+                    {-1, -1, -1, -1, -1, -1,  0,  0},
+                    {-1, -1, -1, -1, -1, -1, -1,  0},
+                    {-1, -1, -1, -1, -1, -1, -1, -1},
+                };
+                const __m256i m = _mm256_loadu_si256((const __m256i*)maskTab[len]);
+                const __m256i v = _mm256_loadu_si256((const __m256i*)src);
+                _mm256_maskstore_epi32(sa + out, m, v);
+            } else {
+                for (uint32_t z = 0; z < len; z++) sa[out + z] = (int32_t)src[z];
+            }
+#else
+            /* No AVX2: four unconditional stores, which is still better than a
+             * loop of len. The guard keeps the last group from running past sa. */
+            if (len <= 4 && out + 4 <= n) {
+                sa[out + 0] = (int32_t)src[0];
+                sa[out + 1] = (int32_t)src[1];
+                sa[out + 2] = (int32_t)src[2];
+                sa[out + 3] = (int32_t)src[3];
+            } else {
+                for (uint32_t z = 0; z < len; z++) sa[out + z] = (int32_t)src[z];
+            }
+#endif
+            out += len;
+            i++;
+            continue;
+        }
+
+        size_t j = i + 1;
+        while (j < desc_len && ds[j].key == ds[i].key) j++;
+
+        PROF_STAT(ST_KEYGRP, 1);
+        {
+            PROF_STAT(ST_COLLIDE, 1);
+            /* Several descriptors share these four bytes, so their positions
+             * have to be interleaved by comparison. Each descriptor's list is
+             * already in order, so this is a merge and not a sort: lay them out
+             * end to end with their boundaries, then merge adjacent pairs until
+             * one list is left.
+             *
+             * Insertion sorting the group instead is quadratic, and these
+             * groups are not small -- 88% of suffixes in these texts share
+             * their first four bytes with a neighbour.
+             *
+             * The boundary tables are sized for every descriptor in the text,
+             * so there is no cap to overflow. A fixed table here needed a case
+             * for "too many lists", and the only thing that case could do was
+             * be wrong: the buffer holds several separately sorted lists, not
+             * one sorted array, so nothing can be inserted into it.
+             */
+            uint32_t* a = s->merge;
+            uint32_t* b = s->merge2;
+            uint32_t* ba = s->bnd;
+            uint32_t* bb = s->bnd2;
+            size_t nlist = 0, total = 0;
+
+            /* Sized for what these texts do, not for the worst case; see the
+             * note on DSA_GROUP_CAP. A group past it hands the whole hash to
+             * libsais, which is slower and right. */
+            {
+                size_t need = 0;
+                for (size_t k = i; k < j; k++) need += dsa_len(ds[k]);
+                if (need > DSA_GROUP_CAP || (j - i) > DSA_GROUP_CAP) return -6;
+            }
+
+            for (size_t k = i; k < j; k++) {
+                const Desc* d = &ds[k];
+                ba[nlist++] = (uint32_t)total;
+                const uint32_t dl = dsa_len(*d);
+                memcpy(a + total, s->arena + dsa_off(*d), dl * sizeof(uint32_t));
+                total += dl;
+            }
+            ba[nlist] = (uint32_t)total;
+            PROF_MAX(ST_MAXMERGE, total);
+            PROF_MAX(ST_MAXLIST, nlist);
+
+            while (nlist > 1) {
+                size_t out_lists = 0, pos = 0;
+                for (size_t l = 0; l < nlist; l += 2) {
+                    bb[out_lists++] = (uint32_t)pos;
+                    if (l + 1 == nlist) {
+                        const uint32_t s0 = ba[l], e0 = ba[l + 1];
+                        memcpy(b + pos, a + s0, (e0 - s0) * sizeof(uint32_t));
+                        pos += e0 - s0;
+                    } else {
+                        uint32_t p0 = ba[l], e0 = ba[l + 1];
+                        uint32_t p1 = ba[l + 1], e1 = ba[l + 2];
+                        while (p0 < e0 && p1 < e1)
+                            b[pos++] = suffix_less(t, n, a[p1], a[p0]) ? a[p1++] : a[p0++];
+                        while (p0 < e0) b[pos++] = a[p0++];
+                        while (p1 < e1) b[pos++] = a[p1++];
+                    }
+                }
+                bb[out_lists] = (uint32_t)pos;
+
+                uint32_t* tv = a; a = b; b = tv;
+                uint32_t* tb = ba; ba = bb; bb = tb;
+                nlist = out_lists;
+            }
+
+            memcpy(sa + out, a, total * sizeof(uint32_t));
+            out += total;
+            PROF_STAT(ST_MERGED, total);
+        }
+        i = j;
+    }
+    PROF_LAP(PH_MERGE);
+
+    return out == n ? 0 : -5;
+}
+
+void dsa_descriptor_release(void)
+{
+    scratch_free(g_scratch);
+    g_scratch = NULL;
+}
