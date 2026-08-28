@@ -17,6 +17,12 @@ gpu/vectors.bin
 # --- local config: holds your wallet address ---
 derostorm.json
 
+# --- release archives ---
+*.rar
+*.zip
+*.7z
+*.tar.gz
+
 # --- logs and profiler dumps ---
 *.log
 *.ncu-rep

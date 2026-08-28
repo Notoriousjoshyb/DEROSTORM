@@ -27,6 +27,19 @@ Copyright (c) 2021-2024 Ilya Grebnov. Licensed under the Apache License,
 Version 2.0. Full text: `native/libsais/LICENSE`. The source is unmodified.
 Only the small C wrapper in `native/derostorm_sa.c` is original derostorm code.
 
+## Dirtybird C Miner — MIT (idea, not code)
+
+https://github.com/Dirtybird99/Dirtybird-C-Miner — Copyright (c) Dirtybird99,
+MIT licensed.
+
+No Dirtybird source is included in this repository. It is listed here because
+the design of the descriptor suffix sort in `native/descriptor.c` follows an
+insight first published in that miner: that AstroBWTv3's stage-1 output has
+exploitable structure a general suffix sort discards. The C in
+`native/descriptor.c` is original DeroStorm code and is covered by our MIT
+licence, but the credit for the approach belongs to Dirtybird99. See
+`CREDITS.md`.
+
 ## Go module dependencies
 
 `vendor/` also contains the remaining Go module dependencies listed in

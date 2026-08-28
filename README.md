@@ -10,11 +10,11 @@ and `astrobwt/difftest` compares the two on every build.
 ```
 ╭─ DEROSTORM ──────────────────────────────────────── AstroBWTv3 · v1.1.0 ─╮
 │                                                                          │
-│  ◆ MINING                      28.12 KH/s                 15 CPU · 1 GPU │
+│  ◆ MINING                      85.44 KH/s                 15 CPU · 1 GPU │
 │       ▁▂▃▄▅▆▇▇▇▇▇▇▇▇▇▇█▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   60s │
 │                                                                          │
-│    CPU ████████████████████████████▌░░░░░░░░░░░░░░░░░░░    18.03 KH/s  64% │
-│    GPU ██████████████████████████████████▌░░░░░░░░░░░   10.09 KH/s  36% │
+│    CPU ██████████████████████████████▎░░░░░░░░░░░░░░░░   33.51 KH/s  39% │
+│    GPU ███████████████████████████████████████████████   51.93 KH/s  61% │
 │                                                                          │
 ├──────────────────────────────────────────────────────────────────────────┤
 │  HEIGHT      2,481,903                NETWORK     120.00 KH/s            │
@@ -250,14 +250,31 @@ is checked the same way — `gpu/hash_parallel_test.exe` against 512 real CPU
 vectors, and the miner re-verifies each device against the CPU at start-up before
 it will submit anything from it.
 
-Measured on a Ryzen 7 9800X3D (8C/16T) and an RTX 5080.
+All numbers below were re-measured on 2026-08-28 against DeroStorm 1.1.0, on a
+Ryzen 7 9800X3D (8C/16T, DDR5-6000 CL30) and an RTX 5080, unless a section says
+otherwise. Everything in this section except the *Before* columns and the
+*What does not help* experiments comes from `derostorm --bench`, which needs no
+node and no wallet, so you can reproduce it on your own machine in a minute.
+
+Headline, all of it at once:
+
+| | H/s |
+|---|---:|
+| CPU, 15 threads | 33,506 |
+| RTX 5080 | 51,931 |
+| **together** | **85,437** |
 
 ### CPU
 
-| | Before | After | |
+| | Before | Now | |
 |---|---:|---:|---:|
-| 1 thread | 700 H/s | 1,875 H/s | +168% |
-| 15 threads | 8.09 KH/s | 18.03 KH/s | +123% |
+| 1 thread | 700 H/s | 3,402 H/s | +386% |
+| 15 threads | 8.09 KH/s | 33,506 H/s | +314% |
+
+*Before* is stock derohe, measured once on this machine at the start and not
+re-run since — it is upstream code and does not move. *Now* is `--bench` on
+1.1.0. The intermediate figures this table used to carry (1,875 H/s and
+18.03 KH/s) were the state before the descriptor suffix sort landed.
 
 Three changes.
 
@@ -283,9 +300,15 @@ not a sort, because each descriptor's list is already ordered.
 Against libsais on the same 512 texts (`native\sabench.exe`):
 
 ```
-  libsais       0.415 s    1234 texts/s    84.8 MB/s
-  descriptor    0.195 s    2620 texts/s   180.1 MB/s   +112%
+  libsais 2.10.4, 512 texts, 35.2 MB, best of 3, 1 thread
+
+  libsais       0.416 s    1231 texts/s    84.6 MB/s
+  descriptor    0.095 s    5381 texts/s   370.0 MB/s   +337.2%
 ```
+
+That +337% is up from +112% when the sort first landed. The gap widened as the
+run-splitting and the descriptor merge were tuned; the libsais column has not
+moved, which is the point of keeping it in the same run.
 
 Two things decide whether it pays, and both are measurements rather than
 arguments. Runs must be long — 4 blocks is 47% *slower* than libsais, 32 blocks
@@ -295,28 +318,39 @@ RC4 rekey rewrites all 256 bytes: carrying a run through one makes almost every
 column non-constant and the per-column insertion sort quadratic in an unbounded
 length, which measured 443 texts/s against 2,139.
 
-The idea is from the Dirtybird C miner (MIT), which got there first. The
-implementation is ours, and it is checked against libsais over all 512 texts
-before any timing is reported — a suffix array is unique, so that is the whole
-correctness question.
+**Credit where it is due: the idea is not ours.** It comes from the
+[Dirtybird C miner](https://github.com/Dirtybird99/Dirtybird-C-Miner) by
+Dirtybird99 (MIT), which worked out that stage 1's output is not arbitrary text
+and that a suffix sort can exploit it. DeroStorm's implementation is its own
+code, written in C against our own run-splitting and descriptor merge, but the
+insight that makes it worth writing at all is Dirtybird's. See `CREDITS.md`.
+
+It is checked against libsais over all 512 texts before any timing is reported
+— a suffix array is unique, so that is the whole correctness question.
 
 **libsais replaces the Go suffix sort**, and is now the fallback behind the
 descriptor sort above rather than the fast path. The suffix array is ~90% of a hash, and
 the Go SA-IS in `astrobwtv3` is not the fastest way to build one. libsais is,
 on this data, by a consistent margin:
 
-| threads | built-in | libsais | |
+| threads | built-in (Go SA-IS) | descriptor + libsais | |
 |---:|---:|---:|---:|
-| 1 | 733 H/s | 877 H/s | +19.6% |
-| 4 | 2,640 H/s | 3,255 H/s | +23.3% |
-| 8 | 5,257 H/s | 6,111 H/s | +16.2% |
-| 15 | 8,212 H/s | 9,721 H/s | +18.4% |
+| 1 | 845 H/s | 2,849 H/s | +237.3% |
+| 4 | 2,649 H/s | 9,324 H/s | +252.0% |
+| 8 | 4,986 H/s | 17,950 H/s | +260.0% |
+| 15 | 8,450 H/s | 29,707 H/s | +251.6% |
 
-The 15-thread row is the mean of three runs (+17.3%, +17.8%, +20.0%). An earlier
-figure of +30% for this change was measured while another miner was running on
-the same machine, which flatters it: the Go sort degrades further under
-contention than libsais does, so the gap widens for reasons that have nothing to
-do with mining alone. `--bench` prints this comparison on your own machine, and
+These are whole hashes, not sorts, which is why they sit below the plain
+`--bench` throughput on the same thread count: the two sorts run interleaved so
+neither gets the quiet half of the machine. Run-to-run spread on the 15-thread
+row is about ±7 points (+251.6% and +258.4% on two runs a minute apart).
+
+When libsais alone replaced the Go sort — before the descriptor sort existed —
+the same table read +19.6% / +23.3% / +16.2% / +18.4%. An earlier figure of +30%
+for that change was measured while another miner was running on the same
+machine, which flatters it: the Go sort degrades further under contention than
+libsais does, so the gap widens for reasons that have nothing to do with mining
+alone. `--bench` prints this comparison on your own machine, and
 it interleaves the two sorts rather than running one after the other, because on
 a desktop doing anything else a sequential A-then-B mostly measures which one
 ran while the machine was quieter.
@@ -364,13 +398,39 @@ profile-guided optimisation (+1.2%).
 
 ### GPU
 
-| | Before | After | |
+| | Before | Now | |
 |---|---:|---:|---:|
-| RTX 5080 | 7.45 KH/s | 12.28 KH/s | +65% |
+| RTX 5080 | 7.45 KH/s | 51,931 H/s | +597% |
 
-Both figures are the GPU on its own, on the real mining path
-(`--mining-threads=1 --gpu=0 --run-for=90`). The suffix sort is ~95% of GPU hash
-time, so everything below is about it.
+*Before* is the GPU on its own on the real mining path
+(`--mining-threads=1 --gpu=0 --run-for=90`), measured when GPU support first
+worked. *Now* is `--bench --gpu=all`, which runs the same kernels over the same
+batch size without needing a node. The intermediate 12.28 KH/s this table used
+to carry was the gain from the packed-key change described below; the rest came
+from the block-count sweep and the stage-1 work after it.
+
+The kernel is checked before it is timed: `--bench` verifies the card against
+the CPU, and `gpu\hash_parallel_test.exe gpu\vectors.bin` reports
+`CORRECT: all 512 hashes match the CPU exactly`.
+
+Resident blocks matter more than anything else, and the curve is not flat:
+
+```
+    blocks            H/s       ms/batch
+        21           4794           1709
+        42           9219            889
+        84          18069            453
+       168          29199            281
+       336          45485            180
+       672          48636            168
+      1252          51931            158
+```
+
+The top of that curve is within noise of itself — a second run picked 672 blocks
+at 50,736 H/s — so the miner measures it while mining rather than shipping a
+constant. Pin it with `--gpu-blocks=<n>` if you would rather it did not.
+
+The suffix sort is ~95% of GPU hash time, so everything below is about it.
 
 **The sort carried a 64-bit key beside a 32-bit value; both fit in one word.**
 A rank and a suffix index are each a position in [0, n), which for a 71 KB text
@@ -421,6 +481,12 @@ buffer nothing touches is never in cache.
 
 Recorded because they are the obvious next guesses, and all three are wrong.
 Measured on a 9800X3D with DDR5-6000 CL30 and an RTX 5080.
+
+**These three were measured on an earlier build and have not been re-run.** The
+absolute H/s in them are therefore low against the numbers above — read them as
+ratios, not as throughput. The conclusions are about the shape of the workload,
+which the later work did not change: it is still L3-resident and still not
+DRAM-bound.
 
 **Faster system RAM.** The CPU hash is not memory bound, and it is not close.
 Testing it takes multiplying the footprint without changing the work: give each
@@ -613,7 +679,10 @@ derostorm/
 │   └── prof/               cycle attribution for the suffix kernel
 ├── vendor/                 all dependencies, including the optimised derohe
 ├── build.ps1 / build.sh
-└── README.md
+├── README.md
+├── CREDITS.md               who got there first
+├── LICENSE                  MIT, for DeroStorm's own code
+└── THIRD-PARTY-NOTICES.md   the licences that are not MIT
 ```
 
 `vendor/` contains the full optimised `derohe` source, so this folder builds standalone. If you re-point `go.mod`'s `replace` at a newer derohe checkout, re-run `go mod vendor`.
@@ -638,6 +707,14 @@ see `native/libsais/LICENSE`. Only the small C wrapper around it in
 `native/derostorm_sa.c` is ours.
 
 Full detail in `THIRD-PARTY-NOTICES.md`.
+
+## Credits
+
+The descriptor suffix sort — the single biggest CPU win in this miner — follows
+an idea first published in the [Dirtybird C
+miner](https://github.com/Dirtybird99/Dirtybird-C-Miner) by Dirtybird99 (MIT).
+The implementation here is ours; the insight is theirs. `CREDITS.md` has the
+full list.
 
 Mining rewards go to whatever address you configure and to nobody else; there is
 no developer fee.
