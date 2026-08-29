@@ -12,6 +12,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -107,11 +108,25 @@ type Snapshot struct {
 	Threads  int     // CPU mining threads
 	GPUs     int     // GPU workers running
 
-	// Split of Hashrate by source. Only drawn when GPUs > 0, where knowing
-	// which half is which is the difference between "the GPU is helping" and
-	// "the GPU died twenty minutes ago and I did not notice".
+	// Split of Hashrate by source. Knowing which half is which is the
+	// difference between "the GPU is helping" and "the GPU died twenty minutes
+	// ago and I did not notice".
+	//
+	// Devices is the same split at full resolution: one entry per hashing
+	// source, the CPU first and then a row per GPU. A rig with six cards needs
+	// per-card rows or a dead card is invisible -- the total drops by a sixth
+	// and nothing says which sixth. When Devices is empty the panel builds
+	// rows from CPURate and GPURate instead, which is what the tests and
+	// --preview use.
 	CPURate float64
 	GPURate float64
+	Devices []DeviceStat
+
+	// PeakRate is the best smoothed rate this session and AvgRate the mean
+	// over the whole run. Together with the live figure they say whether the
+	// machine is holding its speed or quietly losing it: one number cannot.
+	PeakRate float64
+	AvgRate  float64
 
 	History    []float64 // recent hashrate samples, oldest first
 	Height     int64
@@ -130,6 +145,10 @@ type Snapshot struct {
 	// mid-sweep hashrate as the machine's real one.
 	GPUTuning bool
 
+	// Sensors is the last hardware poll: CPU and GPU temperatures, and what
+	// else the card reported while it was being asked. Read-only here.
+	Sensors SensorSample
+
 	// Input is the command line the user is typing. It is drawn as the last row
 	// of the frame so the terminal never has to echo it into the panel.
 	Input     string
@@ -139,6 +158,46 @@ type Snapshot struct {
 }
 
 // ---------------------------------------------------------------- console
+
+// DeviceStat is one hashing source's row in the device section: the CPU, or
+// one GPU. The caller builds these, so nothing in this file has to know where a
+// temperature comes from or what a watt is.
+type DeviceStat struct {
+	Label string  // "CPU", "GPU 0"
+	Rate  float64 // hashes/sec from this source
+	TempC float64 // tempUnknown when there is no sensor for it
+	Note  string  // right-hand detail: "215W" for a GPU, "" for the CPU
+	IsGPU bool
+
+	// Ailing marks a source that is running but returning nothing. Drawn in
+	// the error colour, because a card that has stopped is the single most
+	// expensive thing that can go quietly wrong on a mining machine.
+	Ailing bool
+}
+
+// deviceRows is Devices, or a two-row stand-in built from the split rates when
+// the caller did not supply one.
+func (s Snapshot) deviceRows() []DeviceStat {
+	if len(s.Devices) > 0 {
+		return s.Devices
+	}
+	rows := []DeviceStat{{Label: "CPU", Rate: s.CPURate, TempC: s.Sensors.CPUTemp()}}
+	for i := 0; i < s.GPUs; i++ {
+		d := DeviceStat{Label: "GPU " + strconv.Itoa(i), IsGPU: true, TempC: tempUnknown}
+		// An even split is a stand-in, not a measurement, and it is only ever
+		// reached when the caller gave no per-device figures.
+		d.Rate = s.GPURate / float64(s.GPUs)
+		d.Ailing = d.Rate <= 0
+		if g := s.Sensors.gpuByIndex(i); g != nil {
+			d.TempC = g.TempC
+			if g.HavePower {
+				d.Note = fmt.Sprintf("%.0fW", g.PowerW)
+			}
+		}
+		rows = append(rows, d)
+	}
+	return rows
+}
 
 // Console owns the terminal. Feed it snapshots; it handles redrawing.
 type Console struct {
@@ -152,7 +211,10 @@ type Console struct {
 	// window trimmed it to.
 	maxLogLines int
 	lastLines   int
-	live        bool // false => plain scrolling output (mono / not a TTY)
+	// nGPU is how many GPU rows the panel is being sized for. Set once from
+	// the config; the panel itself draws whatever the snapshot carries.
+	nGPU int
+	live bool // false => plain scrolling output (mono / not a TTY)
 	// colour records whether escape sequences may be emitted at all. It is
 	// decided once, from the environment, and a runtime theme switch cannot
 	// override it -- otherwise "theme copper" would start writing escapes into
@@ -231,7 +293,7 @@ func (c *Console) fitTo(cols, rows int) bool {
 	// back, and starting from the maximum is what lets that happen. A trim-only
 	// version leaves a two-line log forever after one brief small window.
 	c.logLines = c.maxLogLines
-	for c.logLines > minLogLines && c.frameHeight() > rows {
+	for c.logLines > minLogLines && c.frameHeight(c.nGPU) > rows {
 		c.logLines--
 	}
 
@@ -242,7 +304,16 @@ func (c *Console) fitTo(cols, rows int) bool {
 	if c.width+1 > cols {
 		return false
 	}
-	return c.frameHeight() <= rows
+	return c.frameHeight(c.nGPU) <= rows
+}
+
+// PlanDevices tells the console how many GPUs the run will have, so trimming
+// the event log is done against the panel that is actually going to be drawn
+// rather than against a one-device guess.
+func (c *Console) PlanDevices(nGPU int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nGPU = nGPU
 }
 
 // SetTheme switches theme. It reports false when colour is not available in
@@ -279,18 +350,23 @@ func bannerRows(themeNote string) int {
 // away, and the panel stops earning the rows it is taking.
 const minLogLines = 2
 
-// FrameHeight is how many rows the live panel occupies at its tallest, which is
-// with a GPU running: the split rows only exist then, and this is used to size
-// the terminal window before anything is drawn. Measured by building a frame
-// rather than counted by hand, so it cannot drift when a row is added.
-func (c *Console) FrameHeight() int {
+// FrameHeight is how many rows the live panel occupies at its tallest with
+// nGPU devices running, which is what sizes the terminal window before anything
+// is drawn. Measured by building a frame rather than counted by hand, so it
+// cannot drift when a row is added.
+//
+// It takes the device count because the panel gives every GPU its own row: a
+// six-card rig is five rows taller than a one-card one, and a window sized for
+// one would have the panel walk down the screen. The caller knows the count
+// from the config before a single device is opened.
+func (c *Console) FrameHeight(nGPU int) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.frameHeight()
+	return c.frameHeight(nGPU)
 }
 
-func (c *Console) frameHeight() int {
-	return len(c.frame(Snapshot{ShowInput: true, GPUs: 1}))
+func (c *Console) frameHeight(nGPU int) int {
+	return len(c.frame(Snapshot{ShowInput: true, GPUs: nGPU}))
 }
 
 // LogLines is the size of the event log area, after any trimming.
@@ -494,66 +570,34 @@ func (c *Console) frame(s Snapshot) []string {
 		out = append(out, l.String())
 	}
 
-	// ---- where the hashrate is coming from, one bar per source.
+	// ---- where the hashrate is coming from, one row per source.
 	//
-	// Only drawn when a GPU is running: with the CPU alone the bar would always
-	// be full and the row would say nothing. Draw handles the frame changing
-	// height when a GPU starts or stops.
+	// This is the section that answers "is everything still working?", which a
+	// single combined number cannot. A source that stops contributing shows up
+	// here immediately instead of as a headline figure that is quietly a third
+	// lower than it was an hour ago -- and with a row per card, on a rig, it
+	// says which card rather than only that one of them went.
 	//
-	// This is the row that answers "is the GPU still working?", which a single
-	// combined number cannot. A GPU that stops contributing shows up here
-	// immediately instead of as a headline figure that is quietly a third lower
-	// than it was an hour ago.
-	if s.GPUs > 0 {
-		out = append(out, c.blank())
+	// The temperature lives here rather than in the stats grid for the same
+	// reason: it belongs beside the thing whose temperature it is, so a card
+	// that has slowed down and a card that is at 83°C are one glance, not two.
+	devices := s.deviceRows()
+	if len(devices) > 0 {
+		out = append(out, c.titledDivider("DEVICES"))
 
-		peak := s.CPURate
-		if s.GPURate > peak {
-			peak = s.GPURate
-		}
-		total := s.CPURate + s.GPURate
-
-		barW := inner - 27
-		if barW < 8 {
-			barW = 8
-		}
-
-		row := func(label string, rate float64, colour string) string {
-			var l lineBuf
-			l.add(t.Border, boxV)
-			l.padTo(5)
-			l.add(t.Muted, label)
-			l.padTo(9)
-
-			frac := 0.0
-			if peak > 0 {
-				frac = rate / peak
+		peak, total := 0.0, 0.0
+		for _, d := range devices {
+			if d.Rate > peak {
+				peak = d.Rate
 			}
-			l.add(colour, bar(frac, barW))
-
-			share := "--"
-			if total > 0 {
-				share = fmt.Sprintf("%.0f%%", rate/total*100)
-			}
-			l.padTo(W - 2 - 5 - 11)
-			l.add(t.Text, lpad(humanRate(rate), 11))
-			l.padTo(W - 2 - 5)
-			l.add(t.Dim, lpad(share, 5))
-			l.padTo(W - 1)
-			l.add(t.Border, boxV)
-			return l.String()
+			total += d.Rate
 		}
-
-		out = append(out, row("CPU", s.CPURate, t.Accent))
-		gpuColour := t.Accent2
-		if s.GPURate <= 0 {
-			gpuColour = t.Err // running but contributing nothing
+		for _, d := range devices {
+			out = append(out, c.deviceRow(d, peak, total))
 		}
-		out = append(out, row("GPU", s.GPURate, gpuColour))
 	}
 
-	out = append(out, c.blank())
-	out = append(out, c.divider())
+	out = append(out, c.titledDivider("NETWORK"))
 
 	// ---- two-column stats
 	//
@@ -562,11 +606,23 @@ func (c *Console) frame(s Snapshot) []string {
 	// Those two together are what says whether the machine is earning: a
 	// hashrate on its own does not, because it means something different at
 	// every difficulty.
+	//
+	// PEAK and the row beside UPTIME are the "is it still as fast as it was"
+	// pair. Efficiency is shown in hashes per watt where the cards report their
+	// power, because on a machine that runs for months that is the number the
+	// electricity bill is denominated in; with no power reading there is
+	// nothing honest to divide by, so the slot carries the session average
+	// instead.
+	trailLabel, trailValue := "AVG RATE", humanRate(s.AvgRate)
+	if eff, ok := gpuEfficiency(s); ok {
+		trailLabel, trailValue = "GPU EFF", fmt.Sprintf("%.0f H/W", eff)
+	}
 	stats := [][4]string{
-		{"HEIGHT", commas(uint64(maxi64(s.Height, 0))), "NETWORK", humanRate(float64(s.NetHashes))},
-		{"BLOCKS", commas(s.Blocks), "DIFFICULTY", commas(s.Difficulty)},
+		{"HEIGHT", commas(uint64(maxi64(s.Height, 0))), "DIFFICULTY", commas(s.Difficulty)},
+		{"BLOCKS", commas(s.Blocks), "NETWORK", humanRate(float64(s.NetHashes))},
 		{"MINIBLOCKS", commas(s.MiniBlocks), "SHARE", shareText(s)},
-		{"UPTIME", hms(s.Uptime), "REJECTED", commas(s.Rejected)},
+		{"REJECTED", commas(s.Rejected), "PEAK", humanRate(s.PeakRate)},
+		{"UPTIME", hms(s.Uptime), trailLabel, trailValue},
 	}
 	colB := 3 + inner/2
 	for _, row := range stats {
@@ -575,16 +631,21 @@ func (c *Console) frame(s Snapshot) []string {
 		l.padTo(3)
 		l.add(t.Muted, row[0])
 		l.padTo(3 + 12)
-		l.add(t.Text, clip(row[1], colB-3-12-2))
+
+		leftColour := t.Text
+		switch {
+		case row[0] == "REJECTED" && s.Rejected > 0:
+			leftColour = t.Warn
+		case row[0] == "BLOCKS" && s.Blocks > 0:
+			// A found block is the whole point of the program and has happened
+			// perhaps twice. It should not be the same colour as the height.
+			leftColour = t.Good
+		}
+		l.add(leftColour, clip(row[1], colB-3-12-2))
 		l.padTo(colB)
 		l.add(t.Muted, row[2])
 		l.padTo(colB + 12)
-
-		val, colour := row[3], t.Text
-		if row[2] == "REJECTED" && s.Rejected > 0 {
-			colour = t.Warn
-		}
-		l.add(colour, clip(val, W-2-(colB+12))) // -2 keeps a space before the border
+		l.add(t.Text, clip(row[3], W-2-(colB+12))) // -2 keeps a space before the border
 		l.padTo(W - 1)
 		l.add(t.Border, boxV)
 		out = append(out, l.String())
@@ -673,6 +734,116 @@ func (c *Console) ruleWithTitles(left, right string) string {
 func (c *Console) divider() string {
 	t := c.theme
 	return t.c(t.Border, boxTeeL+strings.Repeat(boxH, c.width-2)+boxTeeR)
+}
+
+// titledDivider is a divider that names the section under it. Two named
+// sections cost one row more than one unnamed rule and buy the reader a map:
+// the numbers above the line are about this machine and the ones below are
+// about the chain, which is not otherwise obvious from a grid of labels.
+func (c *Console) titledDivider(title string) string {
+	t := c.theme
+	W := c.width
+	var l lineBuf
+	l.add(t.Border, boxTeeL+boxH+" ")
+	l.add(t.Accent2, title)
+	l.add("", " ")
+	if W-1 > l.w {
+		l.add(t.Border, strings.Repeat(boxH, W-1-l.w))
+	}
+	l.add(t.Border, boxTeeR)
+	return l.String()
+}
+
+// deviceRow draws one hashing source: label, a bar of its share, its rate, that
+// share as a percentage, its temperature, and whatever detail the caller
+// attached.
+//
+// The right-hand columns are laid out from the border inwards at fixed widths,
+// so they line up at every panel width and the bar absorbs the difference. That
+// is the opposite of laying out from the left, which is what makes a table
+// where the last column moves as the numbers change.
+func (c *Console) deviceRow(d DeviceStat, peak, total float64) string {
+	t := c.theme
+	W := c.width
+
+	const noteW, tempW, shareW, rateW = 6, 6, 6, 11
+	noteAt := W - 2 - noteW // -2 keeps a space between the last column and the border
+	tempAt := noteAt - tempW
+	shareAt := tempAt - shareW
+	rateAt := shareAt - rateW
+	const barAt = 3 + 7
+	barW := rateAt - barAt - 1
+	if barW < 6 {
+		barW = 6
+	}
+
+	var l lineBuf
+	l.add(t.Border, boxV)
+	l.padTo(3)
+	l.add(t.Muted, clip(d.Label, 6))
+	l.padTo(barAt)
+
+	frac := 0.0
+	if peak > 0 {
+		frac = d.Rate / peak
+	}
+	barColour := t.Accent
+	if d.IsGPU {
+		barColour = t.Accent2
+	}
+	if d.Ailing {
+		barColour = t.Err
+	}
+	l.add(barColour, bar(frac, barW))
+
+	l.padTo(rateAt)
+	l.add(t.Text, lpad(humanRate(d.Rate), rateW))
+
+	share := "--"
+	if total > 0 {
+		share = fmt.Sprintf("%.0f%%", d.Rate/total*100)
+	}
+	l.padTo(shareAt)
+	l.add(t.Dim, lpad(share, shareW))
+
+	l.padTo(tempAt)
+	l.add(tempColour(t, d.TempC), lpad(tempText(d.TempC), tempW))
+
+	l.padTo(noteAt)
+	l.add(t.Dim, lpad(clip(d.Note, noteW), noteW))
+
+	l.padTo(W - 1)
+	l.add(t.Border, boxV)
+	return l.String()
+}
+
+// gpuEfficiency is GPU hashes per watt, and whether there was enough to say.
+//
+// It is deliberately GPU-only. The cards report their own power draw; the CPU
+// does not, on any platform this runs on, so a whole-machine figure would be a
+// real number divided by a made-up one. A wrong efficiency is worse than none:
+// it is the number someone would use to choose a power limit.
+func gpuEfficiency(s Snapshot) (float64, bool) {
+	watts, rate := 0.0, 0.0
+	for i := range s.Sensors.GPUs {
+		g := &s.Sensors.GPUs[i]
+		if !g.HavePower || g.PowerW <= 0 {
+			return 0, false
+		}
+		watts += g.PowerW
+	}
+	if watts <= 0 || len(s.Sensors.GPUs) == 0 {
+		return 0, false
+	}
+	for _, d := range s.deviceRows() {
+		if d.IsGPU {
+			rate += d.Rate
+		}
+	}
+	if rate <= 0 {
+		return 0, false
+	}
+	return rate / watts, true
 }
 
 func (c *Console) bottom() string {

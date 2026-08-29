@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"math/big"
 	"runtime"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -258,4 +259,28 @@ func (e *Engine) GPUHashes() (t uint64) {
 		t += atomic.LoadUint64(&e.gpuCounters[i].n)
 	}
 	return
+}
+
+// GPUHashesFor is one device's counter. The console keeps a rate window per
+// device from this, which is what lets a six-card rig show which card stopped
+// rather than only that the total dropped.
+func (e *Engine) GPUHashesFor(device int) uint64 {
+	if device < 0 || device >= maxGPUs {
+		return 0
+	}
+	return atomic.LoadUint64(&e.gpuCounters[device].n)
+}
+
+// GPUDeviceList is the indices of the workers running right now, in order.
+// Taken under the same lock SetGPUs writes under, so the console can never see
+// a half-applied change.
+func (e *Engine) GPUDeviceList() []int {
+	e.gmu.Lock()
+	defer e.gmu.Unlock()
+	out := make([]int, 0, len(e.gpuWorkers))
+	for d := range e.gpuWorkers {
+		out = append(out, d)
+	}
+	sort.Ints(out)
+	return out
 }

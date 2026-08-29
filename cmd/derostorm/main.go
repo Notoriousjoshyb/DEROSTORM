@@ -97,6 +97,17 @@ func main() {
 	}
 	globals.Arguments = opts
 
+	// CUDA numbers devices fastest-first by default, while NVML -- where the
+	// temperature and power readings come from -- numbers them by PCI bus. On a
+	// rig with unlike cards the two orderings differ, and "GPU 1" in the panel
+	// would then be one card's hashrate beside another card's temperature.
+	// Pinning CUDA to bus order makes the two the same numbering. Nothing here
+	// wants fastest-first: every device that is going to be used is named
+	// explicitly, so the order they are listed in decides nothing.
+	if _, set := os.LookupEnv("CUDA_DEVICE_ORDER"); !set {
+		os.Setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+	}
+
 	// docopt only defines the keys present in the usage string; globals reads a
 	// few others and expects them to be absent rather than nil-typed.
 	if _, ok := globals.Arguments["--testnet"]; !ok {
@@ -303,6 +314,9 @@ func run(cfg *Config, cfgPath string, theme *Theme, themeNote string, isTTY, noD
 	live := isTTY && !noDash && theme.Name != "mono"
 
 	console := NewConsole(os.Stdout, theme, live, 6)
+	// The panel gives every GPU its own row, so how tall it is depends on how
+	// many devices this run has. Told once, here, before anything is sized.
+	console.PlanDevices(len(cfg.GPUs))
 
 	// Get the window big enough for the banner and the panel before anything is
 	// drawn, so the header does not scroll off the top the moment mining starts.
@@ -328,7 +342,7 @@ func run(cfg *Config, cfgPath string, theme *Theme, themeNote string, isTTY, noD
 		// can start after this point, and the window cannot be grown again once
 		// output has begun.
 		const spare = 2
-		wantRows := bannerRows(themeNote) + console.FrameHeight() + spare
+		wantRows := bannerRows(themeNote) + console.FrameHeight(len(cfg.GPUs)) + spare
 		wantCols := console.Width() + spare
 
 		EnsureTerminalSize(wantCols, wantRows)
@@ -340,6 +354,7 @@ func run(cfg *Config, cfgPath string, theme *Theme, themeNote string, isTTY, noD
 				gotCols, gotRows, wantCols, wantRows)
 			live = false
 			console = NewConsole(os.Stdout, theme, false, 6)
+			console.PlanDevices(len(cfg.GPUs))
 		}
 	}
 
@@ -454,6 +469,19 @@ func run(cfg *Config, cfgPath string, theme *Theme, themeNote string, isTTY, noD
 		logf(LogInfo, "start", "mining with %d threads · commands: %s", cfg.Threads, commandHelp)
 	}
 
+	// Sensors are started after the workers so the first poll sees the machine
+	// under load rather than idle, and their failures are reported once here
+	// rather than every two seconds for the life of the run.
+	sensors := NewSensors(cfg.GPUs)
+	defer sensors.Close()
+	for _, note := range sensors.Notes() {
+		level := LogWarn
+		if strings.HasPrefix(note, "CPU temperature from") {
+			level = LogInfo
+		}
+		logf(level, "sensors", "%s", note)
+	}
+
 	console.HideCursor()
 
 	// ---- render loop
@@ -486,6 +514,13 @@ func run(cfg *Config, cfgPath string, theme *Theme, themeNote string, isTTY, noD
 	recentGPU := newRateWindow(10 * tickHz)
 	spark := newRateWindow(tickHz)
 
+	// One more window per GPU, on the same ten-second average as the headline.
+	// This is what makes a per-card row mean anything: a card is idle between
+	// batches, so a one-second view of a single device is mostly zeroes.
+	perGPU := make(map[int]*rateWindow, len(cfg.GPUs))
+	lastGPUEach := make(map[int]uint64, len(cfg.GPUs))
+	peakRate := 0.0
+
 	draw := func() {
 		// The window may have been resized since the last frame, and the panel
 		// has to be inside it before anything is written. Two console queries,
@@ -503,6 +538,17 @@ func run(cfg *Config, cfgPath string, theme *Theme, themeNote string, isTTY, noD
 		if cpuRate < 0 {
 			cpuRate = 0
 		}
+		if rate > peakRate {
+			peakRate = rate
+		}
+
+		sensed := sensors.Sample()
+		devices := buildDeviceRows(engine, perGPU, cpuRate, sensed)
+
+		avg := 0.0
+		if up := time.Since(start).Seconds(); up > 0 {
+			avg = float64(engine.TotalHashes()) / up
+		}
 
 		s := Snapshot{
 			State:      engine.State(),
@@ -512,6 +558,10 @@ func run(cfg *Config, cfgPath string, theme *Theme, themeNote string, isTTY, noD
 			GPUTuning:  engine.GPUTuning(),
 			CPURate:    cpuRate,
 			GPURate:    gpuRate,
+			Devices:    devices,
+			PeakRate:   peakRate,
+			AvgRate:    avg,
+			Sensors:    sensed,
 			History:    history,
 			Height:     int64(job.Height),
 			Difficulty: parseUint(job.Difficulty),
@@ -548,6 +598,18 @@ func run(cfg *Config, cfgPath string, theme *Theme, themeNote string, isTTY, noD
 				recent.add(inst)
 				spark.add(inst)
 				recentGPU.add(float64(gpu-lastGPU) / dt)
+
+				for _, d := range engine.GPUDeviceList() {
+					w := perGPU[d]
+					if w == nil {
+						w = newRateWindow(10 * tickHz)
+						perGPU[d] = w
+						lastGPUEach[d] = engine.GPUHashesFor(d)
+					}
+					n := engine.GPUHashesFor(d)
+					w.add(float64(n-lastGPUEach[d]) / dt)
+					lastGPUEach[d] = n
+				}
 			}
 			lastTotal, lastGPU, lastAt = total, gpu, now
 
@@ -562,6 +624,41 @@ func run(cfg *Config, cfgPath string, theme *Theme, themeNote string, isTTY, noD
 			draw()
 		}
 	}
+}
+
+// buildDeviceRows turns the engine's counters and the last sensor poll into the
+// rows the panel draws: the CPU first, then one per running GPU.
+//
+// The GPU detail column is power draw where the card reports it, because that
+// is the one number that changes what someone does next -- a card sitting at
+// its power limit is a card that will not go faster whatever else is tuned.
+func buildDeviceRows(e *Engine, perGPU map[int]*rateWindow, cpuRate float64, sensed SensorSample) []DeviceStat {
+	rows := make([]DeviceStat, 0, 1+len(perGPU))
+	rows = append(rows, DeviceStat{Label: "CPU", Rate: cpuRate, TempC: sensed.CPUTemp()})
+
+	for _, d := range e.GPUDeviceList() {
+		row := DeviceStat{
+			Label: "GPU " + strconv.Itoa(d),
+			IsGPU: true,
+			TempC: tempUnknown,
+		}
+		if w := perGPU[d]; w != nil {
+			row.Rate = w.mean()
+		}
+		// A device with a worker running and nothing coming back is the
+		// failure worth shouting about; a device still filling its first
+		// averaging window is not, so the flag waits for the window.
+		row.Ailing = row.Rate <= 0 && perGPU[d] != nil && len(perGPU[d].buf) >= perGPU[d].n
+
+		if g := sensed.gpuByIndex(d); g != nil {
+			row.TempC = g.TempC
+			if g.HavePower {
+				row.Note = fmt.Sprintf("%.0fW", g.PowerW)
+			}
+		}
+		rows = append(rows, row)
+	}
+	return rows
 }
 
 func summary(c *Console, t *Theme, e *Engine, up time.Duration) {
@@ -799,6 +896,16 @@ func runPreview(themeName string, isTTY bool) {
 		Rejected:   1,
 		Uptime:     12*time.Minute + 47*time.Second,
 		Node:       "minernode1.dero.live:10100",
+		PeakRate:   16240.0,
+		AvgRate:    14980.0,
+		Sensors: SensorSample{
+			HaveCPU: true, CPUTempC: 71.5, CPUSource: "hardware monitor",
+			GPUs: []GPUSensor{{
+				Index: 0, Name: "NVIDIA GeForce RTX 5080", TempC: 66,
+				FanPct: 54, HaveFan: true, UtilPct: 99, HaveUtil: true,
+				PowerW: 214.7, PowerCapW: 360, HavePower: true,
+			}},
+		},
 		Log: []LogEntry{
 			{At: now.Add(-38 * time.Second), Level: LogGood, Tag: "connect", Text: "connected to minernode1.dero.live:10100"},
 			{At: now.Add(-21 * time.Second), Level: LogInfo, Tag: "job", Text: "height 2481903 · difficulty 132000"},

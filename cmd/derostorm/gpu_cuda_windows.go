@@ -15,6 +15,12 @@ var gpuLibFS embed.FS
 
 const gpuLibFile = "derostorm_gpu.dll"
 
+// nvmlLibName is the NVIDIA Management Library, which sensors.go asks for GPU
+// temperature and power. It is not embedded and never shipped: it belongs to
+// the display driver, and the loader finds it in System32 on any machine with
+// one installed. A machine without simply gets no telemetry.
+const nvmlLibName = "nvml.dll"
+
 // openGPULibrary loads the extracted DLL and returns a lookup for its exports.
 //
 // LazyProc rather than GetProcAddress by hand because Find reports a missing

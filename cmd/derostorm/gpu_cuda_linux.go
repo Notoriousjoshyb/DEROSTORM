@@ -21,6 +21,12 @@ var gpuLibFS embed.FS
 
 const gpuLibFile = "libderostorm_gpu.so"
 
+// nvmlLibName is the NVIDIA Management Library, which sensors.go asks for GPU
+// temperature and power. The versioned soname is deliberate: plain
+// libnvidia-ml.so is a development symlink that only exists where the CUDA
+// toolkit is installed, while .so.1 ships with the driver itself.
+const nvmlLibName = "libnvidia-ml.so.1"
+
 // openGPULibrary dlopens the extracted library and returns a lookup for its
 // symbols. purego does this without cgo, which is the whole point: the Linux
 // miner is cross-compiled from Windows, and cgo would have ended that.

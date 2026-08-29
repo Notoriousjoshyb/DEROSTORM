@@ -30,37 +30,43 @@ func TestWorkerLabel(t *testing.T) {
 	}
 }
 
-// The frame is now allowed to be taller when a GPU is running, because the
-// CPU/GPU split rows only exist then and sharing the sparkline row with them
-// meant neither had enough space. What must not happen is the height varying
-// with anything else: a height that moved with the hashrate or the device count
-// would make the panel breathe on screen for no reason.
-func TestFrameHeightVariesOnlyWithGPUPresence(t *testing.T) {
+// The frame is allowed to be taller when GPUs are running, because every device
+// gets its own row -- that is what makes a dead card in a rig visible instead of
+// showing up as a total that is quietly a sixth lower. The height must therefore
+// track the device count exactly, and must not move for anything else: a height
+// that changed with the hashrate would make the panel breathe on screen for no
+// reason, and one that lagged the device count would make it walk down it.
+func TestFrameHeightTracksTheDeviceCountAndNothingElse(t *testing.T) {
 	c := NewConsole(discardWriter{}, themes["mono"], true, 6)
 
 	cpuOnly := len(c.frame(Snapshot{Threads: 8}))
-	withGPU := len(c.frame(Snapshot{Threads: 8, GPUs: 1, CPURate: 4000, GPURate: 6800}))
-
-	if withGPU <= cpuOnly {
-		t.Fatalf("expected the GPU layout to be taller: %d vs %d", withGPU, cpuOnly)
+	for n := 1; n <= 8; n++ {
+		got := len(c.frame(Snapshot{Threads: 8, GPUs: n, CPURate: 4000, GPURate: 6800}))
+		if want := cpuOnly + n; got != want {
+			t.Errorf("%d GPUs: frame is %d rows, want %d", n, got, want)
+		}
 	}
 
 	for _, s := range []Snapshot{
 		{Threads: 1},
 		{Threads: 16, Hashrate: 99999, Node: strings.Repeat("host.", 40)},
 		{Threads: 0, Difficulty: 1 << 40, NetHashes: 1 << 40},
+		{Threads: 8, PeakRate: 1e9, AvgRate: 1e9},
 	} {
 		if n := len(c.frame(s)); n != cpuOnly {
 			t.Errorf("CPU-only height changed: %d vs %d for %+v", n, cpuOnly, s)
 		}
 	}
+
+	oneGPU := cpuOnly + 1
 	for _, s := range []Snapshot{
-		{Threads: 15, GPUs: 4, CPURate: 7000, GPURate: 20000},
 		{Threads: 8, GPUs: 1, GPUTuning: true},
-		{Threads: 0, GPUs: 8, GPURate: 0}, // a GPU contributing nothing
+		{Threads: 0, GPUs: 1, GPURate: 0}, // a GPU contributing nothing
+		{Threads: 8, GPUs: 1, Sensors: SensorSample{HaveCPU: true, CPUTempC: 61,
+			GPUs: []GPUSensor{{Index: 0, TempC: 70, PowerW: 215, HavePower: true}}}},
 	} {
-		if n := len(c.frame(s)); n != withGPU {
-			t.Errorf("GPU height changed: %d vs %d for %+v", n, withGPU, s)
+		if n := len(c.frame(s)); n != oneGPU {
+			t.Errorf("one-GPU height changed: %d vs %d for %+v", n, oneGPU, s)
 		}
 	}
 }
@@ -141,7 +147,7 @@ func TestStartupReservesRoomForTheTallestFrame(t *testing.T) {
 
 	const spare = 2
 	for _, note := range []string{"", "NO_COLOR is set, using mono"} {
-		want := bannerRows(note) + c.FrameHeight() + spare
+		want := bannerRows(note) + c.FrameHeight(1) + spare
 		// What the banner and the panel actually occupy, with the GPU rows
 		// present and the command line drawn.
 		need := bannerRows(note) + len(c.frame(Snapshot{ShowInput: true, GPUs: 1}))
@@ -166,6 +172,8 @@ func TestFitToTrimsGrowsBackAndRefusesTheImpossible(t *testing.T) {
 	}
 
 	c := NewConsole(discardWriter{}, themes["default"], true, 6)
+	// fitTo sizes the panel this run will draw, which is a one-GPU one here.
+	c.PlanDevices(1)
 	full := len(c.frame(tall))
 	const wide = 200 // never the constraint
 
