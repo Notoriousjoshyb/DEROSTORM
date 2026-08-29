@@ -172,7 +172,7 @@ Targets built by `--all`: `windows/amd64`, `linux/amd64`, `linux/arm64`, `darwin
 | --- | --- | --- |
 | `windows/amd64` | yes | |
 | `linux/amd64` | yes | |
-| `linux/arm64` | no | no `.so` is built for it; the kernels are portable, so this is a missing build rather than a missing port |
+| `linux/arm64` | no | no `.so` is built for it — see below; the kernels are portable, so this is a missing build rather than a missing port |
 | `darwin/*` | no | Apple dropped NVIDIA driver support in macOS 10.14 and Apple Silicon never had it, so there is no CUDA on any Mac made since 2018 |
 
 Every other build mines on the CPU and says so; nothing fails.
@@ -187,6 +187,25 @@ of the sort, not a recompile.
 
 Only the NVIDIA display driver is needed at run time. The CUDA runtime is
 linked into the embedded library, so there is no toolkit to install.
+
+#### What Linux arm64 would take
+
+Left undone deliberately, and recorded here so the next person does not have to
+find it out again. "arm64 with an NVIDIA GPU" is two unrelated machines:
+
+- **An arm64 server with a plug-in card** — GH200, or Ampere Altra with an RTX.
+  NVIDIA calls this target SBSA, and it cross-compiles from an x86-64 Linux
+  host: `cuda-nvcc-cross-sbsa-13-3`, from
+  `developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/cross-linux-sbsa`.
+  The architecture list is the same as x86-64's, since the cards are the same
+  cards. This is a day's work, and `gpu/buildlib.sh` is most of it already.
+- **A Jetson** — Orin and friends, where the GPU is part of the SoC. A different
+  toolkit (JetPack/L4T), a different driver model, and `sm_87` alone. Not
+  covered by an SBSA build, and a separate job.
+
+Neither is built here for one reason: there is no arm64 card to test on, and a
+GPU binary nobody has run is worse than an honest CPU-only one. If you have the
+hardware, the first case is the easy one.
 
 ### What the build flags do
 
