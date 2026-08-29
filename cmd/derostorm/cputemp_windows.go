@@ -38,9 +38,11 @@ import (
 
 // cpuTempHint is what the event log offers once when nothing could be read. It
 // names the fix rather than the failure, because "no CPU temperature" on its
-// own leaves the reader with nowhere to go.
-const cpuTempHint = "CPU temperature unavailable — start LibreHardwareMonitor " +
-	"and enable Options > Remote Web Server, or set DEROSTORM_CPU_TEMP_URL"
+// own leaves the reader with nowhere to go -- and the fix is almost always
+// "run the thing you already installed", not "install something".
+const cpuTempHint = "CPU temperature unavailable — run HWiNFO (with Shared Memory " +
+	"Support on), Core Temp, MSI Afterburner (with CPU temperature ticked) or " +
+	"LibreHardwareMonitor (with its web server on), and it appears by itself"
 
 // The web server LibreHardwareMonitor and OpenHardwareMonitor both expose, on
 // the port both default to. Overridable so a non-default port, or a monitor on
@@ -84,7 +86,17 @@ func readCPUTemp() (float64, string, bool) {
 		return 0, "", false
 	}
 
-	for _, src := range []func() (float64, string, bool){readCPUTempMonitor, readCPUTempThermalZone} {
+	// Order is quality. The first three read a driver another program already
+	// installed and are the real package temperature; the fourth is the same
+	// thing over HTTP; the last is a guess that happens to be right on some
+	// hardware and is filtered hard because of it.
+	for _, src := range []func() (float64, string, bool){
+		readCPUTempHWiNFO,
+		readCPUTempCoreTemp,
+		readCPUTempAfterburner,
+		readCPUTempMonitor,
+		readCPUTempThermalZone,
+	} {
 		if c, name, ok := src(); ok {
 			cpuTempMu.Lock()
 			cpuTempChosen = src
@@ -110,11 +122,20 @@ type lhmNode struct {
 }
 
 // cpuTempNames are the sensor labels that mean "the CPU package", best first.
-// They are specific enough that no GPU or drive sensor shares one, which is
-// what lets the walk below ignore where in the tree it found them.
+// Matched as substrings by rankCPUTempLabel, because the four monitors name the
+// same sensor four ways -- "Core (Tctl/Tdie)" in LibreHardwareMonitor, "CPU
+// (Tctl/Tdie)" in HWiNFO, "CPU temperature" in Afterburner -- while still being
+// specific enough that no drive or chipset sensor scores.
+//
+// Order is quality, not popularity. A package or Tctl reading is the one a
+// throttling decision is made on; an average across cores is a summary of it,
+// and a per-core maximum is noisier than either.
 var cpuTempNames = []string{
-	"core (tctl/tdie)", // AMD, the number Ryzen Master shows
-	"cpu package",      // Intel
+	"tctl/tdie",         // AMD package, the number Ryzen Master shows
+	"cpu package",       // Intel package
+	"cpu die (average)", // AMD, HWiNFO's name for the same thing
+	"package id 0",      // Intel package, the Linux label some tools copy
+	"cpu temperature",   // MSI Afterburner
 	"core average",
 	"cpu cores",
 	"core max",
@@ -147,12 +168,9 @@ func readCPUTempMonitor() (float64, string, bool) {
 	best, bestRank := 0.0, len(cpuTempNames)
 	var walk func(n *lhmNode)
 	walk = func(n *lhmNode) {
-		label := strings.ToLower(strings.TrimSpace(n.Text))
-		for rank, want := range cpuTempNames {
-			if rank < bestRank && label == want {
-				if c, ok := parseCelsius(n.Value); ok {
-					best, bestRank = c, rank
-				}
+		if rank, ok := rankCPUTempLabel(n.Text); ok && rank < bestRank {
+			if c, ok := parseCelsius(n.Value); ok {
+				best, bestRank = c, rank
 			}
 		}
 		for i := range n.Children {

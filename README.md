@@ -151,31 +151,57 @@ them by PCI bus, so the two would disagree about which card is "GPU 1".
 DeroStorm sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before opening anything, which
 makes the two the same numbering. Set it yourself to override.
 
-### CPU — depends on the platform
+### CPU — reads whatever monitor you already have
+
+**Linux** is straightforward and needs nothing. **Windows needs one of these to
+be running**, and most machines with any tuning history already have one
+installed:
+
+| | How | Read from |
+|---|---|---|
+| **Core Temp** | just run it | `CoreTempMappingObjectEx` |
+| **HWiNFO** | Settings → Shared Memory Support | `Global\HWiNFO_SENS_SM2` |
+| **MSI Afterburner** | Monitoring → tick *CPU temperature* | `MAHMSharedMemory` |
+| **LibreHardwareMonitor** | Options → Remote Web Server | `http://127.0.0.1:8085` |
+
+All four are read-only and need no privileges — a section an elevated process
+published is still readable from a normal one. Nothing is installed, started or
+configured by DeroStorm; it looks, and if it finds nothing it says so.
+
+The first three are shared memory and cost a few microseconds. The fourth is
+HTTP and is there because LibreHardwareMonitor has no shared-memory interface.
+Point it elsewhere — a different port, or a monitor on another machine in the
+rig — with `DEROSTORM_CPU_TEMP_URL`.
+
+### Why Windows needs any of that
 
 **Linux** is straightforward: the kernel has already read the register and
 published it under `/sys/class/hwmon`. `k10temp` or `zenpower` on AMD,
 `coretemp` on Intel, with `/sys/class/thermal` as a fallback. This is the same
 number `sensors` prints, and needs no privileges.
 
-**Windows has no user-mode API for it.** The value lives behind an MSR on Intel
-or the SMU mailbox on AMD, both ring-0. That is why HWiNFO, LibreHardwareMonitor
-and Ryzen Master all install a kernel driver. DeroStorm will not install one, so
-it tries what user mode can see, best first:
+**Windows has no user-mode API for a CPU package temperature.** The value lives
+behind an MSR on Intel or the SMU mailbox on AMD, both ring-0. That is why
+HWiNFO, Core Temp, Afterburner, LibreHardwareMonitor and Ryzen Master all
+install a kernel driver of their own.
 
-1. **LibreHardwareMonitor or OpenHardwareMonitor**, over the local web server
-   either can expose. If one is already running this is the real package
-   temperature, read through the driver it already installed. Turn it on with
-   *Options → Remote Web Server → Run*; the default port 8085 is what DeroStorm
-   looks at. Point it somewhere else with `DEROSTORM_CPU_TEMP_URL`.
-2. **The ACPI thermal zone**, through the performance counter Windows publishes
-   for it. No privileges, no other software. On laptops and most servers it
-   tracks the CPU closely; on many desktop boards it is a chipset zone reporting
-   a fixed, obviously wrong value, so anything outside 25–125°C is discarded.
+DeroStorm will not install one. A miner is not a thing that should be putting
+code in your kernel, and a driver installed to display a number is a permanent
+increase in a machine's attack surface for a cosmetic gain. So instead it reads
+the monitor you already chose to trust, through the interface that monitor
+already publishes. That is the whole design: the table above, tried in order of
+how much the reading can be trusted.
 
-When neither answers, the panel shows `--` and the event log says once what
-would fix it. It never guesses — a confidently wrong temperature is worse than
-no temperature, because it is the number someone would act on.
+After those four it falls back to the **ACPI thermal zone**, through the
+performance counter Windows publishes for it. That needs no privileges and no
+other software at all. On laptops and most servers it tracks the CPU closely; on
+many desktop boards it is a chipset zone reporting a fixed, obviously wrong
+value — this machine's publishes a constant 290 K, or 17°C — so anything outside
+25–125°C is discarded.
+
+When nothing answers, the panel shows `--` and the event log says once what would
+fix it. It never guesses. A confidently wrong temperature is worse than no
+temperature, because it is the number someone would act on.
 
 **macOS and the BSDs** report nothing. macOS needs a private IOKit interface
 whose sensor keys change between Mac models; the BSDs each have their own
@@ -831,7 +857,41 @@ stale artefact: the shipped fat binary against a fresh single-architecture build
 of the same source, three interleaved rounds, is 71.55–71.70 K against
 71.62–71.75 K.
 
-**Fewer or more CPU threads, once the GPU is running.** The GPU worker needs a
+**More mining threads than the machine has logical CPUs.** The suffix sort has
+real headroom left inside each core, and this is the measurement that proves it.
+`native/sabench.exe` oversubscribed, three rounds each:
+
+| threads | texts/s | vs 16 |
+|---:|---:|---:|
+| 16 | 46,043 | — |
+| 24 | 47,398 | +2.9% |
+| 32 | 49,399 | +7.3% |
+| 48 | 51,224 | +11.3% |
+| 64 | 51,433 | +11.7% |
+
+Sixteen threads already fill every logical CPU, so a 17th cannot add a core --
+it can only add another independent instruction stream to a core that was
+stalling. Gaining 11.7% while *also* paying for context switches means the cores
+still have idle issue slots with two SMT threads on them. See
+[Where the speed comes from](#where-the-speed-comes-from) for what that does and
+does not imply.
+
+It does not translate. The whole hash at 20 threads is 34.67 KH/s against 33.73
+at 15, and flat after that -- stage 1 and the final SHA-256 are not stalling, so
+they dilute it. And with the GPU running it reverses completely, because the GPU
+worker needs a thread to feed it and an oversubscribed machine starves it:
+
+| threads | combined |
+|---:|---:|
+| 15 | **103.16 / 103.36 KH/s** |
+| 18 | 101.00 / 99.74 KH/s |
+| 20 | 100.03 / 99.53 KH/s |
+| 24 | 95.87 / 97.53 KH/s |
+
+The GPU is two thirds of the total, so starving it costs more than the CPU can
+win. The headroom is real and adding threads is not how to reach it.
+
+**Fewer CPU threads, once the GPU is running.** The GPU worker needs a
 thread to feed it, so 15 of 16 might be one too many. Measured on the real
 mining path, `--run-for=45 --gpu-blocks=672`, two rounds each:
 
@@ -844,7 +904,7 @@ mining path, `--run-for=45 --gpu-blocks=672`, two rounds each:
 
 14 and 15 tie inside the noise, 16 is clearly worse — the GPU worker and the
 16th miner fight over the same core. The shipped default of *cores × 2 − 1* is
-already the right answer.
+already the right answer, from both directions.
 
 **Both obvious attacks on the CPU merge.** `native\saprof.exe` puts the phases
 at merge 43.6%, column walk 37.6%, radix sort 17.0% — so the merge is the
