@@ -13,8 +13,8 @@ set SUFFIX=%1
 set RUNDEF=
 if not "%2"=="" set RUNDEF=/DDSA_RUN_MAX=%2
 if not "%3"=="" set RUNDEF=%RUNDEF% /DDSA_RUN_SPLIT=%3
-cl /nologo /O2 /Ob3 /Oi /GS- /arch:AVX2 %RUNDEF% /I native ^
+cl /nologo /O2 /Ob3 /Oi /GS- /GL /arch:AVX2 %RUNDEF% /I native ^
    native\sabench.c native\descriptor.c native\libsais\libsais.c ^
-   /Fo:native\ /Fe:native\sabench%SUFFIX%.exe /link /RELEASE || exit /b 1
+   /Fo:native\ /Fe:native\sabench%SUFFIX%.exe /link /RELEASE /LTCG || exit /b 1
 del native\*.obj >nul 2>&1
 echo built native\sabench%SUFFIX%.exe
