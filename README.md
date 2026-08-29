@@ -467,6 +467,46 @@ batch size without needing a node. The intermediate 12.28 KH/s this table used
 to carry was the gain from the packed-key change described below; the rest came
 from the block-count sweep and the stage-1 work after it.
 
+**The column walk's keys slide instead of being re-read.** The largest single
+gain the GPU has had since the descriptor sort itself, and it came from reading
+the profiler rather than from an algorithm.
+
+`gpu\prof\prof.exe` attributes cycles by phase. It put the column walk at **51%
+of the suffix sort**, which is itself 85% of a GPU hash — so a third of the
+kernel was one loop, and that loop runs on about 62 of `BR_BLOCK` threads,
+because the runs are the only parallelism in it. Its latency is the kernel's.
+
+What it spent them on was loads. A descriptor key is the four bytes at
+`ord[x]+rel`, and the walk re-read all four at every column. Three of them are
+the ones it read at the column before:
+
+```
+  K(q-1) = t[q-1]<<24 | t[q]<<16 | t[q+1]<<8 | t[q+2]
+         = t[q-1]<<24 | (K(q) >> 8)
+```
+
+No end-of-text case is needed — the shift drops exactly the byte the zero
+padding would have had to invent. And the one byte it does read is the same byte
+the constant-column test compares and the same byte the insertion sort orders
+by, so all three share one load. A column went from about `6 * len` scattered
+byte reads to `len`, the grouping scan moved from text to shared memory, and the
+insertion sort stopped touching text at all. The keys live in `s_keep`, which
+phase 1 has finished with, so it cost no shared memory.
+
+Measured on 512 real texts, the same binary either way:
+
+```
+  descriptor sort      33,272 -> 41,468 SA/s     +25%
+  whole GPU hash       30,568 -> 36,753 H/s      +20%
+  miner, RTX 5080      45.42 -> 56.09 KH/s       +23%   (Linux 44.28 -> 55.67)
+```
+
+The profile after it: the walk is down to 37% and the collision merge is now the
+larger remaining phase at 28%. The obvious next step does not fit — knowing a
+column is constant *before* loading it would cut most of the remaining loads,
+since a constant column slides every key by the same byte, but the mask is
+278x256 bits and there is no shared memory left beside the radix sort's tile.
+
 **Stage 1 as a table, not a switch.** AstroBWTv3 picks one of 256 byte
 operations per iteration, and a warp whose 32 lanes pick 32 different ones runs
 them one after another. That looked like a fixed cost of the algorithm.

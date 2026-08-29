@@ -215,12 +215,39 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
     PROF_ADD(PH_D_RUNS);
 
     // ---- 2. the column walk, one thread per run.
+    //
+    // The keys slide rather than being re-read. A descriptor key is the four
+    // bytes at ord[x]+rel, and stepping to column rel-1 keeps three of them:
+    //
+    //   K(q-1) = t[q-1]<<24 | t[q]<<16 | t[q+1]<<8 | t[q+2]
+    //          = t[q-1]<<24 | (K(q) >> 8)
+    //
+    // an identity that needs no end-of-text special case, because the shift
+    // drops exactly the byte the zero padding would have had to invent.
+    //
+    // That is worth more than the arithmetic it saves. The one byte it does
+    // read, t[ord[x]+col], is the same byte the constant-column test compares
+    // and the same byte the insertion sort orders by, so all three now share a
+    // single load: the column costs `len` scattered byte reads where it used to
+    // cost about six times that, and the grouping scan reads shared memory
+    // instead of text. This loop is 51% of the suffix sort and the suffix sort
+    // is 85% of a GPU hash, and it runs on ~62 of BR_BLOCK threads because the
+    // runs are the only parallelism there is -- so its latency is the kernel's,
+    // and cutting loads is the whole game.
+    //
+    // s_keep is finished with by here: phase 1 scattered out of it before the
+    // barrier above and nothing reads it again. The keys borrow it rather than
+    // claim shared memory of their own, which is this kernel's scarcest
+    // resource -- the radix sort's tile is already 11 KB.
+    uint32_t* s_key = (uint32_t*)s_keep;
+
     for (int r = tid; r < s_nruns; r += BR_BLOCK) {
         const int g0 = s_start[r];
         const int len = s_start[r + 1] - g0;
         const int base = g0 * 256;
 
         int32_t* ord = s_order + g0;          // exactly len entries, see the note
+        uint32_t* key = s_key + g0;           // key[x] is K(ord[x] + rel)
         uint32_t* arena = sc.arena + (size_t)g0 * 256;
         uint32_t aw = 0;
 
@@ -236,15 +263,17 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
             }
             ord[j] = v;
         }
+        // The only full key read in the walk; every later column slides.
+        for (int i = 0; i < len; i++) key[i] = descKey32(t, n, ord[i] + 255);
 
         for (int rel = 255; rel >= 0; rel--) {
             // Split the ordered suffixes into maximal groups sharing four
             // leading bytes, and record each as one descriptor.
             int i = 0;
             while (i < len) {
-                const uint32_t k = descKey32(t, n, ord[i] + rel);
+                const uint32_t k = key[i];
                 int j = i + 1;
-                while (j < len && descKey32(t, n, ord[j] + rel) == k) j++;
+                while (j < len && key[j] == k) j++;
 
                 const uint32_t off = (uint32_t)((size_t)g0 * 256 + aw);
                 for (int x = i; x < j; x++) arena[aw++] = (uint32_t)(ord[x] + rel);
@@ -257,28 +286,44 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
 
             if (rel == 0) break;
 
-            // Step left. A column that holds the same byte in every block of the
-            // run prepends the same byte to every suffix, so the order does not
-            // change and there is nothing to do. This is the whole saving.
+            // Step left, reading each block's byte in this column exactly once.
+            // Slide first, because the keys move whether or not the order does.
+            //
+            // The constant test walks ord rather than the blocks in address
+            // order, which is the same set of bytes and so the same predicate:
+            // every block of the run appears in ord exactly once.
             const int col = rel - 1;
-            const uint8_t c0 = t[base + col];
+            const uint8_t c0 = (uint8_t)t[ord[0] + col];
+            key[0] = ((uint32_t)c0 << 24) | (key[0] >> 8);
+
             bool constant = true;
-            for (int gg = 1; gg < len; gg++) {
-                if (t[base + gg * 256 + col] != c0) { constant = false; break; }
+            for (int x = 1; x < len; x++) {
+                const uint8_t c = (uint8_t)t[ord[x] + col];
+                constant &= (c == c0);
+                key[x] = ((uint32_t)c << 24) | (key[x] >> 8);
             }
+
+            // A column holding the same byte in every block of the run prepends
+            // the same byte to every suffix, so the order does not change and
+            // there is nothing further to do. This is the whole saving.
             if (constant) continue;
 
-            // Stable insertion sort by that one byte. The existing order is
-            // exactly the right tie-break, which is what makes one byte enough.
+            // Stable insertion sort by that one byte, which is now the top byte
+            // of the slid key, so this reads no text at all. The existing order
+            // is exactly the right tie-break, which is what makes one byte
+            // enough. ord and key permute together or they stop corresponding.
             for (int x = 1; x < len; x++) {
                 const int32_t v = ord[x];
-                const uint8_t key = t[v + col];
+                const uint32_t kv = key[x];
+                const uint8_t kb = (uint8_t)(kv >> 24);
                 int y = x;
-                while (y > 0 && t[ord[y - 1] + col] > key) {
+                while (y > 0 && (uint8_t)(key[y - 1] >> 24) > kb) {
                     ord[y] = ord[y - 1];
+                    key[y] = key[y - 1];
                     y--;
                 }
                 ord[y] = v;
+                key[y] = kv;
             }
         }
     }
