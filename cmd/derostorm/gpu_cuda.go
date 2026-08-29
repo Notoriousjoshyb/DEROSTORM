@@ -1,39 +1,54 @@
-//go:build windows
+//go:build windows || (linux && amd64)
 
 package main
 
 // GPU mining support, bound at run time rather than at link time.
 //
-// The CUDA kernels live in a small DLL (gpu/derostorm_gpu.cu). This file
-// carries that DLL inside the executable, writes it out on first use, and calls
-// its plain-C entry points through LoadLibrary. Three things fall out of doing
-// it this way rather than with cgo:
+// The CUDA kernels live in a small library (gpu/derostorm_gpu.cu). This file
+// carries that library inside the executable, writes it out on first use, and
+// calls its plain-C entry points through the platform's dynamic loader --
+// LoadLibrary on Windows, dlopen on Linux, in gpu_cuda_windows.go and
+// gpu_cuda_linux.go. Three things fall out of doing it this way rather than
+// with cgo:
 //
-//   - One executable. The DLL is embedded, so there is nothing to ship beside
-//     it and no separate GPU build to choose between. A machine with no NVIDIA
-//     card runs the same binary and simply reports no devices.
-//   - No C toolchain. cgo hands the final link to MinGW, and the TDM-GCC 10.3.0
-//     on this machine writes debug sections that Windows refuses to load, so
-//     every cgo build died with "This app can't run on your PC" before reaching
-//     main(). With no cgo, Go's own linker does the work and the problem does
-//     not exist.
-//   - No CUDA runtime to install. The DLL is built with -cudart static, so it
-//     needs only the NVIDIA display driver.
+//   - One executable per platform. The library is embedded, so there is
+//     nothing to ship beside it and no separate GPU build to choose between. A
+//     machine with no NVIDIA card runs the same binary and simply reports no
+//     devices.
+//   - No C toolchain. cgo hands the final link to MinGW, and the TDM-GCC
+//     10.3.0 on this machine writes debug sections that Windows refuses to
+//     load, so every cgo build died with "This app can't run on your PC"
+//     before reaching main(). cgo would also have ended the Linux build, which
+//     is a cross-compile from Windows: the .so is built once under WSL and is
+//     just a file on disk by the time Go embeds it.
+//   - No CUDA runtime to install. The library is built with -cudart static, so
+//     it needs only the NVIDIA display driver.
+//
+// Only the loader is per-platform. Everything below it is shared, because the
+// alternative -- a whole binding per platform -- is the drift gpu_other.go
+// warns about, two copies of one thing falling out of step unnoticed.
+//
+// The entry points are bound as typed Go functions rather than called by hand
+// through uintptrs. That is what removes the unsafe.Pointer-to-uintptr
+// laundering the hand-written Windows binding needed: a *byte stays a *byte all
+// the way into the call, so the garbage collector can see it and there is no
+// window in which a live buffer looks unreferenced.
 //
 // CUDA means NVIDIA. AMD and Intel GPUs are not supported and would need a
-// separate port to HIP or Vulkan.
+// separate port to HIP or Vulkan. Linux arm64 has no library built for it and
+// takes the gpu_other.go path, mining on the CPU.
 
 import (
 	"crypto/sha256"
-	"embed"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
-	"syscall"
-	"unsafe"
+
+	"github.com/ebitengine/purego"
 )
 
 // GPUAvailable reports whether this build can use a GPU at all. Whether one is
@@ -43,35 +58,40 @@ const GPUAvailable = true
 // GPUKind names the hardware this supports, for messages to the user.
 const GPUKind = "NVIDIA CUDA"
 
-//go:embed derostorm_gpu.dll
-var gpuDLL embed.FS
-
+// The library's entry points, as declared in gpu/derostorm_gpu.h. A C int is
+// int32 on both platforms; dsg_context* is opaque and never dereferenced here,
+// so it stays a uintptr rather than pretending to be a Go pointer.
 var (
-	dllOnce sync.Once
-	dllErr  error
-
-	procDeviceCount *syscall.LazyProc
-	procDeviceName  *syscall.LazyProc
-	procInfo        *syscall.LazyProc
-	procError       *syscall.LazyProc
-	procFree        *syscall.LazyProc
-	procHashOne     *syscall.LazyProc
-	procInit        *syscall.LazyProc
-	procSearch      *syscall.LazyProc
-	procSetBlocks   *syscall.LazyProc
-	procShape       *syscall.LazyProc
+	dsgDeviceCount func() int32
+	dsgDeviceInfo  func(device int32, buf *byte, n int32) int32
+	dsgDeviceName  func(ctx uintptr, buf *byte, n int32) int32
+	dsgDeviceShape func(ctx uintptr, sms, maxBlocks, chunk *int32) int32
+	dsgError       func(buf *byte, n int32) int32
+	dsgFree        func(ctx uintptr)
+	dsgHashOne     func(ctx uintptr, work *byte, nonce uint32, out *byte) int32
+	dsgInit        func(device, batch, blocks int32, out *uintptr, batchOut, blocksOut *int32) int32
+	dsgSearch      func(ctx uintptr, work *byte, nonceStart uint32, target *uint64,
+		targetAll int32, nonces *uint32, maxNonces int32, found *int32) int32
+	dsgSetBlocks func(ctx uintptr, blocks int32) int32
 )
 
-// extractDLL writes the embedded library somewhere stable and returns its path.
-// The name carries a hash of the contents, so a rebuilt DLL lands beside the
-// old one instead of failing to overwrite a copy some other process has open.
-func extractDLL() (string, error) {
-	data, err := gpuDLL.ReadFile("derostorm_gpu.dll")
+var (
+	libOnce sync.Once
+	libErr  error
+)
+
+// extractLib writes the embedded library somewhere stable and returns its path.
+// The name carries a hash of the contents, so a rebuilt library lands beside
+// the old one instead of failing to overwrite a copy some other process has
+// open.
+func extractLib() (string, error) {
+	data, err := gpuLibFS.ReadFile(gpuLibFile)
 	if err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(data)
-	name := "derostorm_gpu-" + hex.EncodeToString(sum[:6]) + ".dll"
+	ext := filepath.Ext(gpuLibFile)
+	name := strings.TrimSuffix(gpuLibFile, ext) + "-" + hex.EncodeToString(sum[:6]) + ext
 
 	base, err := os.UserCacheDir()
 	if err != nil {
@@ -105,6 +125,13 @@ func extractDLL() (string, error) {
 		os.Remove(tmpName)
 		return "", err
 	}
+	// dlopen maps the file executable, so it needs more than the 0600
+	// CreateTemp gives it. Windows ignores the mode and LoadLibrary does not
+	// consult it.
+	if err := os.Chmod(tmpName, 0o755); err != nil {
+		os.Remove(tmpName)
+		return "", err
+	}
 	if err := os.Rename(tmpName, path); err != nil {
 		// Another process won the race; its copy is byte for byte this one.
 		os.Remove(tmpName)
@@ -118,40 +145,44 @@ func extractDLL() (string, error) {
 // loadGPU unpacks and binds the library. Safe to call repeatedly; the result,
 // including a failure, is remembered.
 func loadGPU() error {
-	dllOnce.Do(func() {
-		path, err := extractDLL()
+	libOnce.Do(func() {
+		path, err := extractLib()
 		if err != nil {
-			dllErr = fmt.Errorf("cannot unpack the GPU library: %w", err)
+			libErr = fmt.Errorf("cannot unpack the GPU library: %w", err)
 			return
 		}
-		dll := syscall.NewLazyDLL(path)
-		if err := dll.Load(); err != nil {
-			dllErr = fmt.Errorf("cannot load the GPU library: %w", err)
+		sym, err := openGPULibrary(path)
+		if err != nil {
+			libErr = fmt.Errorf("cannot load the GPU library: %w", err)
 			return
 		}
-		procDeviceCount = dll.NewProc("dsg_device_count")
-		procDeviceName = dll.NewProc("dsg_device_name")
-		procInfo = dll.NewProc("dsg_device_info")
-		procError = dll.NewProc("dsg_error")
-		procFree = dll.NewProc("dsg_free")
-		procHashOne = dll.NewProc("dsg_hash_one")
-		procInit = dll.NewProc("dsg_init")
-		procSearch = dll.NewProc("dsg_search")
-		procSetBlocks = dll.NewProc("dsg_set_blocks")
-		procShape = dll.NewProc("dsg_device_shape")
-
-		for _, p := range []*syscall.LazyProc{
-			procDeviceCount, procDeviceName, procError, procFree,
-			procHashOne, procInfo, procInit, procSearch,
-			procSetBlocks, procShape,
+		// Every entry point is resolved here rather than on first use, so a
+		// library missing one is a single clear error at start-up instead of a
+		// nil call somewhere down the hot path.
+		for _, b := range []struct {
+			name string
+			fn   any
+		}{
+			{"dsg_device_count", &dsgDeviceCount},
+			{"dsg_device_info", &dsgDeviceInfo},
+			{"dsg_device_name", &dsgDeviceName},
+			{"dsg_device_shape", &dsgDeviceShape},
+			{"dsg_error", &dsgError},
+			{"dsg_free", &dsgFree},
+			{"dsg_hash_one", &dsgHashOne},
+			{"dsg_init", &dsgInit},
+			{"dsg_search", &dsgSearch},
+			{"dsg_set_blocks", &dsgSetBlocks},
 		} {
-			if err := p.Find(); err != nil {
-				dllErr = fmt.Errorf("GPU library is missing %s: %w", p.Name, err)
+			addr, err := sym(b.name)
+			if err != nil {
+				libErr = fmt.Errorf("GPU library is missing %s: %w", b.name, err)
 				return
 			}
+			purego.RegisterFunc(b.fn, addr)
 		}
 	})
-	return dllErr
+	return libErr
 }
 
 // cstr trims a buffer the library filled at its NUL. Every string entry point
@@ -167,11 +198,11 @@ func cstr(buf []byte) string {
 }
 
 func lastGPUError() string {
-	if procError == nil {
+	if dsgError == nil {
 		return "GPU library not loaded"
 	}
 	var buf [512]byte
-	procError.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(int32(len(buf))))
+	dsgError(&buf[0], int32(len(buf)))
 	if s := cstr(buf[:]); s != "" {
 		return s
 	}
@@ -184,8 +215,7 @@ func GPUDeviceCount() int {
 	if err := loadGPU(); err != nil {
 		return 0
 	}
-	r, _, _ := procDeviceCount.Call()
-	return int(int32(r))
+	return int(dsgDeviceCount())
 }
 
 // GPUDeviceInfo describes a device without opening it, so the setup wizard can
@@ -195,17 +225,8 @@ func GPUDeviceInfo(device int) string {
 	if err := loadGPU(); err != nil {
 		return ""
 	}
-	proc := procInfo
-	if proc == nil {
-		return ""
-	}
 	var buf [256]byte
-	rc, _, _ := proc.Call(
-		uintptr(int32(device)),
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(int32(len(buf))),
-	)
-	if int32(rc) != 0 {
+	if dsgDeviceInfo(int32(device), &buf[0], int32(len(buf))) != 0 {
 		return ""
 	}
 	return cstr(buf[:])
@@ -243,30 +264,19 @@ func NewGPUContext(device, batch, blocks int) (*GPUContext, error) {
 
 	var ctx uintptr
 	var gotBatch, gotBlocks int32
-	rc, _, _ := procInit.Call(
-		uintptr(int32(device)),
-		uintptr(int32(batch)),
-		uintptr(int32(blocks)),
-		uintptr(unsafe.Pointer(&ctx)),
-		uintptr(unsafe.Pointer(&gotBatch)),
-		uintptr(unsafe.Pointer(&gotBlocks)),
-	)
-	if int32(rc) != 0 {
+	if dsgInit(int32(device), int32(batch), int32(blocks), &ctx, &gotBatch, &gotBlocks) != 0 {
 		return nil, fmt.Errorf("gpu init: %s", lastGPUError())
 	}
 
 	var name [256]byte
-	procDeviceName.Call(ctx, uintptr(unsafe.Pointer(&name[0])), uintptr(int32(len(name))))
+	dsgDeviceName(ctx, &name[0], int32(len(name)))
 
 	g := &GPUContext{
 		ctx: ctx, batch: int(gotBatch), blocks: int(gotBlocks), name: cstr(name[:]),
 	}
 
 	var sms, maxBlocks, chunk int32
-	procShape.Call(ctx,
-		uintptr(unsafe.Pointer(&sms)),
-		uintptr(unsafe.Pointer(&maxBlocks)),
-		uintptr(unsafe.Pointer(&chunk)))
+	dsgDeviceShape(ctx, &sms, &maxBlocks, &chunk)
 	g.sms, g.maxBlocks, g.chunk = int(sms), int(maxBlocks), int(chunk)
 
 	return g, nil
@@ -288,8 +298,7 @@ func (g *GPUContext) SetBlocks(n int) error {
 	if g == nil || g.ctx == 0 {
 		return errors.New("gpu: context is closed")
 	}
-	rc, _, _ := procSetBlocks.Call(g.ctx, uintptr(int32(n)))
-	if int32(rc) != 0 {
+	if dsgSetBlocks(g.ctx, int32(n)) != 0 {
 		return fmt.Errorf("gpu set blocks: %s", lastGPUError())
 	}
 	g.blocks = n
@@ -298,7 +307,7 @@ func (g *GPUContext) SetBlocks(n int) error {
 
 func (g *GPUContext) Close() {
 	if g != nil && g.ctx != 0 {
-		procFree.Call(g.ctx)
+		dsgFree(g.ctx)
 		g.ctx = 0
 	}
 }
@@ -327,17 +336,8 @@ func (g *GPUContext) Search(work []byte, nonceStart uint32, t *Target) ([]uint32
 	}
 	var found int32
 
-	rc, _, _ := procSearch.Call(
-		g.ctx,
-		uintptr(unsafe.Pointer(&work[0])),
-		uintptr(nonceStart),
-		uintptr(unsafe.Pointer(&limbs[0])),
-		uintptr(all),
-		uintptr(unsafe.Pointer(&g.hits[0])),
-		uintptr(int32(len(g.hits))),
-		uintptr(unsafe.Pointer(&found)),
-	)
-	if int32(rc) != 0 {
+	if dsgSearch(g.ctx, &work[0], nonceStart, &limbs[0], all,
+		&g.hits[0], int32(len(g.hits)), &found) != 0 {
 		return nil, fmt.Errorf("gpu search: %s", lastGPUError())
 	}
 	if found < 0 || int(found) > len(g.hits) {
@@ -356,13 +356,7 @@ func (g *GPUContext) HashOne(work []byte, nonce uint32) ([32]byte, error) {
 	if len(work) != gpuWorkSize {
 		return out, fmt.Errorf("gpu: work is %d bytes, want %d", len(work), gpuWorkSize)
 	}
-	rc, _, _ := procHashOne.Call(
-		g.ctx,
-		uintptr(unsafe.Pointer(&work[0])),
-		uintptr(nonce),
-		uintptr(unsafe.Pointer(&out[0])),
-	)
-	if int32(rc) != 0 {
+	if dsgHashOne(g.ctx, &work[0], nonce, &out[0]) != 0 {
 		return out, fmt.Errorf("gpu hash: %s", lastGPUError())
 	}
 	return out, nil

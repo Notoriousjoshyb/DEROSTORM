@@ -166,6 +166,28 @@ Requires **Go 1.22 or newer**. Everything is vendored, so no network access is n
 
 Targets built by `--all`: `windows/amd64`, `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`.
 
+### Which builds mine on the GPU
+
+| Target | GPU mining | Why |
+| --- | --- | --- |
+| `windows/amd64` | yes | |
+| `linux/amd64` | yes | |
+| `linux/arm64` | no | no `.so` is built for it; the kernels are portable, so this is a missing build rather than a missing port |
+| `darwin/*` | no | Apple dropped NVIDIA driver support in macOS 10.14 and Apple Silicon never had it, so there is no CUDA on any Mac made since 2018 |
+
+Every other build mines on the CPU and says so; nothing fails.
+
+GPU mining is CUDA, so it means NVIDIA. The library carries a cubin for every
+architecture CUDA 13 still supports — `sm_75` (RTX 20xx) through `sm_120`
+(RTX 50xx) — plus PTX, so a card newer than the toolkit compiles at load
+instead of failing. Pascal and older were dropped by CUDA 13 itself and mine on
+the CPU. AMD and Intel cards would need a port to HIP or Vulkan: the kernels
+assume a 32-thread warp throughout `gpu/blockradix.cuh`, so that is a rewrite
+of the sort, not a recompile.
+
+Only the NVIDIA display driver is needed at run time. The CUDA runtime is
+linked into the embedded library, so there is no toolkit to install.
+
 ### What the build flags do
 
 The build scripts pass two non-default flags. Both are deliberate and both matter.
@@ -182,11 +204,12 @@ Uses `cmd/derostorm/default.pgo`. Worth a few percent. Regenerate it with the `p
 
 ### Building the native libraries
 
-Two of them are embedded in the executable and bound at run time: the CUDA
-kernels, and libsais for the suffix sort. Both are checked in under
-`cmd/derostorm/` as the copies `go:embed` picks up, so an ordinary build needs
-neither a C toolchain nor CUDA. They only need rebuilding when their sources
-change:
+Three of them are embedded in the executable and bound at run time: the CUDA
+kernels for Windows, the same kernels for Linux, and libsais for the suffix
+sort. They are build products, not source, so they are not in git — build them
+once and the copies under `cmd/derostorm/` are what `go:embed` picks up from
+then on. After that an ordinary build needs neither a C toolchain nor CUDA, and
+they only need rebuilding when their sources change:
 
 ```
 .\build.ps1 -Native      # both, then the miner
@@ -196,15 +219,31 @@ or one at a time:
 
 ```
 gpu\buildlib.bat         # CUDA kernels  -> cmd\derostorm\derostorm_gpu.dll
+gpu/buildlib.sh          # CUDA kernels  -> cmd\derostorm\libderostorm_gpu.so   (run under Linux)
 native\build.bat         # libsais       -> cmd\derostorm\derostorm_sa.dll
 ```
 
 Each script copies its result into `cmd\derostorm\` itself, because doing that
-by hand is how a stale library gets shipped. `build.ps1` refuses to build if
-either copy is missing, since `go:embed` fails with no hint as to the cause.
+by hand is how a stale library gets shipped. Both build scripts refuse to build
+if a copy is missing, since `go:embed` fails with no hint as to the cause.
 
-The CUDA half needs the toolkit and the MSVC host compiler; the libsais half
-needs only MSVC.
+The CUDA halves need the toolkit and a host compiler — MSVC on Windows, gcc on
+Linux; the libsais half needs only MSVC.
+
+`gpu/buildlib.sh` is the odd one, because `nvcc` targets the host it runs on: a
+Linux `.so` cannot be produced from the Windows toolkit, whatever flags you
+pass. WSL is enough, and needs no GPU of its own — the build wants `nvcc`, not
+a card:
+
+```powershell
+wsl --install -d Ubuntu-24.04
+# then, inside it, NVIDIA's cuda-toolkit package, and:
+wsl -- bash -lc "cd /mnt/c/path/to/derostorm && sh gpu/buildlib.sh"
+```
+
+`.\build.ps1 -Native` does all of that for you. Once the `.so` exists it is
+just a file, so cross-compiling the Linux miner from Windows works normally —
+which is the whole reason the GPU binding avoids cgo.
 
 `gpu\build.bat` builds the test harnesses instead. `gpu\hash_parallel_test.exe
 gpu\vectors.bin` is the one that matters: it runs 512 real vectors through the
@@ -656,7 +695,10 @@ derostorm/
 │   ├── theme.go            palettes
 │   ├── commands.go         runtime command line
 │   ├── affinity.go         CPU-slot → logical-CPU map
-│   ├── gpu_windows.go      loads the CUDA library, binds its entry points
+│   ├── gpu_cuda.go         binds the CUDA library and drives it
+│   ├── gpu_cuda_windows.go   embeds the .dll, finds symbols with LoadLibrary
+│   ├── gpu_cuda_linux.go     embeds the .so, finds symbols with dlopen
+│   ├── gpu_other.go        the no-GPU build: macOS, and Linux off amd64
 │   ├── gpu_worker.go       the GPU mining worker
 │   ├── gpu_tune.go         measures the suffix kernel's block count
 │   ├── gpu_bench.go        --bench for the GPU

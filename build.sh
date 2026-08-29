@@ -21,7 +21,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION=1.1.1
+VERSION=1.2.0
 PKG=./cmd/derostorm
 BOUNDS_PKG=github.com/deroproject/derohe/astrobwt/astrobwtv3
 GCFLAGS="${BOUNDS_PKG}=-B"
@@ -39,6 +39,35 @@ for arg in "$@"; do
 done
 
 mkdir -p "$OUTDIR"
+
+# The embedded copies. Checked here because a missing one is a go:embed error
+# with no hint as to the cause, and because which ones are needed depends on
+# what is being built: the CUDA libraries are per-target, not per-host.
+#
+#   derostorm_gpu.dll     CUDA kernels for Windows   gpu/buildlib.bat  (needs Windows)
+#   libderostorm_gpu.so   CUDA kernels for Linux     gpu/buildlib.sh   (needs Linux)
+#   derostorm_sa.dll      libsais suffix sort        native/build.bat  (needs Windows)
+#
+# nvcc targets the host it runs on, so neither CUDA library can be built from
+# the other's platform. Building every target from one machine therefore means
+# building the libraries on two -- or copying them across, which is all they
+# are by the time Go embeds them.
+check_embedded() {
+  local missing=0
+  for entry in \
+    "cmd/derostorm/derostorm_gpu.dll:gpu/buildlib.bat, on Windows" \
+    "cmd/derostorm/libderostorm_gpu.so:gpu/buildlib.sh, on Linux" \
+    "cmd/derostorm/derostorm_sa.dll:native/build.bat, on Windows"
+  do
+    local path="${entry%%:*}" how="${entry#*:}"
+    if [ ! -f "$path" ]; then
+      echo "missing $path -- build it with $how" >&2
+      missing=1
+    fi
+  done
+  [ "$missing" -eq 0 ] || exit 1
+}
+check_embedded
 
 if [ "$SKIP_TESTS" -eq 0 ]; then
   echo "running tests..."

@@ -1,17 +1,19 @@
-//go:build !windows
+//go:build !windows && (!linux || !amd64)
 
 package main
 
-// GPU mining on everything except Windows: not built yet.
+// The fallback for builds with no CUDA library to embed: macOS, and Linux on
+// anything but amd64.
 //
-// The kernels themselves are portable CUDA (gpu/*.cuh); what is missing is the
-// packaging. The Windows path embeds a DLL and binds it with LoadLibrary, and
-// the same trick needs a .so plus dlopen here. Until that exists, these builds
-// mine on the CPU.
+// macOS is not a packaging gap but a dead end. Apple dropped NVIDIA driver
+// support in 10.14 and Apple Silicon never had it, so there is no CUDA to bind
+// to on any Mac made since 2018; a GPU path there would be Metal and a rewrite
+// of gpu/*.cuh, not a loader. Linux arm64 is only missing a build -- see
+// gpu_cuda_linux.go.
 //
-// Shapes match gpu_windows.go exactly so engine.go and gpu_worker.go need no
-// build tags of their own, and so a Linux build still type-checks every call
-// site rather than letting the two drift apart unnoticed.
+// Shapes match gpu_cuda.go exactly so engine.go and gpu_worker.go need no build
+// tags of their own, and so these builds still type-check every call site
+// rather than letting the two drift apart unnoticed.
 
 import "errors"
 
@@ -21,7 +23,7 @@ const GPUAvailable = false
 // GPUKind names the hardware this would support, for messages to the user.
 const GPUKind = "NVIDIA CUDA"
 
-var errNoGPUHere = errors.New("GPU mining is only built for Windows at the moment")
+var errNoGPUHere = errors.New("this build has no GPU support: NVIDIA CUDA needs Windows, or Linux on amd64")
 
 // GPUDeviceCount is always zero here.
 func GPUDeviceCount() int { return 0 }
@@ -29,7 +31,7 @@ func GPUDeviceCount() int { return 0 }
 // GPUDeviceInfo has nothing to describe.
 func GPUDeviceInfo(device int) string { return "" }
 
-// GPUContext is the same handle as on Windows, with nothing behind it.
+// GPUContext is the same handle as gpu_cuda.go's, with nothing behind it.
 type GPUContext struct{}
 
 func NewGPUContext(device, batch, blocks int) (*GPUContext, error) { return nil, errNoGPUHere }

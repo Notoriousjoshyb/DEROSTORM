@@ -27,6 +27,19 @@ Copyright (c) 2021-2024 Ilya Grebnov. Licensed under the Apache License,
 Version 2.0. Full text: `native/libsais/LICENSE`. The source is unmodified.
 Only the small C wrapper in `native/derostorm_sa.c` is original derostorm code.
 
+## purego — Apache License 2.0
+
+`vendor/github.com/ebitengine/purego/`
+
+Copyright The Ebitengine Authors. Licensed under the Apache License, Version
+2.0. Full text: `vendor/github.com/ebitengine/purego/LICENSE`. The source is
+unmodified.
+
+Used by `cmd/derostorm/gpu_cuda.go` to call the embedded CUDA library's C entry
+points without cgo — `dlopen` on Linux, and the typed function binding on both
+platforms. Avoiding cgo is what keeps the Linux miner a cross-compile from
+Windows and keeps a C toolchain out of an ordinary build.
+
 ## Dirtybird C Miner — MIT (idea, not code)
 
 https://github.com/Dirtybird99/Dirtybird-C-Miner — Copyright (c) Dirtybird99,
@@ -43,8 +56,22 @@ licence, but the credit for the approach belongs to Dirtybird99. See
 ## Go module dependencies
 
 `vendor/` also contains the remaining Go module dependencies listed in
-`go.mod`. Each keeps the licence in its own directory. Run `go mod vendor` to
-refresh them.
+`go.mod`. Each keeps the licence in its own directory.
+
+**`go mod vendor` is destructive here.** The vendored derohe is not upstream
+derohe: `astrobwt/astrobwtv3/pow.go` is modified and `sha_hook.go` is an
+addition, and between them they provide `AstroBWTv3_pair` and `SHA256Pair`,
+which `cmd/derostorm/` calls. Neither exists in the `replace` target, so
+`go mod vendor` overwrites the first and deletes the second, and the build then
+fails with `undefined: astrobwtv3.AstroBWTv3_pair`. If you have run it, put
+them back with:
+
+```
+git checkout -- vendor/github.com/deroproject/derohe/astrobwt/astrobwtv3/
+```
+
+To add a dependency, run `go mod vendor` and then that `git checkout` — the
+new module's files survive it, since it only restores the derohe ones.
 
 ## Mining rewards
 

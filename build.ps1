@@ -34,7 +34,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$Version  = '1.1.1'
+$Version  = '1.2.0'
 $Pkg      = './cmd/derostorm'
 $BoundsPkg = 'github.com/deroproject/derohe/astrobwt/astrobwtv3'
 $GcFlags  = "$BoundsPkg=-B"
@@ -45,9 +45,16 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 # The embedded copies. Their presence is checked on every build, because a
 # missing one is a build error from go:embed with no hint as to the cause.
+#
+# The Linux CUDA library is the odd one out: nvcc targets the host it runs on,
+# so a .so cannot come from this toolchain and is built under WSL instead. That
+# is a build-time dependency only -- once the file exists, embedding it in a
+# GOOS=linux cross-build is no different from embedding the DLL, which is the
+# reason the GPU binding avoids cgo (see cmd/derostorm/gpu_cuda.go).
 $Embedded = @(
-    @{ Path = 'cmd\derostorm\derostorm_gpu.dll'; Script = 'gpu\buildlib.bat'; What = 'CUDA kernels' }
-    @{ Path = 'cmd\derostorm\derostorm_sa.dll';  Script = 'native\build.bat'; What = 'libsais suffix sort' }
+    @{ Path = 'cmd\derostorm\derostorm_gpu.dll';   Script = 'gpu\buildlib.bat'; What = 'CUDA kernels (Windows)' }
+    @{ Path = 'cmd\derostorm\libderostorm_gpu.so'; Script = 'gpu/buildlib.sh';  What = 'CUDA kernels (Linux)'; Wsl = $true }
+    @{ Path = 'cmd\derostorm\derostorm_sa.dll';    Script = 'native\build.bat'; What = 'libsais suffix sort' }
 )
 
 if ($Native) {
@@ -60,7 +67,13 @@ if ($Native) {
         # code is the only thing worth believing here.
         $prev = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        & cmd /c "$($lib.Script) 2>&1" | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        if ($lib.Wsl) {
+            $repo = (& wsl.exe wslpath -a "$PSScriptRoot") -replace "`0", ''
+            & wsl.exe -- bash -lc "cd '$repo' && sh $($lib.Script) 2>&1" |
+                ForEach-Object { Write-Host "    $($_ -replace "`0", '')" -ForegroundColor DarkGray }
+        } else {
+            & cmd /c "$($lib.Script) 2>&1" | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        }
         $code = $LASTEXITCODE
         $ErrorActionPreference = $prev
 
@@ -70,7 +83,9 @@ if ($Native) {
 
 foreach ($lib in $Embedded) {
     if (-not (Test-Path $lib.Path)) {
-        throw "$($lib.Path) is missing - run $($lib.Script), or .\build.ps1 -Native"
+        $how = if ($lib.Wsl) { "run it under WSL with a Linux CUDA toolkit, or .\build.ps1 -Native" }
+               else          { "run $($lib.Script), or .\build.ps1 -Native" }
+        throw "$($lib.Path) is missing - $how"
     }
 }
 
