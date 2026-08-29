@@ -611,6 +611,39 @@ buffer nothing touches is never in cache.
 
 ### What does not help
 
+**Both obvious attacks on the CPU merge.** `native\saprof.exe` puts the phases
+at merge 43.6%, column walk 37.6%, radix sort 17.0% — so the merge is the
+largest, and it is resolving only **1.8% of key groups and 3.2% of positions**.
+Spending 44% of the sort on 3% of the data looks like an error. It is not; both
+ways of fixing it lose.
+
+*A longer descriptor key.* The key is three bytes (`DSA_KEY_BYTES`), so wider
+keys mean fewer collisions and less merging. Four bytes does exactly that, and
+still loses, because the radix sort needs a third pass:
+
+```
+  3 bytes   329 colliding groups   merge 43.7%  radix 17.0%   5403 texts/s
+  4 bytes   247 colliding groups   merge 38.5%  radix 24.2%   5267 texts/s
+```
+
+The merge gave up 73M cycles and the sort paid 140M for them.
+
+*Pre-reading the comparison's first eight bytes.* Every `suffix_less` loads two
+eight-byte windows at unrelated offsets, and a position is compared more than
+once, so reading each position's `head8` into an array carried through the merge
+should turn scattered text loads into sequential ones. It is bit-exact and it is
+slower — 5,270 against 5,455.
+
+The reason is the group size. A pairwise merge of L lists compares each position
+about log2(L) times, and the average group here is **seven** positions in a few
+lists: its text is in L1 after the first comparison, so there is nothing left to
+save and the pre-pass is pure cost. Gating it on group size, so only the tail
+(930 positions in 279 lists) pays for it, recovers most of the loss but not all
+of it — 5,385 — because the branch that chooses costs about what it saves.
+
+The finding is that the merge is not latency bound the way the phase share
+suggests. It is 5,229 comparisons over data that is already hot.
+
 **The stage-1 instruction table, on the CPU.** It is a clear win on the GPU
 (above) and the obvious next move is to do the same in `pow.go`, replacing 2,300
 lines of switch with a 512-byte table. Both forms generated from `pow.go`, proved
