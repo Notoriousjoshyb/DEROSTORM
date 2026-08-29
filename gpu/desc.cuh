@@ -1,4 +1,4 @@
-// desc.cuh -- the descriptor suffix sort, one thread block per hash.
+﻿// desc.cuh -- the descriptor suffix sort, one thread block per hash.
 //
 // This is the CPU descriptor sort (native/descriptor.c) mapped onto a block. The
 // idea is identical and stated in full there; the short version is that stage 1
@@ -65,6 +65,60 @@
 #ifndef DESC_SPLIT
 #define DESC_SPLIT 160
 #endif
+
+// Blocks a run may span before it is cut anyway, or 0 for no cap.
+//
+// This knob exists only on the GPU, and the reason is the mapping. On the CPU a
+// longer run is strictly better -- it shares more columns and it hands the
+// global sort a bigger pre-ordered group, and native/descriptor.c measured that
+// out to a plateau past 64 blocks. Here the walk is one thread per run, so runs
+// are also the only parallelism the phase has: ~62 of them against BR_BLOCK
+// threads, in the phase that is 38% of the kernel. Cutting runs shorter buys
+// threads at the price of columns.
+//
+// The cut is on a fixed grid rather than by counting from the last boundary,
+// because the boundary test is one thread per block and knows nothing about its
+// neighbours; counting would make a parallel phase sequential to speed up a
+// sequential one. A grid cut bounds run length just as well.
+//
+// Swept in the README. The answer is the default below.
+#ifndef DESC_RUN_MAX
+#define DESC_RUN_MAX 0
+#endif
+
+// Four-byte words a suffix comparison reads per iteration. See descSuffixLess.
+#ifndef DESC_CMP_WORDS
+#define DESC_CMP_WORDS 2
+#endif
+
+// Pieces the 256 columns of a run are cut into, each walked by its own thread.
+//
+// The walk is sequential in the columns because column rel-1 inherits the order
+// from column rel, and that is why the phase runs on ~62 threads: one per run,
+// 256 steps each. Measured, its cost is not the work -- an extra text read per
+// position per column is free and an extra arena word is 4.6% -- it is the
+// chain. So the chain is what has to be cut.
+//
+// It can be, because the inheritance is an optimisation and not a definition.
+// The order at column rel is just the run's blocks sorted by the suffixes
+// starting at rel, which depends on the text and nothing else. A thread can
+// therefore start anywhere: sort directly at the top of its own piece, then
+// inherit down through it. K pieces means K seed sorts per run instead of one,
+// against a chain of 256/K instead of 256, and K times the threads.
+//
+// 1 is exactly the old shape, seed at column 255 and walk to 0, which is what
+// makes it the honest baseline for the sweep in the README.
+#ifndef DESC_CHUNKS
+#define DESC_CHUNKS 4
+#endif
+#define DESC_CHUNK_COLS (256 / DESC_CHUNKS)
+
+// Must divide 256 exactly, or the pieces do not cover the columns and the
+// suffix array is silently wrong -- 3 and 6 were both measured producing a
+// wrong answer before this line existed, because 3*85 and 6*42 leave a
+// column nobody walks.
+static_assert(DESC_CHUNKS * DESC_CHUNK_COLS == 256,
+              "DESC_CHUNKS must divide 256");
 
 // Blocks in the longest text, which is what the order and run tables are sized
 // for. ASTRO_MAX_TEXT is ASTRO_MAX_TRIES*256, so this is ASTRO_MAX_TRIES.
@@ -137,11 +191,55 @@ __device__ __forceinline__ uint32_t descKey32(const uint8_t* t, int n, int p)
 // decides four of them: eight independent loads in flight, then one branch. The
 // loads are what matters -- they can all be outstanding at once instead of
 // forming a chain -- and the branch saving comes free with it.
-__device__ __forceinline__ bool descSuffixLess(const uint8_t* t, int n, int a, int b)
+// `from` is a count of leading bytes the caller already knows are equal, so the
+// comparison may start past them. The merge knows four: a key group is by
+// definition the descriptors whose first four bytes agree, so its every
+// comparison used to open by gathering eight bytes across two cache lines,
+// comparing them, finding them equal, and going round again. That is one full
+// dependent global round trip per comparison, spent to re-derive the fact that
+// put the two suffixes in the same group.
+//
+// Only when the shorter suffix actually has that many bytes. Two suffixes can
+// share a key with fewer, because a key past the end of the text is zero
+// padded, and then the bytes are not known to be equal -- they are not all
+// there. m < from falls back to a full comparison, which is what a text end
+// costs and there are at most three of them.
+__device__ __forceinline__ bool descSuffixLessFrom(const uint8_t* t, int n,
+                                                   int a, int b, int from)
 {
     const int la = n - a, lb = n - b;
     const int m = la < lb ? la : lb;
-    int i = 0;
+    int i = (m >= from) ? from : 0;
+
+    // DESC_CMP_WORDS four-byte words per iteration, compared in order.
+    //
+    // The loads are the cost and they are not coalesced -- two suffixes at
+    // unrelated offsets, one thread. What can be changed is how many are in
+    // flight. A four-byte step issues eight loads, waits, and decides, so a
+    // comparison that walks ~97 bytes before it separates is ~24 dependent
+    // round trips one after another. Widening the step does not read less, it
+    // reads further ahead: the same bytes, fewer stalls, at the price of
+    // fetching a little past the answer on the iteration that finds it.
+    //
+    // Colliding suffixes are long-prefix matches by construction -- they come
+    // from near-copy blocks -- so reading ahead is rarely wasted. Swept in the
+    // README.
+    for (; i + 4 * DESC_CMP_WORDS <= m; i += 4 * DESC_CMP_WORDS) {
+        uint32_t wa[DESC_CMP_WORDS], wb[DESC_CMP_WORDS];
+#pragma unroll
+        for (int w = 0; w < DESC_CMP_WORDS; w++) {
+            const int o = i + 4 * w;
+            wa[w] = ((uint32_t)t[a + o] << 24) | ((uint32_t)t[a + o + 1] << 16) |
+                    ((uint32_t)t[a + o + 2] << 8) | (uint32_t)t[a + o + 3];
+            wb[w] = ((uint32_t)t[b + o] << 24) | ((uint32_t)t[b + o + 1] << 16) |
+                    ((uint32_t)t[b + o + 2] << 8) | (uint32_t)t[b + o + 3];
+        }
+#pragma unroll
+        for (int w = 0; w < DESC_CMP_WORDS; w++) {
+            if (wa[w] != wb[w]) return wa[w] < wb[w];
+        }
+    }
+
     for (; i + 4 <= m; i += 4) {
         const uint32_t wa = ((uint32_t)t[a + i] << 24) | ((uint32_t)t[a + i + 1] << 16) |
                             ((uint32_t)t[a + i + 2] << 8) | (uint32_t)t[a + i + 3];
@@ -156,6 +254,11 @@ __device__ __forceinline__ bool descSuffixLess(const uint8_t* t, int n, int a, i
     return la < lb;
 }
 
+__device__ __forceinline__ bool descSuffixLess(const uint8_t* t, int n, int a, int b)
+{
+    return descSuffixLessFrom(t, n, a, b, 0);
+}
+
 // descSuffixArrayBlock builds the suffix array of t[0:n] into sa[0:n]. The whole
 // block must call it with blockDim.x == BR_BLOCK. Returns 0 on success, or a
 // negative value when a key group was too large to merge (see DESC_MERGE_CAP),
@@ -163,7 +266,11 @@ __device__ __forceinline__ bool descSuffixLess(const uint8_t* t, int n, int a, i
 __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                                     DescScratch sc, BlockRadixScratch* sh)
 {
-    __shared__ int32_t s_order[DESC_MAX_BLOCKS];
+    // One order and key array per chunk, so chunks of the same run do not
+    // overwrite each other. At DESC_CHUNKS == 1 this is the single array the
+    // walk has always used.
+    __shared__ int32_t  s_order[DESC_CHUNKS * DESC_MAX_BLOCKS];
+    __shared__ uint32_t s_wkey[DESC_CHUNKS * DESC_MAX_BLOCKS];
     __shared__ int32_t s_start[DESC_MAX_BLOCKS + 1];
     __shared__ int32_t s_flag[DESC_MAX_BLOCKS];
     __shared__ int32_t s_keep[DESC_MAX_BLOCKS];   // s_flag before the scan ate it
@@ -200,6 +307,9 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
             int diff = 0;
             for (int i = 0; i < 256 && diff <= DESC_SPLIT; i++) diff += (a[i] != b[i]);
             start = (diff > DESC_SPLIT);
+#if DESC_RUN_MAX > 0
+            start |= ((g % DESC_RUN_MAX) == 0);
+#endif
         }
         s_flag[g] = start;
         s_keep[g] = start;
@@ -235,21 +345,28 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
     // runs are the only parallelism there is -- so its latency is the kernel's,
     // and cutting loads is the whole game.
     //
-    // s_keep is finished with by here: phase 1 scattered out of it before the
-    // barrier above and nothing reads it again. The keys borrow it rather than
-    // claim shared memory of their own, which is this kernel's scarcest
-    // resource -- the radix sort's tile is already 11 KB.
-    uint32_t* s_key = (uint32_t*)s_keep;
+    // One thread per (run, chunk) rather than per run; see DESC_CHUNKS. At
+    // DESC_CHUNKS == 1 this is one thread per run and the loop below is the
+    // walk it always was.
+    const int ntask = s_nruns * DESC_CHUNKS;
 
-    for (int r = tid; r < s_nruns; r += BR_BLOCK) {
+    for (int q = tid; q < ntask; q += BR_BLOCK) {
+        const int r = q / DESC_CHUNKS;
+        const int c = q - r * DESC_CHUNKS;    // 0 is the top of the text
         const int g0 = s_start[r];
         const int len = s_start[r + 1] - g0;
         const int base = g0 * 256;
 
-        int32_t* ord = s_order + g0;          // exactly len entries, see the note
-        uint32_t* key = s_key + g0;           // key[x] is K(ord[x] + rel)
+        // Columns this thread owns, walked hi down to lo.
+        const int hi = 255 - c * DESC_CHUNK_COLS;
+        const int lo = hi - DESC_CHUNK_COLS + 1;
+
+        // Chunks of the same run walk it at the same time, so each needs its own
+        // order and keys -- hence the stride. Runs partition the blocks, so the
+        // slices within a chunk are still disjoint.
+        int32_t*  ord = s_order + (size_t)c * DESC_MAX_BLOCKS + g0;
+        uint32_t* key = s_wkey  + (size_t)c * DESC_MAX_BLOCKS + g0;
         uint32_t* arena = sc.arena + (size_t)g0 * 256;
-        uint32_t aw = 0;
 
         // Seed with the order of the suffixes starting at each block's last
         // byte. Insertion sort: len is the blocks in a run, typically four.
@@ -257,16 +374,21 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         for (int i = 1; i < len; i++) {
             const int32_t v = ord[i];
             int j = i;
-            while (j > 0 && descSuffixLess(t, n, v + 255, ord[j - 1] + 255)) {
+            while (j > 0 && descSuffixLess(t, n, v + hi, ord[j - 1] + hi)) {
                 ord[j] = ord[j - 1];
                 j--;
             }
             ord[j] = v;
         }
-        // The only full key read in the walk; every later column slides.
-        for (int i = 0; i < len; i++) key[i] = descKey32(t, n, ord[i] + 255);
+        // The chunk's one full key read; every column below it slides.
+        for (int i = 0; i < len; i++) key[i] = descKey32(t, n, ord[i] + hi);
 
-        for (int rel = 255; rel >= 0; rel--) {
+        for (int rel = hi; rel >= lo; rel--) {
+            // Where this column's positions go. Every column of a run emits
+            // every one of its blocks exactly once, so the offset is the column
+            // number times the run length and needs no running total -- which is
+            // what lets chunks write into the same arena without meeting.
+            uint32_t aw = (uint32_t)(255 - rel) * (uint32_t)len;
             // Split the ordered suffixes into maximal groups sharing four
             // leading bytes, and record each as one descriptor.
             int i = 0;
@@ -284,7 +406,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                 i = j;
             }
 
-            if (rel == 0) break;
+            if (rel == lo) break;
 
             // Step left, reading each block's byte in this column exactly once.
             // Slide first, because the keys move whether or not the order does.
@@ -464,7 +586,9 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                     int p0 = ba[l], e0 = ba[l + 1];
                     int p1 = ba[l + 1], e1 = ba[l + 2];
                     while (p0 < e0 && p1 < e1) {
-                        b[pos++] = descSuffixLess(t, n, a[p1], a[p0]) ? a[p1++] : a[p0++];
+                        // 4: every position here shares the group's key.
+                        b[pos++] = descSuffixLessFrom(t, n, a[p1], a[p0], 4)
+                                       ? a[p1++] : a[p0++];
                     }
                     while (p0 < e0) b[pos++] = a[p0++];
                     while (p1 < e1) b[pos++] = a[p1++];
