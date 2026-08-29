@@ -467,6 +467,40 @@ batch size without needing a node. The intermediate 12.28 KH/s this table used
 to carry was the gain from the packed-key change described below; the rest came
 from the block-count sweep and the stage-1 work after it.
 
+**Stage 1 as a table, not a switch.** AstroBWTv3 picks one of 256 byte
+operations per iteration, and a warp whose 32 lanes pick 32 different ones runs
+them one after another. That looked like a fixed cost of the algorithm.
+
+It is not. Every one of the 256 operations is exactly **four instructions from
+one set of sixteen** — @Wolf9466's observation, published in tnn-miner, see
+`CREDITS.md` — so the op can choose data instead of code. `gpu/gencases` emits a
+512-byte table and its decoder from `pow.go`, and fails the build if any case
+stops being four instructions; `gpu/stage1.cuh` applies the four statements that
+are not instructions by op number.
+
+Measured with `gpu\hash_parallel_test.exe`, which times stage 1 separately, three
+runs each, the same binary switched with `-DSTAGE1_SWITCH`:
+
+```
+  stage 1        switch  24.4  24.4  24.4 ms
+                 table   22.8  23.1  22.6 ms      -6%
+  whole hash     switch  30422 30563 30399 H/s
+                 table   30870 30772 30596 H/s    +0.9%
+```
+
+Six percent of stage 1 and about one of the hash, because stage 1 is only 8.6%
+of GPU hash time to begin with — the 256-way branch was never the expensive part
+of it; the per-iteration hashing and the 256-byte append are. The size is the
+larger result: 2,572 lines of generated switch, once per architecture in a fat
+binary, became one table, and the embedded CUDA library went from 5,840 KB to
+2,124 KB.
+
+Nesting the loops the other way — instruction outside, bytes inside, so the
+branch is taken four times per op rather than four times per byte — is also
+correct and measured 23.4 ms, slightly worse: it reads and writes shared memory
+four times per byte instead of once. The same swap on the CPU goes the other way
+by a factor of 4.7, which is why stage 1 in Go still uses its switch. See below.
+
 The kernel is checked before it is timed: `--bench` verifies the card against
 the CPU, and `gpu\hash_parallel_test.exe gpu\vectors.bin` reports
 `CORRECT: all 512 hashes match the CPU exactly`.
@@ -537,7 +571,29 @@ buffer nothing touches is never in cache.
 
 ### What does not help
 
-Recorded because they are the obvious next guesses, and all three are wrong.
+**The stage-1 instruction table, on the CPU.** It is a clear win on the GPU
+(above) and the obvious next move is to do the same in `pow.go`, replacing 2,300
+lines of switch with a 512-byte table. Both forms generated from `pow.go`, proved
+identical on all 256 ops first, then timed:
+
+```
+  switch    25.1 ns/op
+  table    118.0 ns/op        4.7x slower
+```
+
+The reason is the loop nesting, and it is the exact opposite of the GPU's. The
+switch chooses the operation **once** and then runs a window of up to 32 bytes
+with no branch in sight. The table branches four times **per byte**. A CPU
+predicts the one outer branch almost perfectly and a GPU cannot, which is the
+whole difference between the two answers.
+
+tnn-miner does use the table on the CPU, and is right to: it pairs it with AVX2,
+doing 32 bytes per instruction, which is what makes the shape pay. DeroStorm's
+stage 1 is Go, where that is not expressible without assembly, and the ceiling
+would not justify it — the operation loop is under 6% of a CPU hash, so a
+perfect result is worth about +0.1 KH/s of the machine's ~45.
+
+The three below are recorded for the same reason, and all three are wrong.
 Measured on a 9800X3D with DDR5-6000 CL30 and an RTX 5080.
 
 **These three were measured on an earlier build and have not been re-run.** The

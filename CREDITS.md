@@ -27,6 +27,30 @@ a quarter of its current CPU speed without it.
 
 Thanks, Dirtybird.
 
+## Wolf9466 and tnn-miner — the 256 operations are sixteen
+
+**https://github.com/Tritonn204/tnn-miner** — by Tritonn204, and the file this
+came from, `src/crypto/astrobwtv3/wolfbranching.cpp`, credits @Wolf9466.
+
+AstroBWTv3's stage 1 is written as a 256-way switch, and everyone including us
+implemented it as one: 2,300 lines of Go in `pow.go`, and 2,572 lines of
+generated CUDA to match. Wolf noticed that it is not 256 of anything. Every one
+of the operations is exactly **four instructions drawn from one set of sixteen**,
+so the entire switch is a 512-byte table and a four-step loop.
+
+DeroStorm's table is generated from `pow.go` by `gpu/gencases` rather than
+copied, and it came out identical to Wolf's, entry for entry, all 256 — which is
+the check that the reading is right, in both directions. No tnn-miner code is
+included here.
+
+On the GPU it is worth about 6% of stage 1, and it shrinks the embedded CUDA
+library from 5,840 KB to 2,124 KB. On the CPU the same table is **4.7x slower**
+than the switch it would replace, so the CPU keeps its switch — see the README.
+That is not a criticism of the idea: tnn-miner pairs it with AVX2, which is what
+makes it pay there, and DeroStorm's stage 1 is Go.
+
+Thanks, Wolf.
+
 ## libsais — Ilya Grebnov
 
 **https://github.com/IlyaGrebnov/libsais** — Apache-2.0.

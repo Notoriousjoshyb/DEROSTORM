@@ -7,11 +7,24 @@
 //
 // The 256-way switch is the part AstroBWTv3 aims at GPUs on purpose: a warp
 // executes 32 lanes in lockstep, so 32 lanes picking 32 different cases run one
-// after another. Nothing here fixes that -- it is inherent to the algorithm and
-// to the thread-per-hash mapping. It is cheap in absolute terms only because
-// each case body touches at most 32 bytes.
+// after another. That looked inherent, and the case bodies were generated as a
+// literal switch to match.
 //
-// The case bodies are generated, not hand-written: see gpu/gencases.
+// It is not inherent. All 256 operations are exactly four instructions drawn
+// from one set of sixteen -- @Wolf9466's observation, published in tnn-miner
+// (see CREDITS.md) -- so the op can select data rather than code: a 512-byte
+// table, and one loop every lane runs together. What is left diverges sixteen
+// ways at worst instead of 256, and lanes that drew the same instruction at the
+// same step share it. Both the table and its decoder are generated from pow.go
+// by gpu/gencases, which fails the build if any case stops being four
+// instructions, and the four statements that are not instructions are applied
+// by op number here.
+//
+// Building with -DSTAGE1_SWITCH selects the old literal switch instead. It is
+// kept because it is the readable form of the same thing, and because a claim
+// that the table is faster is only worth what the measurement beside it is.
+//
+// Both forms are generated, not hand-written: see gpu/gencases.
 //
 // Storage is the caller's choice and it matters more than anything else here.
 // step_3 and the RC4 permutation are both 256-byte arrays indexed by runtime
@@ -25,6 +38,12 @@
 #pragma once
 #include <cstdint>
 #include "crypto.cuh"
+
+// STAGE1_CODE and stage1Step. After crypto.cuh, which is where the rotl8 and
+// rev8 they use come from. The -DSTAGE1_SWITCH build does not need it.
+#ifndef STAGE1_SWITCH
+#include "stage1_table.inc"
+#endif
 
 // tries stops at 277, and each try appends 256 bytes.
 #define ASTRO_MAX_TRIES 277
@@ -75,7 +94,52 @@ __device__ uint32_t astroStage1(const uint8_t* input, int inlen, uint8_t* text,
             pos2 = (uint8_t)(pos1 + ((uint8_t)(pos2 - pos1) & 0x1f));
         }
 
+#ifdef STAGE1_SWITCH
 #include "stage1_cases.inc"
+#else
+        // The same 256 cases as one loop over four instructions. The op decides
+        // the data the loop reads, not the code it runs, so a warp whose lanes
+        // drew 32 different ops now walks one body together instead of taking
+        // 32 branches one after another.
+        {
+            if (op >= 254) rc4Init(&rc4s, s, 256);   // case 254/255, before the loop
+
+            // Bytes outside, the four instructions inside, so a byte is read
+            // and written once and stays in a register between them.
+            //
+            // The other nesting -- instruction outside, bytes inside -- is also
+            // correct, because a byte's result depends only on s[i] and s[pos2]
+            // and no op but case 0 writes s[pos2], so the loops commute for the
+            // other 255. It takes the branch four times per op instead of four
+            // times per byte, which sounds strictly better and is not: it reads
+            // and writes shared memory four times per byte instead of once, and
+            // measured 23.4 ms against 22.8. Whether that trade pays depends on
+            // which resource is scarce, and the two answers are opposite -- the
+            // same swap in Go is worth 4.7x, which is why the CPU keeps its
+            // switch. See the CPU note in README.md.
+            const uint16_t insns = STAGE1_CODE[op];
+            for (uint8_t i = pos1; i < pos2; i++) {
+                // Re-read per byte, because case 0's swap below writes s[pos2].
+                const uint8_t p2 = s[pos2];
+                uint8_t x = s[i];
+#pragma unroll
+                for (int sh = 12; sh >= 0; sh -= 4) {
+                    x = stage1Step(x, p2, (insns >> sh) & 0xF);
+                }
+                s[i] = x;
+
+                if (op == 0) {
+                    uint8_t a = rev8(s[pos1]), b = rev8(s[pos2]);
+                    s[pos2] = a;
+                    s[pos1] = b;
+                }
+                if (op == 253) {
+                    prev_lhash = lhash + prev_lhash;
+                    lhash = xxhash64(s, pos2);
+                }
+            }
+        }
+#endif
 
         // Four probabilistic deviations. The Go source compares byte
         // subtraction, which wraps, so the cast to uint8_t is load-bearing.
