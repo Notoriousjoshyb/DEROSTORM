@@ -31,6 +31,25 @@ derostorm.json
 # --- local scratch, not part of the project ---
 _local/
 
+# --- one-off measurement binaries ---
+# The native and CUDA experiment builds land beside their sources with a suffix
+# saying which variant they are (sabench_s160, saprof_b1b, desc_test256). The
+# *.exe rule above already covers them; this comment is here so the next person
+# knows they are disposable and can be deleted at any time.
+
+# --- measurement notes, kept local ---
+# One directory per research wave: what was tried, what was measured, and what
+# was reverted. Deliberately not committed -- these are working notes against
+# one machine's numbers, and the conclusions that survived them are written up
+# in the README instead. Drop this line to start tracking them.
+research/
+
+# --- analysis tool output ---
+# graphify writes a call-graph cache here. It is tens of megabytes of derived
+# JSON keyed by content hash, so it rebuilds from the tree on demand and must
+# never be committed.
+graphify-out/
+
 # --- editor / OS ---
 .vscode/
 .idea/

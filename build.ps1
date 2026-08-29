@@ -46,7 +46,8 @@
 param(
     [switch]$All,
     [switch]$Native,
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [switch]$Clean
 )
 
 $ErrorActionPreference = 'Stop'
@@ -63,6 +64,56 @@ function Get-GcFlags($goarch) {
     return ''
 }
 $OutDir   = Join-Path $PSScriptRoot 'bin'
+
+# -Clean removes build output and the disposable measurement binaries, then
+# exits. It is a separate switch rather than something a build does on its own,
+# because a build that quietly deletes things is a build nobody trusts.
+#
+# What it never touches: the three embedded libraries under cmd\derostorm. They
+# are inputs to the build, not outputs of it -- go:embed fails without them and
+# rebuilding them needs nvcc, MSVC and WSL. gpuectors.bin is left for the same
+# reason: the GPU tests read it.
+function Invoke-Clean {
+    $targets = @(
+        'bin'
+        'bench'
+        'derostorm.exe'
+        'cmd\derostorm\derostorm.exe'
+    )
+    $patterns = @(
+        'native\sabench*.exe'
+        'native\saprof*.exe'
+        'native\sapro_*.exe'
+        'native\shabench*.exe'
+        'gpu\*_test*.exe'
+        'gpu\desc_test*.exe'
+        'gpu\hash*.exe'
+        'gpu\prof\prof.exe'
+        'gpu\*.exp'
+        'gpu\*.lib'
+        'native\*.exp'
+        'native\*.lib'
+        'native\*.obj'
+    )
+
+    $freed = 0
+    foreach ($t in $targets + ($patterns | ForEach-Object { Get-Item $_ -EA SilentlyContinue })) {
+        $path = if ($t -is [string]) { $t } else { $t.FullName }
+        if (-not (Test-Path $path)) { continue }
+        $bytes = (Get-ChildItem $path -Recurse -File -EA SilentlyContinue |
+                  Measure-Object -Property Length -Sum).Sum
+        if (-not $bytes) { $bytes = (Get-Item $path).Length }
+        Remove-Item $path -Recurse -Force -EA SilentlyContinue
+        if (-not (Test-Path $path)) {
+            $freed += $bytes
+            Write-Host "  removed $path" -ForegroundColor DarkGray
+        }
+    }
+    Write-Host ''
+    Write-Host ("cleaned {0:N0} MB" -f ($freed / 1MB)) -ForegroundColor Green
+}
+
+if ($Clean) { Invoke-Clean; return }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 

@@ -10,17 +10,17 @@ and `astrobwt/difftest` compares the two on every build.
 ```
 ╭─ DEROSTORM ──────────────────────────────────────── AstroBWTv3 · v1.3.0 ─╮
 │                                                                          │
-│  ◆ MINING                      96.91 KH/s                 15 CPU · 1 GPU │
+│  ◆ MINING                     103.15 KH/s                 15 CPU · 1 GPU │
 │       ▁▂▃▄▅▆▇▇▇▇▇▇▇▇▇▇█▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   60s │
-│                                                                          │
-│    CPU ████████████████████▌░░░░░░░░░░░░░░░░░░░░░░░░░░   33.51 KH/s  35% │
-│    GPU ███████████████████████████████████████████████   63.40 KH/s  65% │
-│                                                                          │
-├──────────────────────────────────────────────────────────────────────────┤
-│  HEIGHT      2,481,903                NETWORK     120.00 KH/s            │
-│  BLOCKS      9                        DIFFICULTY  132,000                │
+├─ DEVICES ────────────────────────────────────────────────────────────────┤
+│  CPU    ████████████████▌░░░░░░░░░░░░░░░░░  33.51 KH/s   32%  71°C       │
+│  GPU 0  ████████████████████████████████░░  69.64 KH/s   68%  66°C  215W │
+├─ NETWORK ────────────────────────────────────────────────────────────────┤
+│  HEIGHT      2,481,903                DIFFICULTY  132,000                │
+│  BLOCKS      9                        NETWORK     120.00 KH/s            │
 │  MINIBLOCKS  89                       SHARE       12.92% · ~8.5s         │
-│  UPTIME      00:12:47                 REJECTED    1                      │
+│  REJECTED    1                        PEAK        104.20 KH/s            │
+│  UPTIME      00:12:47                 GPU EFF     324 H/W                │
 │  NODE        minernode1.dero.live:10100                                  │
 ╰──────────────────────────────────────────────────────────────────────────╯
   ▸ 11:04:00  connect    connected to minernode1.dero.live:10100
@@ -31,10 +31,19 @@ and `astrobwt/difftest` compares the two on every build.
   › threads 12▏
 ```
 
-The two bars are the row worth having. A single combined hashrate cannot tell
-you that a GPU stopped contributing an hour ago; this can. `SHARE` is your slice
-of the network and the mean gap between shares at the current difficulty, which
-is what says whether a change to the settings actually helped.
+The **DEVICES** section is the part worth having. A single combined hashrate
+cannot tell you that a card stopped contributing an hour ago; a row per device
+can, and on a rig it says *which* card rather than only that the total dropped.
+Each row carries that device's temperature, and a GPU row its power draw.
+
+`SHARE` is your slice of the network and the mean gap between shares at the
+current difficulty, which is what says whether a change to the settings actually
+helped. `PEAK` beside the live figure is what says whether the machine is still
+as fast as it was, and `GPU EFF` is hashes per watt — on a machine that runs for
+months that is the number the electricity bill is denominated in.
+
+See [Temperatures](#temperatures) for where the two numbers come from, and why
+the CPU one is harder than the GPU one.
 
 ---
 
@@ -96,9 +105,11 @@ Colour is switched off automatically when output is not a terminal or when `NO_C
 
 ### Window size
 
-The panel needs about **98 columns by 36 rows** — the banner, the panel at its
-tallest (which is with a GPU running, since the CPU/GPU split rows only exist
-then), the event log and the command line.
+The panel needs about **98 columns by 38 rows** — the banner, the panel, the
+event log and the command line. It is two rows taller with a GPU than without,
+and one row taller again for every extra card, because every device gets its own
+row; DeroStorm sizes the window from the device count in the config before
+anything is drawn.
 
 DeroStorm asks the terminal for that on start-up, and only ever asks for more
 than it has, so a window someone has deliberately made large is left alone. Two
@@ -112,6 +123,67 @@ moving the cursor up over its own height, so one that is taller than the window
 would walk down the screen leaving a copy of itself behind on every frame. If it
 cannot fit even a two-line log, DeroStorm says so and prints plain scrolling
 output instead.
+
+---
+
+## Temperatures
+
+The **DEVICES** rows carry a temperature per source, coloured green below 65°C,
+amber to 80°C and red above it. Nothing is ever throttled, clocked or fan-curved
+in response: the miner reports the number and leaves the decision to you. A
+program that quietly backs off on a reading it half-trusts is worse than one
+that shows you the reading.
+
+### GPU — always works
+
+Read from **NVML**, the management library inside the NVIDIA display driver. It
+is loaded at run time by name, exactly as the CUDA kernels are, so a machine
+with a working card always has it and a machine without one simply gets no
+telemetry instead of a miner that will not start. Only the read-only queries are
+bound — nothing here can change a clock, a fan or a power limit.
+
+That gives temperature, power draw against the enforced limit, fan speed,
+utilisation, memory use and core clock. The panel shows temperature and watts;
+the watts are also what `GPU EFF` divides by.
+
+On a rig with unlike cards, CUDA numbers devices fastest-first while NVML numbers
+them by PCI bus, so the two would disagree about which card is "GPU 1".
+DeroStorm sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before opening anything, which
+makes the two the same numbering. Set it yourself to override.
+
+### CPU — depends on the platform
+
+**Linux** is straightforward: the kernel has already read the register and
+published it under `/sys/class/hwmon`. `k10temp` or `zenpower` on AMD,
+`coretemp` on Intel, with `/sys/class/thermal` as a fallback. This is the same
+number `sensors` prints, and needs no privileges.
+
+**Windows has no user-mode API for it.** The value lives behind an MSR on Intel
+or the SMU mailbox on AMD, both ring-0. That is why HWiNFO, LibreHardwareMonitor
+and Ryzen Master all install a kernel driver. DeroStorm will not install one, so
+it tries what user mode can see, best first:
+
+1. **LibreHardwareMonitor or OpenHardwareMonitor**, over the local web server
+   either can expose. If one is already running this is the real package
+   temperature, read through the driver it already installed. Turn it on with
+   *Options → Remote Web Server → Run*; the default port 8085 is what DeroStorm
+   looks at. Point it somewhere else with `DEROSTORM_CPU_TEMP_URL`.
+2. **The ACPI thermal zone**, through the performance counter Windows publishes
+   for it. No privileges, no other software. On laptops and most servers it
+   tracks the CPU closely; on many desktop boards it is a chipset zone reporting
+   a fixed, obviously wrong value, so anything outside 25–125°C is discarded.
+
+When neither answers, the panel shows `--` and the event log says once what
+would fix it. It never guesses — a confidently wrong temperature is worse than
+no temperature, because it is the number someone would act on.
+
+**macOS and the BSDs** report nothing. macOS needs a private IOKit interface
+whose sensor keys change between Mac models; the BSDs each have their own
+sysctl. Both are real options, neither is one line.
+
+Sensors are polled on their own goroutine every two seconds, not on the 200ms
+render tick: a temperature does not move five times a second and every read
+crosses into a driver.
 
 ---
 
@@ -220,7 +292,8 @@ hardware, the first case is the easy one.
 
 ### What the build flags do
 
-The build scripts pass two non-default flags. Both are deliberate and both matter.
+The build scripts pass three non-default flags — two to the Go compiler and one
+to MSVC. All three are deliberate and all three matter.
 
 **`-gcflags '…/astrobwtv3=-B'` — bounds checks off, in one package only.**
 
@@ -250,7 +323,35 @@ safely had.
 
 **`-pgo=auto` — profile-guided optimisation.**
 
-Uses `cmd/derostorm/default.pgo`. Worth a few percent. Regenerate it with the `pow-bench` tool in the derohe tree if you change the hash code.
+Uses `cmd/derostorm/default.pgo`. Regenerate it with
+`--cpuprofile=cmd/derostorm/default.pgo --run-for=90` if you change the Go hot
+path. Note that it only reaches the Go half of a hash — stage 1, the final
+SHA-256 and the mining loop. The suffix sort is in the native library, where
+Go's profile cannot see it, which is why refreshing the profile after a change
+to `native/descriptor.c` is a null (measured 2026-08-29: 34.24/34.25/34.26 KH/s
+with a fresh profile against 34.13/34.31 with the shipped one — no difference
+outside the noise).
+
+**`/GL` with `/LTCG` — whole-program optimisation, on the native library.**
+
+`native/build.bat` compiles `derostorm_sa.c`, `descriptor.c`, `sha256ni.c` and
+`libsais.c` in one command, but without `/GL` each is still its own translation
+unit: the descriptor merge cannot inline `suffix_less` across a file boundary
+and libsais cannot be specialised for the one way this program calls it. `/GL`
+defers code generation to link time, where the optimiser can see all of it.
+
+Measured on `native/sabench.exe` at 15 threads, four interleaved rounds:
+
+| | texts/s |
+|---|---:|
+| without `/GL` | 44,054 – 45,032 |
+| with `/GL /LTCG` | **46,410 – 46,963** |
+
+About **+4.7%** on the sort, every round, with no overlap between the two sets.
+End to end that is **+1.8%** on the CPU hashrate — 33.6–34.0 KH/s before,
+34.2–34.5 KH/s after, three interleaved `--bench` rounds at 15 threads — because
+a whole hash is not only the sort. The output is bit-identical; the 512 vectors
+still pass. It costs a slower link and nothing else.
 
 ### Building the native libraries
 
@@ -352,19 +453,25 @@ is checked the same way — `gpu/hash_parallel_test.exe` against 512 real CPU
 vectors, and the miner re-verifies each device against the CPU at start-up before
 it will submit anything from it.
 
-All numbers below were re-measured on 2026-08-28 against DeroStorm 1.1.0, on a
+Most numbers below were measured on 2026-08-28 against DeroStorm 1.1.0, on a
 Ryzen 7 9800X3D (8C/16T, DDR5-6000 CL30) and an RTX 5080, unless a section says
 otherwise. Everything in this section except the *Before* columns and the
 *What does not help* experiments comes from `derostorm --bench`, which needs no
 node and no wallet, so you can reproduce it on your own machine in a minute.
 
-Headline, all of it at once:
+Headline, all of it at once, re-measured on 2026-08-29 at 1.3.0:
 
 | | H/s |
 |---|---:|
-| CPU, 15 threads | 33,506 |
-| RTX 5080 | 63,400 |
-| **together** | **85,437** |
+| CPU, 15 threads | 34,180 – 34,500 |
+| RTX 5080 | 71,550 – 71,750 |
+| **together, real mining path** | **~103,100** |
+
+The combined figure is `--run-for=60 --gpu=all --gpu-blocks=672`, not the sum of
+the two above: on the real path the two share a memory system and a job feed,
+and the sum overstates it by two or three percent. The 1.1.0 figures this table
+used to carry were 33,506 / 63,400 / 85,437 — the GPU is where almost all of the
+gain since has been.
 
 ### CPU
 
@@ -703,6 +810,41 @@ in at start-up. It did not change the hashrate, and it was never going to: a
 buffer nothing touches is never in cache.
 
 ### What does not help
+
+**Every nvcc flag worth trying.** The suffix kernel is memory-saturated, so the
+temptation is to look for a compiler switch that moves it. Three were built as
+single-architecture `sm_120` libraries and A/B'd through the real miner
+(`--bench --gpu=all`), twice each, interleaved:
+
+| | best H/s |
+|---|---:|
+| control (`-O3`, as shipped) | 71.88 / 71.87 K |
+| `--extra-device-vectorization` | 71.30 / 71.43 K |
+| `-Xptxas -dlcm=cg` | **35.37 / 35.34 K** |
+
+`-dlcm=cg` bypasses L1 for global loads, which halves the rate: the descriptor
+walk re-reads the same 68 KB of text constantly and lives on L1 hits. The
+vectorisation flag is a small consistent loss. There is nothing here.
+
+A plain rebuild is also a null, which is worth knowing before anyone suspects a
+stale artefact: the shipped fat binary against a fresh single-architecture build
+of the same source, three interleaved rounds, is 71.55–71.70 K against
+71.62–71.75 K.
+
+**Fewer or more CPU threads, once the GPU is running.** The GPU worker needs a
+thread to feed it, so 15 of 16 might be one too many. Measured on the real
+mining path, `--run-for=45 --gpu-blocks=672`, two rounds each:
+
+| threads | combined |
+|---:|---:|
+| 13 | 102.46 / 101.19 KH/s |
+| 14 | 103.26 / 102.75 KH/s |
+| 15 | **103.71 / 101.64 KH/s** |
+| 16 | 101.30 / 97.10 KH/s |
+
+14 and 15 tie inside the noise, 16 is clearly worse — the GPU worker and the
+16th miner fight over the same core. The shipped default of *cores × 2 − 1* is
+already the right answer.
 
 **Both obvious attacks on the CPU merge.** `native\saprof.exe` puts the phases
 at merge 43.6%, column walk 37.6%, radix sort 17.0% — so the merge is the

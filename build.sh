@@ -4,6 +4,7 @@
 #   ./build.sh              build for this machine into ./bin
 #   ./build.sh --all        cross-compile every supported platform
 #   ./build.sh --skip-tests skip the test run (not recommended, see below)
+#   ./build.sh --clean      delete build output and one-off test binaries
 #
 # Two non-obvious build flags are used, both deliberate:
 #
@@ -47,13 +48,34 @@ OUTDIR="$(pwd)/bin"
 
 ALL=0
 SKIP_TESTS=0
+CLEAN=0
 for arg in "$@"; do
   case "$arg" in
     --all)        ALL=1 ;;
     --skip-tests) SKIP_TESTS=1 ;;
+    --clean)      CLEAN=1 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
+
+# --clean removes build output and the disposable measurement binaries, then
+# exits. It is a separate flag rather than something a build does on its own,
+# because a build that quietly deletes things is a build nobody trusts.
+#
+# What it never touches: the three embedded libraries under cmd/derostorm. They
+# are inputs to the build, not outputs of it -- go:embed fails without them and
+# rebuilding them needs nvcc, MSVC and WSL. gpu/vectors.bin is left for the same
+# reason: the GPU tests read it.
+if [ "$CLEAN" -eq 1 ]; then
+  for p in bin bench derostorm.exe cmd/derostorm/derostorm.exe            native/sabench*.exe native/saprof*.exe native/sapro_*.exe            native/shabench*.exe native/sabench native/saprof            gpu/*_test*.exe gpu/desc_test*.exe gpu/hash*.exe gpu/prof/prof.exe            gpu/*.exp gpu/*.lib native/*.exp native/*.lib native/*.obj; do
+    [ -e "$p" ] || continue
+    rm -rf "$p"
+    echo "  removed $p"
+  done
+  echo
+  echo "cleaned"
+  exit 0
+fi
 
 mkdir -p "$OUTDIR"
 
