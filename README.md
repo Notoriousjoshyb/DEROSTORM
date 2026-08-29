@@ -8,7 +8,7 @@ implementation — every optimisation here is a faster route to the same 32 byte
 and `astrobwt/difftest` compares the two on every build.
 
 ```
-╭─ DEROSTORM ──────────────────────────────────────── AstroBWTv3 · v1.4.0 ─╮
+╭─ DEROSTORM ──────────────────────────────────────── AstroBWTv3 · v1.4.1 ─╮
 │                                                                          │
 │  ◆ MINING                     125.35 KH/s                 15 CPU · 1 GPU │
 │       ▁▂▃▄▅▆▇▇▇▇▇▇▇▇▇▇█▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   60s │
@@ -500,6 +500,16 @@ the sum overstates it slightly.
 The GPU is where the gain is, and 1.4.0 is +28% on it in one session. All of it
 came from the same thing — see [The GPU was reading memory one byte at a
 time](#the-gpu-was-reading-memory-one-byte-at-a-time).
+
+**1.4.1 exists for one reason.** The 1.4.0 Linux archives shipped the *previous*
+CUDA kernels: `libderostorm_gpu.so` is built by `nvcc` under Linux, which was
+not available on the machine that cut the release, so Linux GPU mining ran at
+1.3.0 speed while Windows had everything. The `.so` is rebuilt here with
+`gpu/buildlib.sh` under WSL (Ubuntu 24.04, CUDA 13.0) and the `linux-amd64`
+binary relinked — Linux now mines the same kernels as Windows, verified
+end-to-end on the reference 5080 from the new binary under WSL. No kernel source
+changed between 1.4.0 and 1.4.1; Windows binaries are unchanged in behaviour,
+and CPU mining is untouched on every platform.
 
 ### CPU
 
