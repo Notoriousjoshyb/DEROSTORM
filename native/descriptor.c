@@ -598,25 +598,28 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
     }
 #endif
 
-    /* Columns where the next four are all constant.
+    /* Columns where the next DSA_KEY_BYTES are all constant.
      *
-     * Where they are, every block of the run has the same four bytes at that
-     * offset, so every suffix in the column shares its key, the whole run is one
-     * group, and the scan below cannot discover anything: it computes `blocks`
+     * Where they are, every block of the run has the same DSA_KEY_BYTES bytes at
+     * that offset, so every suffix in the column shares its key, the whole run is
+     * one group, and the scan below cannot discover anything: it computes `blocks`
      * identical keys and compares them. Measured, 91% of columns emit exactly
      * one descriptor (20,124 descriptors over 62 runs x 256 columns), so this is
      * the common case and not a special one.
      *
-     * The last three columns are excluded because constant[] only covers this
-     * block; columns 256 and past belong to the next one. That is 3 of 256. */
-    uint8_t same4[DSA_BLOCK];
-    for (uint32_t rel = 0; rel + 4 <= DSA_BLOCK; rel++) {
-        same4[rel] = (uint8_t)(constant[rel] & constant[rel + 1] &
-                               constant[rel + 2] & constant[rel + 3]);
+     * With a DSA_KEY_BYTES=3 key this only needs three constant columns, not the
+     * four below; the old same4 was a leftover of the four-byte-key era and let
+     * column 253 (whose bytes 253..255 are all inside this block) fall off the
+     * fast path. The last two columns are still excluded because constant[]
+     * only covers this block; column 254 and 255 would read past it. */
+    uint8_t same_key[DSA_BLOCK];
+    for (uint32_t rel = 0; rel + DSA_KEY_BYTES <= DSA_BLOCK; rel++) {
+        uint8_t s = constant[rel];
+        for (uint32_t k = 1; k < DSA_KEY_BYTES; k++) s &= constant[rel + k];
+        same_key[rel] = s;
     }
-    same4[DSA_BLOCK - 3] = 0;
-    same4[DSA_BLOCK - 2] = 0;
-    same4[DSA_BLOCK - 1] = 0;
+    for (uint32_t rel = DSA_BLOCK - DSA_KEY_BYTES + 1; rel < DSA_BLOCK; rel++)
+        same_key[rel] = 0;
 
     for (int rel = DSA_BLOCK - 1; rel >= 0; rel--) {
         const uint32_t r = (uint32_t)rel;
@@ -626,7 +629,7 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
         if (*desc_len + blocks > desc_room) return 0;   /* grow and retry */
 
 #ifndef DSA_NO_SAME4
-        if (same4[r]) {
+        if (same_key[r]) {
             /* Every block shares this column's four bytes, so there is exactly
              * one group and the scan below would only prove it the long way. */
             Desc* d = &s->desc[*desc_len];
