@@ -58,13 +58,24 @@ licence, but the credit for the approach belongs to Dirtybird99. See
 `vendor/` also contains the remaining Go module dependencies listed in
 `go.mod`. Each keeps the licence in its own directory.
 
-**`go mod vendor` is destructive here.** The vendored derohe is not upstream
-derohe: `astrobwt/astrobwtv3/pow.go` is modified and `sha_hook.go` is an
-addition, and between them they provide `AstroBWTv3_pair` and `SHA256Pair`,
-which `cmd/derostorm/` calls. Neither exists in the `replace` target, so
-`go mod vendor` overwrites the first and deletes the second, and the build then
-fails with `undefined: astrobwtv3.AstroBWTv3_pair`. If you have run it, put
-them back with:
+**`go mod vendor` is destructive here, and `go mod tidy` does not work at all.**
+
+`go.mod` carries `replace github.com/deroproject/derohe => ../derohe-main`, a
+locally patched derohe that is not in this repository. Everything that builds —
+`go build`, `go test`, `build.ps1`, `build.sh` — reads `vendor/` and never looks
+at that path, so a clean clone builds fine. The two commands that bypass
+`vendor/` do not:
+
+- `go mod tidy` fails with `replacement directory ../derohe-main does not
+  exist`. There is nothing to fix; do not run it.
+- `go mod vendor` succeeds, and that is worse. The vendored derohe is not
+  upstream derohe: `astrobwt/astrobwtv3/pow.go` is modified and `sha_hook.go` is
+  an addition, and between them they provide `AstroBWTv3_pair` and `SHA256Pair`,
+  which `cmd/derostorm/` calls. Neither exists in the replace target, so
+  vendoring overwrites the first and deletes the second, and the build then
+  fails with `undefined: astrobwtv3.AstroBWTv3_pair`.
+
+If you have run it, put them back with:
 
 ```
 git checkout -- vendor/github.com/deroproject/derohe/astrobwt/astrobwtv3/

@@ -1,4 +1,4 @@
-module github.com/joshybfps/derostorm
+module github.com/notoriousjoshyb/derostorm
 
 go 1.25.0
 

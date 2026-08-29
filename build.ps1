@@ -6,13 +6,31 @@
 #
 # Two non-obvious build flags are used, both deliberate:
 #
-#   -gcflags '...astrobwtv3=-B'
+#   -gcflags '...astrobwtv3=-B'      AMD64 ONLY -- see below
 #       Disables bounds checks in the suffix-sort package only. That package is
 #       ~90% of mining CPU time and its inner loops carry two or three bounds
 #       checks each; measured +7.8% hashrate. It is only sound because the tests
 #       prove no index ever goes out of range -- AstroBWTv3 swallows panics, so
 #       an out-of-range access would silently produce a wrong hash rather than
 #       crash. Do not skip the tests.
+#
+#       It is passed on amd64 and nowhere else, because on arm64 it does not
+#       produce a wrong hash, it produces a crash:
+#
+#         unexpected fault address 0x7b681b88b333
+#         fatal error: fault
+#
+#       Reported from a Mac (darwin/arm64) and reproduced on linux/arm64 under
+#       qemu, in the miner and in a bare hashing loop. The same loop is clean on
+#       amd64 with -B, and clean on arm64 *without* it -- 16,000 hashes each way,
+#       astrobwtv3.RecoveredPanics zero on both, so this is not an out-of-range
+#       index the checks were hiding. The algorithm is sound on arm64; what is
+#       not sound is turning the checks off there.
+#
+#       This is the failure that flag was always going to have: it was licensed
+#       by a test suite that only ever ran on the machine doing the building, and
+#       the four cross-compiled targets inherited a guarantee nothing had checked
+#       for them. amd64 keeps it because amd64 is what the tests run on.
 #
 #   -pgo=auto
 #       Profile-guided optimisation from cmd/derostorm/default.pgo.
@@ -34,11 +52,16 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$Version  = '1.2.0'
+$Version  = '1.3.0'
 $Pkg      = './cmd/derostorm'
 $BoundsPkg = 'github.com/deroproject/derohe/astrobwt/astrobwtv3'
-$GcFlags  = "$BoundsPkg=-B"
 $LdFlags  = '-s -w'
+
+# -B is passed on amd64 and nowhere else. See boundsFlags below.
+function Get-GcFlags($goarch) {
+    if ($goarch -eq 'amd64') { return "$BoundsPkg=-B" }
+    return ''
+}
 $OutDir   = Join-Path $PSScriptRoot 'bin'
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
@@ -103,7 +126,12 @@ function Build-Target($goos, $goarch) {
     Write-Host "building $name" -ForegroundColor Cyan
     $env:GOOS = $goos
     $env:GOARCH = $goarch
-    go build -trimpath -pgo=auto -gcflags="$GcFlags" -ldflags="$LdFlags" -o $out $Pkg
+    $gc = Get-GcFlags $goarch
+    if ($gc) {
+        go build -trimpath -pgo=auto -gcflags="$gc" -ldflags="$LdFlags" -o $out $Pkg
+    } else {
+        go build -trimpath -pgo=auto -ldflags="$LdFlags" -o $out $Pkg
+    }
     $code = $LASTEXITCODE
     Remove-Item Env:GOOS, Env:GOARCH -ErrorAction SilentlyContinue
     if ($code -ne 0) { throw "build failed for $goos/$goarch" }

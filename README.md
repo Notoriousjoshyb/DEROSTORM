@@ -8,13 +8,13 @@ implementation — every optimisation here is a faster route to the same 32 byte
 and `astrobwt/difftest` compares the two on every build.
 
 ```
-╭─ DEROSTORM ──────────────────────────────────────── AstroBWTv3 · v1.1.0 ─╮
+╭─ DEROSTORM ──────────────────────────────────────── AstroBWTv3 · v1.3.0 ─╮
 │                                                                          │
-│  ◆ MINING                      85.44 KH/s                 15 CPU · 1 GPU │
+│  ◆ MINING                      96.91 KH/s                 15 CPU · 1 GPU │
 │       ▁▂▃▄▅▆▇▇▇▇▇▇▇▇▇▇█▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   60s │
 │                                                                          │
-│    CPU ██████████████████████████████▎░░░░░░░░░░░░░░░░   33.51 KH/s  39% │
-│    GPU ███████████████████████████████████████████████   51.93 KH/s  61% │
+│    CPU ████████████████████▌░░░░░░░░░░░░░░░░░░░░░░░░░░   33.51 KH/s  35% │
+│    GPU ███████████████████████████████████████████████   63.40 KH/s  65% │
 │                                                                          │
 ├──────────────────────────────────────────────────────────────────────────┤
 │  HEIGHT      2,481,903                NETWORK     120.00 KH/s            │
@@ -150,6 +150,17 @@ Logs go to `derostorm.exe.log` beside the executable — never to the console, s
 
 Requires **Go 1.22 or newer**. Everything is vendored, so no network access is needed to build.
 
+> **Do not run `go mod tidy` or `go mod vendor` here.** Both ignore `vendor/` and
+> go looking for the real modules, and `go.mod` carries
+> `replace github.com/deroproject/derohe => ../derohe-main`, a locally patched
+> derohe that a clone does not have. `go mod tidy` therefore fails with
+> `replacement directory ../derohe-main does not exist`, and `go mod vendor`
+> succeeds and quietly deletes the patches — see `THIRD-PARTY-NOTICES.md`.
+>
+> Nothing else needs them. `go build`, `go test` and both build scripts use
+> `vendor/` automatically and never look at the replace target, so a clean clone
+> builds with no network and no derohe checkout.
+
 **Windows**
 
 ```powershell
@@ -217,6 +228,26 @@ The suffix-sort package is ~90% of mining CPU time and its inner loops carry two
 
 This is safe *only because it is tested*. `AstroBWTv3` wraps its body in `recover()` and returns a falsified hash on panic, so an out-of-range index would be silent rather than a crash. The package therefore counts recovered panics, and the test suite asserts that counter stays at zero across millions of hashes built with this same flag. **The build scripts run the tests before building — do not use `--skip-tests` for a build you intend to mine with.**
 
+**It is passed on amd64 and nowhere else.** On arm64 it does not produce a wrong
+hash, it produces a crash:
+
+```
+unexpected fault address 0x7b681b88b333
+fatal error: fault
+```
+
+Reported from a Mac and reproduced on `linux/arm64` under qemu, in the miner and
+in a bare hashing loop. The same loop is clean on amd64 with `-B`, and clean on
+arm64 *without* it — 16,000 hashes each way, `astrobwtv3.RecoveredPanics` zero on
+both. So this is not an out-of-range index the checks were hiding: the algorithm
+is sound on arm64, and what is not sound is turning the checks off there.
+
+This is the failure the flag was always going to have. It is licensed by a test
+suite that only ever ran on the machine doing the building, and the four
+cross-compiled targets inherited a guarantee nothing had checked for them. amd64
+keeps it because amd64 is what the tests run on; arm64 gives up 7.8% it never
+safely had.
+
 **`-pgo=auto` — profile-guided optimisation.**
 
 Uses `cmd/derostorm/default.pgo`. Worth a few percent. Regenerate it with the `pow-bench` tool in the derohe tree if you change the hash code.
@@ -228,7 +259,20 @@ kernels for Windows, the same kernels for Linux, and libsais for the suffix
 sort. They are build products, not source, so they are not in git — build them
 once and the copies under `cmd/derostorm/` are what `go:embed` picks up from
 then on. After that an ordinary build needs neither a C toolchain nor CUDA, and
-they only need rebuilding when their sources change:
+they only need rebuilding when their sources change.
+
+**Which ones you need depends on the target, not on your machine**, and for some
+targets the answer is none:
+
+| Target | Needs |
+| --- | --- |
+| `windows/amd64` | `derostorm_gpu.dll` and `derostorm_sa.dll` |
+| `linux/amd64` | `libderostorm_gpu.so` |
+| `linux/arm64`, `darwin/amd64`, `darwin/arm64` | **nothing** |
+
+So building for macOS needs no GPU, no CUDA and no libraries: `./build.sh` on a
+Mac produces a working CPU miner from a clean clone. `build.sh` checks only what
+the target it is building actually embeds.
 
 ```
 .\build.ps1 -Native      # both, then the miner
@@ -319,7 +363,7 @@ Headline, all of it at once:
 | | H/s |
 |---|---:|
 | CPU, 15 threads | 33,506 |
-| RTX 5080 | 51,931 |
+| RTX 5080 | 63,400 |
 | **together** | **85,437** |
 
 ### CPU
@@ -458,7 +502,7 @@ profile-guided optimisation (+1.2%).
 
 | | Before | Now | |
 |---|---:|---:|---:|
-| RTX 5080 | 7.45 KH/s | 51,931 H/s | +597% |
+| RTX 5080 | 7.45 KH/s | 63,400 H/s | +751% |
 
 *Before* is the GPU on its own on the real mining path
 (`--mining-threads=1 --gpu=0 --run-for=90`), measured when GPU support first
@@ -467,9 +511,58 @@ batch size without needing a node. The intermediate 12.28 KH/s this table used
 to carry was the gain from the packed-key change described below; the rest came
 from the block-count sweep and the stage-1 work after it.
 
-**The column walk's keys slide instead of being re-read.** The largest single
-gain the GPU has had since the descriptor sort itself, and it came from reading
-the profiler rather than from an algorithm.
+**The column walk runs on four threads a run, not one.** The largest single gain
+the GPU has had since the descriptor sort itself.
+
+The walk inherits: the order at column `rel-1` is the order at column `rel`
+re-sorted by one byte. That is the saving, and it is also why the phase ran on
+~62 of `BR_BLOCK` threads — one per run, 256 steps each, and the steps are a
+chain.
+
+Three probes, each adding one operation and reading the cost off the delta with
+the output still correct, say the chain is the cost and the work is not:
+
+```
+  + one atomic per descriptor      -0.5%
+  + one scattered word per descriptor  -2.1%
+  + one arena word per position    -4.6%
+  + one text read per position      free
+```
+
+Those sum to nothing like the walk's 37%. What is left is threads standing idle
+and a 256-long dependency chain.
+
+The chain can be cut, because **inheritance is an optimisation, not a
+definition**. The order at a column is the run's blocks sorted by the suffixes
+starting there — a function of the text and nothing else. So a thread can start
+anywhere: sort directly at the top of its own piece, then inherit down through
+it. Four pieces is four seed sorts a run instead of one, against a chain of 64
+instead of 256 and four times the threads.
+
+The arena offsets fell out of it. Every column of a run emits every one of its
+blocks exactly once, so column `rel` writes at `(255 - rel) * len` — no running
+total, which is exactly what let the pieces write into one arena without
+meeting.
+
+Swept at the shipped `BR_BLOCK=256`, whole hash, all correct:
+
+```
+  1 piece    53,889 H/s        4 pieces   60,451 H/s   <- default
+  2 pieces   59,728 H/s        8 pieces   54,209 H/s
+```
+
+**The count has to divide 256**, and this is why there is a `static_assert` on
+it: 3 and 6 were measured producing a *wrong* suffix array, because 3x85 and
+6x42 leave a column nobody walks. The 512-vector check caught both.
+
+The best count is not a property of the algorithm. At `BR_BLOCK=1024` it is 8
+and the sort measures 59,455 SA/s against 41,643; at the shipped 256 it is 4 and
+8 is *slower than 1*. The order and key arrays are per piece, so the count buys
+threads with shared memory, and how much of that is spare depends on the block
+size. Sweep it against the configuration you ship, not the harness.
+
+**The column walk's keys slide instead of being re-read.** The gain before that
+one, and it came from reading the profiler rather than from an algorithm.
 
 `gpu\prof\prof.exe` attributes cycles by phase. It put the column walk at **51%
 of the suffix sort**, which is itself 85% of a GPU hash — so a third of the
