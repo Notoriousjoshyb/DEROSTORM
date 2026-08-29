@@ -40,7 +40,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION=1.3.0
+VERSION=1.4.0
 PKG=./cmd/derostorm
 BOUNDS_PKG=github.com/deroproject/derohe/astrobwt/astrobwtv3
 LDFLAGS="-s -w"
@@ -67,7 +67,18 @@ done
 # rebuilding them needs nvcc, MSVC and WSL. gpu/vectors.bin is left for the same
 # reason: the GPU tests read it.
 if [ "$CLEAN" -eq 1 ]; then
-  for p in bin bench derostorm.exe cmd/derostorm/derostorm.exe            native/sabench*.exe native/saprof*.exe native/sapro_*.exe            native/shabench*.exe native/sabench native/saprof            gpu/*_test*.exe gpu/desc_test*.exe gpu/hash*.exe gpu/prof/prof.exe            gpu/*.exp gpu/*.lib native/*.exp native/*.lib native/*.obj; do
+  # bin is emptied of build output rather than removed. It also holds
+  # derostorm.json, which carries the wallet address the setup wizard asked
+  # for, and deleting a user's config as part of "clean the build" is the kind
+  # of helpfulness nobody asks for twice.
+  for p in \
+      bench derostorm.exe cmd/derostorm/derostorm.exe \
+      bin/derostorm-* bin/*.dll bin/*.so bin/*.log \
+      native/sabench*.exe native/saprof*.exe native/sapro_*.exe \
+      native/shabench*.exe native/sabench native/saprof \
+      gpu/*_test*.exe gpu/desc_test*.exe gpu/hash*.exe gpu/prof/prof.exe \
+      gpu/*.exp gpu/*.lib native/*.exp native/*.lib native/*.obj
+  do
     [ -e "$p" ] || continue
     rm -rf "$p"
     echo "  removed $p"

@@ -87,8 +87,29 @@
 #endif
 
 // Four-byte words a suffix comparison reads per iteration. See descSuffixLess.
+//
+// Two, until the text load became two aligned loads and a PRMT rather than four
+// byte loads (descLoadBE32). That changed the trade this knob sits on. Reading
+// further ahead never read less, it read sooner; with a byte gather each extra
+// word cost four more load instructions, and four words measured as a real-miner
+// null against two. With a wide load an extra word costs two, and the same sweep
+// now says four, clearly and repeatably:
+//
+//     1  74.1 / 74.1        2  76.8 / 77.2        4  79.2 / 79.5
+//     6  77.6 / 77.6        8  76.3 / 76.1
+//
+// Past four it turns over again -- the comparison starts fetching well beyond
+// where it decides. Worth reading as a warning about the other knobs in this
+// file: every one of them was swept against a load that no longer exists.
 #ifndef DESC_CMP_WORDS
-#define DESC_CMP_WORDS 2
+#define DESC_CMP_WORDS 4
+#endif
+
+// Read the text four bytes at a time with two aligned loads and a PRMT, rather
+// than four byte loads. See descLoadBE32. The knob exists so the two can be
+// built against each other; 0 is the old shape exactly.
+#ifndef DESC_WIDE_LOAD
+#define DESC_WIDE_LOAD 1
 #endif
 
 // Pieces the 256 columns of a run are cut into, each walked by its own thread.
@@ -161,15 +182,70 @@ struct DescScratch {
 
 #define DESC_BYTES_PER_SYMBOL (2 * 8 + 4 + 4 + 4)
 
+// Four text bytes at an arbitrary offset, as one big-endian word.
+//
+// This is the most executed operation in the kernel: the column walk and every
+// suffix comparison are built out of it.
+//
+// The obvious body is four byte loads and a shift-or chain, and this file used
+// to say nvcc would fold that into one 32-bit load. It does not, and cannot: a
+// 32-bit load on this hardware must be four-byte aligned and p is arbitrary, so
+// the compiler has no way to prove it. The SASS said so outright --
+// suffix_kernel carried 98 LDG.E.U8 instructions.
+//
+// Four byte loads are not four times the DRAM traffic, because the addresses
+// are adjacent and the coalescer merges the sectors. What they cost is four
+// trips through the load/store unit, four L1 tag lookups and four entries of
+// the outstanding-load budget, in a kernel whose whole problem is that it is
+// waiting on memory.
+//
+// So: read the two aligned words that straddle the offset and let one PRMT pick
+// the four bytes out of them. Two loads instead of four, and the big-endian
+// order falls out of the same instruction rather than costing three shifts and
+// three ORs. Byte loads in the kernel fell from 98 to 34.
+//
+// The selector. __byte_perm(a, b, s) sees an eight-byte value {b,a} and builds a
+// result whose byte i, counting from the least significant, is source byte
+// s>>(4*i) & 0xf. Wanting t[p] in the most significant byte and t[p+3] in the
+// least, with the word starting `m` bytes into the first load:
+//
+//     result byte 3 = t[p+0] = source m+0      nibble 3 = m
+//     result byte 2 = t[p+1] = source m+1      nibble 2 = m+1
+//     result byte 1 = t[p+2] = source m+2      nibble 1 = m+2
+//     result byte 0 = t[p+3] = source m+3      nibble 0 = m+3
+//
+// which is 0x0123 + 0x1111*m, and m is at most 3, so the top nibble reaches 6
+// and never leaves the eight bytes available.
+//
+// Two things this needs, neither obvious. Alignment: masking the address down is
+// safe at any alignment of the text, because the selector is derived from the
+// same address and cancels it out; what it needs is that the masked address stay
+// inside the allocation, which holds because texts are slices of one buffer.
+// Slack: the second load reaches up to seven bytes past p, and every caller
+// guarantees p+3 < n, so it reads at most four bytes past the text. Those bytes
+// are fetched and never selected, but they must be mapped, so the texts
+// allocation carries eight bytes of tail; see dsg_init.
+__device__ __forceinline__ uint32_t descLoadBE32(const uint8_t* t, int p)
+{
+#if DESC_WIDE_LOAD
+    const uintptr_t a = (uintptr_t)(t + p);
+    const uint32_t  m = (uint32_t)(a & 3u);
+    const uint32_t* w = (const uint32_t*)(a & ~(uintptr_t)3);
+    return __byte_perm(w[0], w[1], 0x0123u + 0x1111u * m);
+#else
+    return ((uint32_t)t[p] << 24) | ((uint32_t)t[p + 1] << 16) |
+           ((uint32_t)t[p + 2] << 8) | (uint32_t)t[p + 3];
+#endif
+}
+
 __device__ __forceinline__ uint32_t descKey32(const uint8_t* t, int n, int p)
 {
-    if (p + 4 <= n) {
-        // One 32-bit load and a byte swap. The text is not aligned to 4 here, so
-        // this relies on the device allowing unaligned loads through a byte
-        // gather; nvcc emits the four-byte form either way.
-        return ((uint32_t)t[p] << 24) | ((uint32_t)t[p + 1] << 16) |
-               ((uint32_t)t[p + 2] << 8) | (uint32_t)t[p + 3];
-    }
+    if (p + 4 <= n) return descLoadBE32(t, p);
+
+    // The last three positions of the text, where a fourth byte does not exist
+    // and the key is zero padded. Byte loads here, because the wide form would
+    // read past the text for a case that happens three times in seventy
+    // thousand.
     uint32_t k = 0;
     for (int i = 0; i < 4; i++) {
         k <<= 8;
@@ -229,10 +305,8 @@ __device__ __forceinline__ bool descSuffixLessFrom(const uint8_t* t, int n,
 #pragma unroll
         for (int w = 0; w < DESC_CMP_WORDS; w++) {
             const int o = i + 4 * w;
-            wa[w] = ((uint32_t)t[a + o] << 24) | ((uint32_t)t[a + o + 1] << 16) |
-                    ((uint32_t)t[a + o + 2] << 8) | (uint32_t)t[a + o + 3];
-            wb[w] = ((uint32_t)t[b + o] << 24) | ((uint32_t)t[b + o + 1] << 16) |
-                    ((uint32_t)t[b + o + 2] << 8) | (uint32_t)t[b + o + 3];
+            wa[w] = descLoadBE32(t, a + o);
+            wb[w] = descLoadBE32(t, b + o);
         }
 #pragma unroll
         for (int w = 0; w < DESC_CMP_WORDS; w++) {
@@ -241,10 +315,8 @@ __device__ __forceinline__ bool descSuffixLessFrom(const uint8_t* t, int n,
     }
 
     for (; i + 4 <= m; i += 4) {
-        const uint32_t wa = ((uint32_t)t[a + i] << 24) | ((uint32_t)t[a + i + 1] << 16) |
-                            ((uint32_t)t[a + i + 2] << 8) | (uint32_t)t[a + i + 3];
-        const uint32_t wb = ((uint32_t)t[b + i] << 24) | ((uint32_t)t[b + i + 1] << 16) |
-                            ((uint32_t)t[b + i + 2] << 8) | (uint32_t)t[b + i + 3];
+        const uint32_t wa = descLoadBE32(t, a + i);
+        const uint32_t wb = descLoadBE32(t, b + i);
         if (wa != wb) return wa < wb;
     }
     for (; i < m; i++) {
@@ -302,10 +374,45 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         if (g == 0) {
             start = 1;
         } else {
+            // Sixteen bytes at a time, not one.
+            //
+            // The byte loop this replaces issued 512 loads per block pair and
+            // almost always ran all 256 iterations, because its early exit only
+            // fires on a rekey and a rekey is rare by construction. Blocks are
+            // 256 bytes apart, so both pointers carry the alignment of the text
+            // itself and a uint4 load is legal on both or neither. Measured, the
+            // phase went from 4.2% of the kernel to 0.6%.
+            //
+            // __vsetne4 puts 0x01 in each byte lane where two words differ, so
+            // multiplying by 0x01010101 and taking the top byte sums the four
+            // lanes into the byte-difference count with nothing unpacked.
+            //
+            // The guard is not decoration. A uint4 load needs sixteen-byte
+            // alignment and CUDA faults rather than fixing it up, so the shape of
+            // the caller's buffer decides whether this is legal. The miner's
+            // texts are slices of one allocation at a stride of 277*256 and are
+            // always aligned; a harness laying texts out at the length of the
+            // longest one is not, and gpu/prof and gpu/desc_test both did until
+            // gpu/vectors_host.h started rounding that stride. Branching costs
+            // one uniform test per pair and makes the wrong layout slow rather
+            // than fatal.
             const uint8_t* a = t + (g - 1) * 256;
             const uint8_t* b = t + g * 256;
             int diff = 0;
-            for (int i = 0; i < 256 && diff <= DESC_SPLIT; i++) diff += (a[i] != b[i]);
+            if ((((uintptr_t)a) & 15u) == 0) {
+                const uint4* a4 = (const uint4*)a;
+                const uint4* b4 = (const uint4*)b;
+                for (int i = 0; i < 16 && diff <= DESC_SPLIT; i++) {
+                    const uint4 x = a4[i], y = b4[i];
+                    uint32_t d = __vsetne4(x.x, y.x);
+                    d += __vsetne4(x.y, y.y);
+                    d += __vsetne4(x.z, y.z);
+                    d += __vsetne4(x.w, y.w);
+                    diff += (int)((d * 0x01010101u) >> 24);
+                }
+            } else {
+                for (int i = 0; i < 256 && diff <= DESC_SPLIT; i++) diff += (a[i] != b[i]);
+            }
             start = (diff > DESC_SPLIT);
 #if DESC_RUN_MAX > 0
             start |= ((g % DESC_RUN_MAX) == 0);

@@ -171,7 +171,10 @@ int main(int argc, char** argv)
     int32_t* dSA = nullptr;
     int32_t* dNext = nullptr;
     int32_t* dFails = nullptr;
-    CK(cudaMalloc(&dTexts, (size_t)count * stride));
+    // Eight bytes of tail: descLoadBE32 reads the two aligned words that
+    // straddle a text offset, so the last positions of the last text reach a
+    // few bytes past it. Fetched, never used, but still has to be mapped.
+    CK(cudaMalloc(&dTexts, (size_t)count * stride + 8));
     CK(cudaMalloc(&dLens, (size_t)count * 4));
     CK(cudaMalloc(&dSA, (size_t)count * stride * 4));
     CK(cudaMalloc(&dNext, 4));

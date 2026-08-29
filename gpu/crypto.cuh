@@ -356,9 +356,43 @@ struct SHA256 {
 
 __device__ void sha256Block(uint32_t h[8], const uint8_t* p) {
     uint32_t w[64];
-    for (int i = 0; i < 16; i++) {
-        w[i] = ((uint32_t)p[i * 4] << 24) | ((uint32_t)p[i * 4 + 1] << 16) |
-               ((uint32_t)p[i * 4 + 2] << 8) | (uint32_t)p[i * 4 + 3];
+
+    // The schedule wants sixteen big-endian words, and building each from four
+    // byte loads is 64 global loads for 64 bytes. That is what the SHA kernel
+    // was doing -- 93 LDG.E.U8 in its SASS -- for a stage that is ~12% of the
+    // GPU pipeline.
+    //
+    // Nothing about it needed to be byte-wise. The input is a suffix array cast
+    // to bytes, so it is a multiple of four bytes long and sixteen-byte aligned,
+    // and the padding block is a struct field. One __byte_perm reverses a word,
+    // which is exactly the big-endian conversion, so an aligned load plus a
+    // permute replaces four loads and six shift-or operations.
+    //
+    // Three paths rather than one, because sha256 is a general routine here and
+    // the alignment is a property of the caller. Sixteen-byte alignment is what
+    // the mining path actually has and costs four loads a block; four-byte is
+    // the padding buffer and costs sixteen; the byte gather stays for anything
+    // else, so an unaligned caller is slow rather than broken.
+    const uintptr_t addr = (uintptr_t)p;
+    if ((addr & 15u) == 0) {
+        const uint4* q = (const uint4*)p;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const uint4 v = q[i];
+            w[i * 4 + 0] = __byte_perm(v.x, 0, 0x0123);
+            w[i * 4 + 1] = __byte_perm(v.y, 0, 0x0123);
+            w[i * 4 + 2] = __byte_perm(v.z, 0, 0x0123);
+            w[i * 4 + 3] = __byte_perm(v.w, 0, 0x0123);
+        }
+    } else if ((addr & 3u) == 0) {
+        const uint32_t* q = (const uint32_t*)p;
+#pragma unroll
+        for (int i = 0; i < 16; i++) w[i] = __byte_perm(q[i], 0, 0x0123);
+    } else {
+        for (int i = 0; i < 16; i++) {
+            w[i] = ((uint32_t)p[i * 4] << 24) | ((uint32_t)p[i * 4 + 1] << 16) |
+                   ((uint32_t)p[i * 4 + 2] << 8) | (uint32_t)p[i * 4 + 3];
+        }
     }
     for (int i = 16; i < 64; i++) {
         uint32_t s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3);

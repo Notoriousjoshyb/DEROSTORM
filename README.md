@@ -8,19 +8,19 @@ implementation — every optimisation here is a faster route to the same 32 byte
 and `astrobwt/difftest` compares the two on every build.
 
 ```
-╭─ DEROSTORM ──────────────────────────────────────── AstroBWTv3 · v1.3.0 ─╮
+╭─ DEROSTORM ──────────────────────────────────────── AstroBWTv3 · v1.4.0 ─╮
 │                                                                          │
-│  ◆ MINING                     103.15 KH/s                 15 CPU · 1 GPU │
+│  ◆ MINING                     125.35 KH/s                 15 CPU · 1 GPU │
 │       ▁▂▃▄▅▆▇▇▇▇▇▇▇▇▇▇█▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   60s │
 ├─ DEVICES ────────────────────────────────────────────────────────────────┤
-│  CPU    ████████████████▌░░░░░░░░░░░░░░░░░  33.51 KH/s   32%  71°C       │
-│  GPU 0  ████████████████████████████████░░  69.64 KH/s   68%  66°C  215W │
+│  CPU    ███████▌░░░░░░░░░░░░░░░░░░░░░░░░░  33.72 KH/s   27%  71°C        │
+│  GPU 0  ████████████████████████████████░  91.87 KH/s   73%  66°C  215W  │
 ├─ NETWORK ────────────────────────────────────────────────────────────────┤
 │  HEIGHT      2,481,903                DIFFICULTY  132,000                │
 │  BLOCKS      9                        NETWORK     120.00 KH/s            │
 │  MINIBLOCKS  89                       SHARE       12.92% · ~8.5s         │
-│  REJECTED    1                        PEAK        104.20 KH/s            │
-│  UPTIME      00:12:47                 GPU EFF     324 H/W                │
+│  REJECTED    1                        PEAK        126.10 KH/s            │
+│  UPTIME      00:12:47                 GPU EFF     427 H/W                │
 │  NODE        minernode1.dero.live:10100                                  │
 ╰──────────────────────────────────────────────────────────────────────────╯
   ▸ 11:04:00  connect    connected to minernode1.dero.live:10100
@@ -485,19 +485,21 @@ otherwise. Everything in this section except the *Before* columns and the
 *What does not help* experiments comes from `derostorm --bench`, which needs no
 node and no wallet, so you can reproduce it on your own machine in a minute.
 
-Headline, all of it at once, re-measured on 2026-08-29 at 1.3.0:
+Headline, all of it at once, re-measured on 2026-08-29 at 1.4.0:
 
-| | H/s |
-|---|---:|
-| CPU, 15 threads | 34,180 – 34,500 |
-| RTX 5080 | 71,550 – 71,750 |
-| **together, real mining path** | **~103,100** |
+| | H/s | at 1.3.0 | at 1.1.0 |
+|---|---:|---:|---:|
+| CPU, 15 threads | 33,700 – 34,500 | 33,600 | 33,506 |
+| RTX 5080 | **91,870** | 71,650 | 63,400 |
+| **together, real mining path** | **124,700 – 125,400** | ~103,300 | — |
 
-The combined figure is `--run-for=60 --gpu=all --gpu-blocks=672`, not the sum of
-the two above: on the real path the two share a memory system and a job feed,
-and the sum overstates it by two or three percent. The 1.1.0 figures this table
-used to carry were 33,506 / 63,400 / 85,437 — the GPU is where almost all of the
-gain since has been.
+The combined figure is `--run-for=50 --gpu=all --gpu-blocks=672`, not the sum of
+the two above: on the real path the two share a memory system and a job feed, so
+the sum overstates it slightly.
+
+The GPU is where the gain is, and 1.4.0 is +28% on it in one session. All of it
+came from the same thing — see [The GPU was reading memory one byte at a
+time](#the-gpu-was-reading-memory-one-byte-at-a-time).
 
 ### CPU
 
@@ -635,7 +637,7 @@ profile-guided optimisation (+1.2%).
 
 | | Before | Now | |
 |---|---:|---:|---:|
-| RTX 5080 | 7.45 KH/s | 63,400 H/s | +751% |
+| RTX 5080 | 7.45 KH/s | 91,870 H/s | +1133% |
 
 *Before* is the GPU on its own on the real mining path
 (`--mining-threads=1 --gpu=0 --run-for=90`), measured when GPU support first
@@ -643,6 +645,70 @@ worked. *Now* is `--bench --gpu=all`, which runs the same kernels over the same
 batch size without needing a node. The intermediate 12.28 KH/s this table used
 to carry was the gain from the packed-key change described below; the rest came
 from the block-count sweep and the stage-1 work after it.
+
+**The GPU was reading memory one byte at a time.** The largest single session of
+gains on this card, +28% end to end, and every part of it was the same mistake in
+a different file: code that gathered or scattered bytes individually on data that
+was already aligned. A byte load is not four times the DRAM traffic of a word
+load — the coalescer merges adjacent sectors — but it is four times the
+load/store-unit trips, four times the L1 tag lookups and four times the
+outstanding-load budget, in a kernel whose whole problem is waiting on memory.
+
+Found by dumping the SASS and counting, which is worth doing before believing any
+comment about what the compiler will do:
+
+```
+cuobjdump -sass ds.cubin | grep -c LDG.E.U8
+```
+
+*The text load.* `descKey32` and every suffix comparison built a four-byte
+big-endian word from four byte loads and a shift-or chain. The comment above it
+claimed nvcc folded that into one 32-bit load. It does not and it cannot: a
+32-bit load must be four-byte aligned, `p` is arbitrary, and the compiler has no
+way to prove anything. `suffix_kernel` carried **98 `LDG.E.U8`**.
+
+Reading the two aligned words that straddle the offset and picking the bytes out
+with one `PRMT` is two loads instead of four, and the byte reversal comes free in
+the same instruction rather than costing three shifts and three ORs. Byte loads
+fell to 34, and the miner went 71.65 → 73.37 KH/s.
+
+*The run boundary test.* Deciding whether two 256-byte blocks differ enough to
+end a run compared them **one byte at a time** — 512 loads per pair, and it
+almost always ran all 256 iterations because the early exit only fires on a
+rekey. Sixteen bytes at a time with `__vsetne4` took the phase from **4.2% of the
+kernel to 0.6%**, and the miner to 76.63 KH/s. The CPU had done this with AVX2
+since the beginning; only the GPU was still counting bytes.
+
+*SHA-256.* The message schedule built sixteen big-endian words from **64 byte
+loads per 64-byte block**. The input is a suffix array cast to bytes, so it is
+sixteen-byte aligned and always was. Four `uint4` loads and sixteen `PRMT`s
+instead: **SHA time halved, 15.0 ms to 7.4 ms**, and the miner went to 85.5 KH/s.
+
+*The stage-1 output.* Every one of ~270 iterations appended the 256-byte state to
+the text with a byte loop — about **69,000 single-byte global stores per hash**,
+the largest source of memory instructions in that kernel. Sixty-four word stores
+instead took **stage 1 from 22.0 ms to 13.4 ms**, and the miner to 93.9 KH/s.
+
+*And then the knobs were all wrong.* Every tuning constant in `gpu/desc.cuh` had
+been swept against the old load. `DESC_CMP_WORDS` sits on the trade between
+reading further ahead and reading past the answer; with a byte gather an extra
+word cost four more loads and four was a measured null, and with a wide load it
+costs two and four is a clear win:
+
+| DESC_CMP_WORDS | 1 | 2 | 4 | 6 | 8 |
+|---|---:|---:|---:|---:|---:|
+| KH/s | 74.1 | 77.2 | **79.5** | 77.6 | 76.3 |
+
+That is the general lesson and it is worth more than the number: **a swept
+constant is only valid against the code it was swept on.** The others were
+re-swept too and held — `DESC_CHUNKS` 4, `BR_BITS` 7, `BR_BLOCK` 256.
+
+Two preconditions came out of this and are worth knowing before touching that
+file. The `uint4` boundary test needs sixteen-byte-aligned texts, which the miner
+has by construction and the test harnesses did not — `gpu/vectors_host.h` now
+rounds its layout stride, and the kernel branches to a byte fallback rather than
+faulting on a caller that gets it wrong. And `descLoadBE32` reads up to four
+bytes past the text, so every allocation of texts carries eight bytes of tail.
 
 **The column walk runs on four threads a run, not one.** The largest single gain
 the GPU has had since the descriptor sort itself.
@@ -837,6 +903,30 @@ buffer nothing touches is never in cache.
 
 ### What does not help
 
+**Everything else tried on the GPU this session.** Recorded because each one
+looked reasonable and each one measured worse, interleaved against the build
+beside it:
+
+| | result |
+|---|---|
+| `DESC_RUN_MAX` 8 / 16 / 32 / 64 — cap run length to even out the walk | **31.7 / 42.4 / 54.3 / 63.6 KH/s** against 79.7 uncapped |
+| `DESC_CHUNKS` 2 / 8 / 16 | 73.7 / 71.8 / 47.3 against 79.5 |
+| `DESC_SPLIT` 100 / 130 / 190 / 220 | flat, 79.2–79.5, all inside the noise |
+| `BR_BITS` 6 / 8 | 79.0 / 72.1 against 79.6; 8 doubles the histogram and costs occupancy |
+| `BR_BLOCK` 128 / 512 | 64.9 / 68.5 against 79.6 |
+| seed the column walk by key first, full compare only on ties | null, 79.1 against 79.5 |
+
+The run-length cap is the interesting one. Capping runs shortens the longest
+column walk, which is what the block waits on at the barrier — the profile bills
+11.2% of the kernel to threads idling there. It still loses catastrophically,
+because a shorter run shares fewer constant columns and hands the global sort a
+smaller pre-ordered group. **Long runs are worth far more than balance.**
+
+Occupancy is not the limit either and there is nothing to win by forcing it:
+`suffix_kernel` is 64 registers with zero spills and 12,256 bytes of shared
+memory, which is exactly 4 blocks per SM on this card, and 4 × 84 SMs = 336 is
+where the block-count plateau starts.
+
 **Every nvcc flag worth trying.** The suffix kernel is memory-saturated, so the
 temptation is to look for a compiler switch that moves it. Three were built as
 single-architecture `sm_120` libraries and A/B'd through the real miner
@@ -905,6 +995,15 @@ mining path, `--run-for=45 --gpu-blocks=672`, two rounds each:
 14 and 15 tie inside the noise, 16 is clearly worse — the GPU worker and the
 16th miner fight over the same core. The shipped default of *cores × 2 − 1* is
 already the right answer, from both directions.
+
+**The GPU's wider comparison, on the CPU.** `DESC_CMP_WORDS` = 4 was worth 3.2%
+on the GPU by putting more loads in flight before a branch, and the CPU sort is
+latency bound, so the same shape should pay. It does not. Swept 1 / 2 / 3 / 4
+eight-byte words per iteration of `suffix_less`, three rounds each at 15 threads,
+every result landed between 44.5k and 47.0k texts/s with no ordering — pure
+noise. An out-of-order core already issues the next iteration's loads
+speculatively past the branch; the GPU has no speculation, which is exactly why
+it needed the unrolling and the CPU does not.
 
 **Both obvious attacks on the CPU merge.** `native\saprof.exe` puts the phases
 at merge 43.6%, column walk 37.6%, radix sort 17.0% — so the merge is the

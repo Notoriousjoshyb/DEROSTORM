@@ -67,6 +67,14 @@ inline Vectors loadVectors(const char* path)
     int maxLen = 0;
     for (uint32_t i = 0; i < count; i++) if (lens[i] > maxLen) maxLen = lens[i];
 
+    // Rounded to sixteen, which makes every text in the layout below sixteen-byte
+    // aligned. The miner's texts are slices of one allocation at a stride of
+    // 277*256 and are aligned by construction; a harness laying them out at the
+    // length of the longest one is not, and the run boundary test in
+    // gpu/desc.cuh takes its uint4 path only on an aligned text. Without this a
+    // harness measures the byte fallback and reports it as the kernel's speed.
+    maxLen = (maxLen + 15) & ~15;
+
     Vectors v;
     v.count = (int)count;
     v.maxLen = maxLen;

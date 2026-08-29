@@ -65,7 +65,13 @@ __device__ uint32_t astroStage1(const uint8_t* input, int inlen, uint8_t* text,
     RC4 rc4s;
     rc4s.s = rc4buf;
 
-    for (int i = 0; i < 256; i++) s[i] = 0;
+    if ((((uintptr_t)s) & 3u) == 0) {
+        uint32_t* s32 = (uint32_t*)s;
+#pragma unroll
+        for (int i = 0; i < 64; i++) s32[i] = 0;
+    } else {
+        for (int i = 0; i < 256; i++) s[i] = 0;
+    }
     for (int i = 0; i < 16; i++) counter[i] = 0;
 
     sha256(shaKey, input, inlen);
@@ -163,8 +169,33 @@ __device__ uint32_t astroStage1(const uint8_t* input, int inlen, uint8_t* text,
 
         s[255] = (uint8_t)(s[255] ^ s[pos1] ^ s[pos2]);
 
+        // The output write, and the reason it is not a byte loop.
+        //
+        // Every iteration appends the whole 256-byte state to the text, and
+        // there are ~270 iterations, so a byte loop is ~69,000 global byte
+        // stores per hash -- the single largest source of memory instructions
+        // in this kernel. One thread owns one hash, so these are uncoalesced
+        // whatever their width; what changes is how many of them there are.
+        //
+        // The state lives in shared memory at a four-byte-aligned stride and the
+        // destination is a 256-byte-aligned slice of a text slot, so sixteen
+        // four-byte shared reads feed four sixteen-byte global stores per block
+        // of 64. Sixteen stores a round instead of 256.
+        //
+        // Guarded rather than assumed. The convenience overload at the bottom of
+        // this file hands in plain locals, whose alignment is whatever the
+        // compiler chose, and the contract above says a caller may use any
+        // stride it likes. An unaligned caller takes the byte loop and is slow;
+        // it is not wrong, and it does not fault.
         uint8_t* dst = text + (tries - 1) * 256;
-        for (int i = 0; i < 256; i++) dst[i] = s[i];
+        if ((((uintptr_t)s | (uintptr_t)dst) & 3u) == 0) {
+            const uint32_t* s32 = (const uint32_t*)s;
+            uint32_t* d32 = (uint32_t*)dst;
+#pragma unroll
+            for (int i = 0; i < 64; i++) d32[i] = s32[i];
+        } else {
+            for (int i = 0; i < 256; i++) dst[i] = s[i];
+        }
 
         if (tries > 260 + 16 || (s[255] >= 0xf0 && tries > 260)) break;
     }
@@ -180,6 +211,9 @@ __device__ uint32_t astroStage1(const uint8_t* input, int inlen, uint8_t* text,
 // use do not have to set up a shared-memory tile.
 __device__ uint32_t astroStage1(const uint8_t* input, int inlen, uint8_t* text)
 {
-    uint8_t s[256], rc4buf[256];
+    // Aligned so this path takes the same wide copies the miner does; without
+    // the attribute the compiler is free to place these at any byte and the
+    // guards above would quietly pick the slow branch.
+    __align__(16) uint8_t s[256], rc4buf[256];
     return astroStage1(input, inlen, text, s, rc4buf);
 }

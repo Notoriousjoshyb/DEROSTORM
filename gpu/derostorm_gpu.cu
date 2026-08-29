@@ -460,7 +460,11 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
 
     ALLOC(c->words, (size_t)c->maxBlocks * ASTRO_MAX_TEXT * 6 * 4);
     ALLOC(c->keys,  (size_t)c->maxBlocks * ASTRO_MAX_TEXT * 2 * 8);
-    ALLOC(c->texts, (size_t)c->chunk * ASTRO_MAX_TEXT);
+    // Eight bytes of tail. descLoadBE32 reads the two aligned words that
+    // straddle a text offset, so the last few positions of the last text in the
+    // chunk reach up to four bytes past it. They are fetched and never used,
+    // but an unmapped fetch is still a fault.
+    ALLOC(c->texts, (size_t)c->chunk * ASTRO_MAX_TEXT + 8);
     ALLOC(c->lens,  (size_t)c->chunk * 4);
     ALLOC(c->sa,    (size_t)c->chunk * ASTRO_MAX_TEXT * 4);
     ALLOC(c->next,  sizeof(int32_t));

@@ -53,7 +53,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$Version  = '1.3.0'
+$Version  = '1.4.0'
 $Pkg      = './cmd/derostorm'
 $BoundsPkg = 'github.com/deroproject/derohe/astrobwt/astrobwtv3'
 $LdFlags  = '-s -w'
@@ -74,13 +74,19 @@ $OutDir   = Join-Path $PSScriptRoot 'bin'
 # rebuilding them needs nvcc, MSVC and WSL. gpuectors.bin is left for the same
 # reason: the GPU tests read it.
 function Invoke-Clean {
+    # bin is emptied of build output, not removed. It also holds derostorm.json,
+    # which carries the wallet address the setup wizard asked for, and deleting
+    # a user's config as part of "clean the build" is the kind of helpfulness
+    # nobody asks for twice.
     $targets = @(
-        'bin'
         'bench'
         'derostorm.exe'
         'cmd\derostorm\derostorm.exe'
     )
     $patterns = @(
+        'bin\derostorm-*'
+        'bin\*.dll'
+        'bin\*.log'
         'native\sabench*.exe'
         'native\saprof*.exe'
         'native\sapro_*.exe'

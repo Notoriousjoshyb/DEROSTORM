@@ -209,7 +209,10 @@ int main(int argc, char** argv)
     Pool pool{}; pool.stride = ASTRO_MAX_TEXT;
 
     CK(cudaMalloc(&dIn, v.inputs.size()));
-    CK(cudaMalloc(&dTexts, (size_t)batch * ASTRO_MAX_TEXT));
+    // Eight bytes of tail: descLoadBE32 reads the two aligned words that
+    // straddle a text offset, so the last positions of the last text reach a
+    // few bytes past it. Fetched, never used, but still has to be mapped.
+    CK(cudaMalloc(&dTexts, (size_t)batch * ASTRO_MAX_TEXT + 8));
     CK(cudaMalloc(&dLens, (size_t)batch * 4));
     CK(cudaMalloc(&dSA, (size_t)batch * saStride * 4));
     CK(cudaMalloc(&dHash, (size_t)batch * 32));
