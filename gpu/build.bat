@@ -4,7 +4,11 @@ REM which vcvars64 provides. Run from the repository root:  gpu\build.bat
 call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 exit /b 1
 
-set ARCH=sm_120
+REM native is the card in this machine. These are local test binaries, so that
+REM is the right target: building the six architectures the shipped library
+REM carries would cost six times the build for nothing. gpu\buildlib.bat is the
+REM one that has to run on someone else's card.
+set ARCH=native
 REM BR_BLOCK is option B's threads per hash. 1024 measured fastest; the
 REM sweep in gpu\sweep.bat rebuilds at other widths to check.
 set FLAGS=-O3 -arch=%ARCH% -diag-suppress 177 -DBR_BLOCK=1024
