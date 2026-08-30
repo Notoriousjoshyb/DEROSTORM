@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
 	"runtime"
 	"runtime/pprof"
 	"strconv"
@@ -32,7 +31,7 @@ import (
 	"github.com/docopt/docopt-go"
 )
 
-const version = "1.4.1"
+const version = "1.5.0"
 
 const usage = `DeroStorm ` + version + `
 AstroBWTv3 miner for DERO. Mines on the CPU, and on NVIDIA GPUs as well when
@@ -68,8 +67,18 @@ Options:
   --gpu-blocks=<n>                Resident blocks in the GPU suffix kernel.
                                   Default: measure a few settings while mining
                                   and keep the fastest.
-  --theme=<name>                  default, copper, aurora, ember or mono.
-  --no-dashboard                  Plain scrolling output, no live panel.
+  --theme=<name>                  cyber, default, copper, aurora, ember or
+                                  mono.
+  --tui                           Force the full-screen console. It is already
+                                  the default on an interactive terminal.
+  --no-tui                        Plain scrolling output, no console at all.
+  --classic                       The compact in-place panel instead of the
+                                  full-screen console.
+  --no-dashboard                  Same as --no-tui.
+  --rpc-address=<host:port>       derod JSON-RPC, for peer count, network
+                                  hashrate and block interval. Default: the
+                                  getwork host with the port two higher, which
+                                  is where derod puts it.
   --testnet                       Use the DERO testnet.
   --debug                         Verbose logging to the log file.
   --bench                         Run the built-in benchmark and exit.
@@ -79,9 +88,26 @@ Options:
   --run-for=<sec>                 Mine for this many seconds, then print the
                                   session summary and exit. For measuring the
                                   real mining path rather than the benchmark.
-  --preview                       Show the console with sample data and exit.
+  --preview                       Draw one console frame with sample data and
+                                  exit. Use it to compare themes and to check
+                                  a layout at a size you do not have.
+  --size=<WxH>                    Size for --preview. Default: this terminal.
+  --screen=<name>                 Screen for --preview: dashboard, mining,
+                                  stats, network, threads, config, logs, pools
+                                  or help.
+  --preview-classic               Preview the compact panel in every theme.
+  --termdiag                      Report what every source says the terminal
+                                  size is, and rule a line that wide. For
+                                  chasing a frame drawn wider than its window.
 
-Runtime commands (type and press Enter):
+Console keys:
+  M S N T C L P H  mining, statistics, network, threads, config, logs, pools,
+                   help.  Esc or D returns to the dashboard, Tab cycles.
+  arrows/PgUp/PgDn scroll the event log; End returns it to live
+  :                open the command line
+  Q or Ctrl-C      stop mining and exit
+
+Runtime commands (press : first, then type and press Enter):
   threads <n>   change the thread count live, also accepts +2 or -4
   theme <name>  switch colour theme
   save          write current settings to the config file
@@ -131,10 +157,19 @@ func main() {
 	vtOK := EnableVirtualTerminal()
 	isTTY := StdoutIsTTY() && vtOK
 
-	// --preview needs no config, no node and no wallet: it exists so the themes
-	// can be compared before committing to one.
+	// The previews need no config, no node and no wallet: they exist so the
+	// themes and the layout can be looked at before committing to either.
 	if optBool(opts, "--preview") {
+		runTUIPreview(optString(opts, "--theme"), optString(opts, "--size"),
+			optString(opts, "--screen"), isTTY)
+		return
+	}
+	if optBool(opts, "--preview-classic") {
 		runPreview(optString(opts, "--theme"), isTTY)
+		return
+	}
+	if optBool(opts, "--termdiag") {
+		runTermDiag()
 		return
 	}
 
@@ -305,325 +340,20 @@ func main() {
 		runFor = n
 	}
 
-	run(cfg, cfgPath, theme, themeNote, isTTY, optBool(opts, "--no-dashboard"), testnet, runFor)
-}
-
-// ---------------------------------------------------------------- run loop
-
-func run(cfg *Config, cfgPath string, theme *Theme, themeNote string, isTTY, noDash, testnet bool, runFor int) {
-	live := isTTY && !noDash && theme.Name != "mono"
-
-	console := NewConsole(os.Stdout, theme, live, 6)
-	// The panel gives every GPU its own row, so how tall it is depends on how
-	// many devices this run has. Told once, here, before anything is sized.
-	console.PlanDevices(len(cfg.GPUs))
-
-	// Get the window big enough for the banner and the panel before anything is
-	// drawn, so the header does not scroll off the top the moment mining starts.
-	//
-	// Three steps, because the first two can each come up short.
-	//
-	//  1. EnsureTerminalSize asks, and only ever grows -- a window someone has
-	//     deliberately made large is left alone.
-	//  2. WaitForTerminalSize waits for the answer. The ANSI resize is a
-	//     request handled asynchronously: in Windows Terminal the window belongs
-	//     to the tab and the resize goes through its UI thread, so measuring
-	//     immediately measures the size from before the request.
-	//  3. Adapt fits the panel to the window that actually exists, and runs
-	//     again every tick so a window resized later is handled the same way.
-	//
-	// The reason this is worth three steps rather than none: the panel is
-	// redrawn by moving the cursor up over its own height, so one that does not
-	// fit loses its top row to the scrollback on every frame and walks down the
-	// screen leaving copies of itself. Trimming the event log is much the lesser
-	// loss, and dropping to plain output is the lesser loss after that.
-	if live {
-		// Sized for the tallest layout, which is the one with a GPU: a device
-		// can start after this point, and the window cannot be grown again once
-		// output has begun.
-		const spare = 2
-		wantRows := bannerRows(themeNote) + console.FrameHeight(len(cfg.GPUs)) + spare
-		wantCols := console.Width() + spare
-
-		EnsureTerminalSize(wantCols, wantRows)
-		gotCols, gotRows := WaitForTerminalSize(wantCols, wantRows, 750*time.Millisecond)
-
-		if !console.Adapt() {
-			fmt.Fprintf(os.Stderr,
-				"terminal is %d x %d and the live panel needs %d x %d — using plain output for this run\n",
-				gotCols, gotRows, wantCols, wantRows)
-			live = false
-			console = NewConsole(os.Stdout, theme, false, 6)
-			console.PlanDevices(len(cfg.GPUs))
-		}
+	mode := consoleFull
+	switch {
+	case optBool(opts, "--no-tui") || optBool(opts, "--no-dashboard"):
+		mode = consolePlain
+	case optBool(opts, "--classic"):
+		mode = consoleClassic
 	}
 
-	// Point the hash at the faster suffix sort before any thread starts, so no
-	// two threads disagree about which sort they are using. Reported either way:
-	// a 35% difference in hashrate should never be a silent one.
-	saNote, saFast := InstallFastSuffixSort()
-
-	console.Banner(version, cfg.Node, cfg.Wallet, testnet, themeNote)
-
-	engine := NewEngine(cfg.Node, cfg.Wallet)
-
-	// Raw input is only worth enabling when there is a live panel to draw the
-	// command line into.
-	var editor *Editor
-	rawOK := false
-	if live {
-		var restore func()
-		restore, rawOK = EnableRawInput()
-		defer restore()
-		editor = &Editor{}
-	}
-
-	var (
-		logMu   sync.Mutex
-		logRing []LogEntry
-	)
-	addLog := func(e LogEntry) {
-		logMu.Lock()
-		logRing = append(logRing, e)
-		if len(logRing) > 64 {
-			logRing = logRing[len(logRing)-64:]
-		}
-		logMu.Unlock()
-		if !live {
-			console.PlainLog(e)
-		}
-	}
-	logf := func(l LogLevel, tag, format string, args ...interface{}) {
-		addLog(LogEntry{At: time.Now(), Level: l, Tag: tag, Text: fmt.Sprintf(format, args...)})
-	}
-
-	stopOnce := sync.Once{}
-	done := make(chan struct{})
-	quit := func() {
-		stopOnce.Do(func() {
-			engine.setState(StateStopping)
-			engine.Stop()
-			close(done)
-		})
-	}
-
-	// --run-for: stop on a timer as if the user had typed quit, so the session
-	// summary is printed the same way. This is how the combined CPU-and-GPU
-	// hashrate gets measured on the real mining path instead of in a benchmark
-	// loop that never sees a job change.
-	if runFor > 0 {
-		go func() {
-			select {
-			case <-time.After(time.Duration(runFor) * time.Second):
-				logf(LogInfo, "quit", "--run-for elapsed")
-				quit()
-			case <-done:
-			}
-		}()
-	}
-
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, os.Interrupt)
-	go func() {
-		<-sigc
-		logf(LogInfo, "quit", "interrupt received")
-		quit()
-	}()
-
-	// command input
-	if editor != nil || !live {
-		ctx := CommandContext{
-			Engine: engine, Console: console, Config: cfg, Path: cfgPath,
-			Quit: quit, Log: logf,
-		}
-		go ReadCommands(rawOK, editor, func(line string) { RunCommand(ctx, line) })
-	}
-
-	// engine events into the log ring
-	go func() {
-		for {
-			select {
-			case e := <-engine.Events():
-				addLog(e)
-			case <-done:
-				return
-			}
-		}
-	}()
-
-	go engine.RunGetWork()
-	if err := engine.SetThreads(cfg.Threads); err != nil {
-		logf(LogError, "threads", "%v", err)
-	}
-	if saFast {
-		logf(LogGood, "start", "%s", saNote)
-	} else {
-		logf(LogWarn, "start", "%s", saNote)
-	}
-
-	if len(cfg.GPUs) > 0 {
-		engine.SetGPUs(cfg.GPUs, cfg.GPUBatch, cfg.GPUBlocks)
-		logf(LogInfo, "start", "mining with %d threads and %d GPU(s) · commands: %s",
-			cfg.Threads, len(cfg.GPUs), commandHelp)
-	} else {
-		logf(LogInfo, "start", "mining with %d threads · commands: %s", cfg.Threads, commandHelp)
-	}
-
-	// Sensors are started after the workers so the first poll sees the machine
-	// under load rather than idle, and their failures are reported once here
-	// rather than every two seconds for the life of the run.
-	sensors := NewSensors(cfg.GPUs)
-	defer sensors.Close()
-	for _, note := range sensors.Notes() {
-		level := LogWarn
-		if strings.HasPrefix(note, "CPU temperature from") {
-			level = LogInfo
-		}
-		logf(level, "sensors", "%s", note)
-	}
-
-	console.HideCursor()
-
-	// ---- render loop
-	const tick = 200 * time.Millisecond
-	ticker := time.NewTicker(tick)
-	defer ticker.Stop()
-
-	start := time.Now()
-	lastTotal := engine.TotalHashes()
-	lastGPU := engine.GPUHashes()
-	lastAt := start
-	history := make([]float64, 0, 60)
-	frame := 0
-	nextSample := start.Add(time.Second)
-
-	// Two windows over the same samples, because the headline and the sparkline
-	// want different things.
-	//
-	// A GPU worker does not trickle: it returns a whole batch of thousands of
-	// hashes at once, roughly once a second. Averaged over one second, the
-	// displayed rate therefore alternates between "a batch landed" and "none
-	// did", and swings by more than half either way. That is an artefact of the
-	// sampling, not of the mining. Averaging over ten seconds spans enough
-	// batches for the number to sit still, which is what a hashrate is for.
-	//
-	// The sparkline keeps the short window: its job is to show shape, and a
-	// flat line would hide the very dips the headline is smoothing away.
-	const tickHz = int(time.Second / tick)
-	recent := newRateWindow(10 * tickHz)
-	recentGPU := newRateWindow(10 * tickHz)
-	spark := newRateWindow(tickHz)
-
-	// One more window per GPU, on the same ten-second average as the headline.
-	// This is what makes a per-card row mean anything: a card is idle between
-	// batches, so a one-second view of a single device is mostly zeroes.
-	perGPU := make(map[int]*rateWindow, len(cfg.GPUs))
-	lastGPUEach := make(map[int]uint64, len(cfg.GPUs))
-	peakRate := 0.0
-
-	draw := func() {
-		// The window may have been resized since the last frame, and the panel
-		// has to be inside it before anything is written. Two console queries,
-		// and no further work when nothing changed.
-		console.Adapt()
-
-		job := engine.Job()
-		logMu.Lock()
-		logCopy := append([]LogEntry(nil), logRing...)
-		logMu.Unlock()
-
-		rate := recent.mean()
-		gpuRate := recentGPU.mean()
-		cpuRate := rate - gpuRate
-		if cpuRate < 0 {
-			cpuRate = 0
-		}
-		if rate > peakRate {
-			peakRate = rate
-		}
-
-		sensed := sensors.Sample()
-		devices := buildDeviceRows(engine, perGPU, cpuRate, sensed)
-
-		avg := 0.0
-		if up := time.Since(start).Seconds(); up > 0 {
-			avg = float64(engine.TotalHashes()) / up
-		}
-
-		s := Snapshot{
-			State:      engine.State(),
-			Hashrate:   rate,
-			Threads:    engine.Threads(),
-			GPUs:       engine.GPUs(),
-			GPUTuning:  engine.GPUTuning(),
-			CPURate:    cpuRate,
-			GPURate:    gpuRate,
-			Devices:    devices,
-			PeakRate:   peakRate,
-			AvgRate:    avg,
-			Sensors:    sensed,
-			History:    history,
-			Height:     int64(job.Height),
-			Difficulty: parseUint(job.Difficulty),
-			NetHashes:  job.Difficultyuint64,
-			Blocks:     job.Blocks,
-			MiniBlocks: job.MiniBlocks,
-			Rejected:   job.Rejected,
-			Uptime:     time.Since(start),
-			Node:       cfg.Node,
-			Testnet:    testnet,
-			Log:        logCopy,
-			Frame:      frame,
-		}
-		if editor != nil && rawOK {
-			s.Input = editor.Buffer()
-			s.ShowInput = true
-		}
-		console.Draw(s)
-	}
-
-	for {
-		select {
-		case <-done:
-			console.Finish()
-			summary(console, theme, engine, time.Since(start))
-			return
-		case now := <-ticker.C:
-			frame++
-
-			total := engine.TotalHashes()
-			gpu := engine.GPUHashes()
-			if dt := now.Sub(lastAt).Seconds(); dt > 0 {
-				inst := float64(total-lastTotal) / dt
-				recent.add(inst)
-				spark.add(inst)
-				recentGPU.add(float64(gpu-lastGPU) / dt)
-
-				for _, d := range engine.GPUDeviceList() {
-					w := perGPU[d]
-					if w == nil {
-						w = newRateWindow(10 * tickHz)
-						perGPU[d] = w
-						lastGPUEach[d] = engine.GPUHashesFor(d)
-					}
-					n := engine.GPUHashesFor(d)
-					w.add(float64(n-lastGPUEach[d]) / dt)
-					lastGPUEach[d] = n
-				}
-			}
-			lastTotal, lastGPU, lastAt = total, gpu, now
-
-			if !now.Before(nextSample) {
-				nextSample = now.Add(time.Second)
-				history = append(history, spark.mean())
-				if len(history) > 120 {
-					history = history[len(history)-120:]
-				}
-			}
-
-			draw()
-		}
-	}
+	run(runOpts{
+		cfg: cfg, cfgPath: cfgPath, theme: theme, themeNote: themeNote,
+		isTTY: isTTY, mode: mode, testnet: testnet, runFor: runFor,
+		rpcAddress: optString(opts, "--rpc-address"),
+		logFile:    logFile.Name(),
+	})
 }
 
 // buildDeviceRows turns the engine's counters and the last sensor poll into the
@@ -661,31 +391,6 @@ func buildDeviceRows(e *Engine, perGPU map[int]*rateWindow, cpuRate float64, sen
 	return rows
 }
 
-func summary(c *Console, t *Theme, e *Engine, up time.Duration) {
-	job := e.Job()
-	total := e.TotalHashes()
-	avg := 0.0
-	if up.Seconds() > 0 {
-		avg = float64(total) / up.Seconds()
-	}
-	out := os.Stdout
-	fmt.Fprintf(out, "  %s\n", t.c(t.Accent+t.Bold, "session summary"))
-	line := func(k, v string) {
-		fmt.Fprintf(out, "    %s  %s\n", t.c(t.Muted, pad(k, 12)), t.c(t.Text, v))
-	}
-	line("uptime", hms(up))
-	line("hashes", commas(total))
-	line("average", humanRate(avg))
-	line("blocks", commas(job.Blocks))
-	line("miniblocks", commas(job.MiniBlocks))
-	line("rejected", commas(job.Rejected))
-	if p := astrobwtv3.RecoveredPanics; p != 0 {
-		fmt.Fprintf(out, "    %s  %s\n", t.c(t.Err, pad("WARNING", 12)),
-			t.c(t.Err, fmt.Sprintf("%d hash(es) aborted internally and returned a falsified result", p)))
-	}
-	fmt.Fprintln(out)
-}
-
 // ---------------------------------------------------------------- benchmark
 
 // runBench measures the hash function on the CPU across thread counts, and then
@@ -694,13 +399,13 @@ func summary(c *Console, t *Theme, e *Engine, up time.Duration) {
 // predict what the machine will do with both mining.
 func runBench(t *Theme, maxThreadsWanted int, gpus []int, gpuBatch int,
 	saNote string, saOK bool) {
-	fmt.Printf("\n  %s\n", t.c(t.Accent+t.Bold, "DeroStorm benchmark · AstroBWTv3"))
+	fmt.Printf("\n  %s\n", t.C(t.Accent+t.Bold, "DeroStorm benchmark · AstroBWTv3"))
 	noteColour := t.Dim
 	if !saOK {
 		noteColour = t.Warn
 	}
-	fmt.Printf("  %s\n\n", t.c(noteColour, saNote))
-	fmt.Printf("  %s\n", t.c(t.Muted, fmt.Sprintf("%8s %14s %16s %14s", "threads", "H/s", "time/hash", "H/s/thread")))
+	fmt.Printf("  %s\n\n", t.C(noteColour, saNote))
+	fmt.Printf("  %s\n", t.C(t.Muted, fmt.Sprintf("%8s %14s %16s %14s", "threads", "H/s", "time/hash", "H/s/thread")))
 
 	if maxThreadsWanted < 1 {
 		maxThreadsWanted = DefaultThreads()
@@ -720,7 +425,7 @@ func runBench(t *Theme, maxThreadsWanted int, gpus []int, gpuBatch int,
 		}
 		hps := float64(n*iterations) / best.Seconds()
 		bestPerThreads = append(bestPerThreads, hps)
-		fmt.Printf("  %s\n", t.c(t.Text, fmt.Sprintf("%8d %14.1f %16s %14.1f",
+		fmt.Printf("  %s\n", t.C(t.Text, fmt.Sprintf("%8d %14.1f %16s %14.1f",
 			n, hps, (best/time.Duration(n*iterations)).Round(time.Microsecond).String(), hps/float64(n))))
 	}
 
@@ -735,7 +440,7 @@ func runBench(t *Theme, maxThreadsWanted int, gpus []int, gpuBatch int,
 	}
 
 	if p := astrobwtv3.RecoveredPanics; p != 0 {
-		fmt.Printf("\n  %s\n", t.c(t.Err, fmt.Sprintf("WARNING: %d hash(es) aborted internally", p)))
+		fmt.Printf("\n  %s\n", t.C(t.Err, fmt.Sprintf("WARNING: %d hash(es) aborted internally", p)))
 	}
 
 	// ---- the two suffix sorts, against each other
@@ -748,12 +453,12 @@ func runBench(t *Theme, maxThreadsWanted int, gpus []int, gpuBatch int,
 	switch {
 	case len(gpus) == 0:
 		if GPUAvailable && GPUDeviceCount() > 0 {
-			fmt.Printf("\n  %s\n", t.c(t.Dim, fmt.Sprintf(
+			fmt.Printf("\n  %s\n", t.C(t.Dim, fmt.Sprintf(
 				"%d %s device(s) present but not benchmarked — add --gpu=all",
 				GPUDeviceCount(), GPUKind)))
 		}
 	case !GPUAvailable:
-		fmt.Printf("\n  %s\n", t.c(t.Warn, "this build has no GPU support"))
+		fmt.Printf("\n  %s\n", t.C(t.Warn, "this build has no GPU support"))
 	default:
 		for _, d := range gpus {
 			gpuTotal += runGPUBench(t, d, gpuBatch)
@@ -761,7 +466,7 @@ func runBench(t *Theme, maxThreadsWanted int, gpus []int, gpuBatch int,
 	}
 
 	if gpuTotal > 0 && cpuBest > 0 {
-		fmt.Printf("  %s\n", t.c(t.Accent+t.Bold, fmt.Sprintf(
+		fmt.Printf("  %s\n", t.C(t.Accent+t.Bold, fmt.Sprintf(
 			"CPU %s + GPU %s = %s together",
 			humanRate(cpuBest), humanRate(gpuTotal), humanRate(cpuBest+gpuTotal))))
 	}
@@ -931,7 +636,7 @@ func runPreview(themeName string, isTTY bool) {
 		}
 		c := NewConsole(os.Stdout, draw, false, 6)
 		fmt.Printf("\n  %s  %s\n\n",
-			draw.c(draw.Accent+draw.Bold, "--theme="+name), draw.c(draw.Dim, shown.Desc))
+			draw.C(draw.Accent+draw.Bold, "--theme="+name), draw.C(draw.Dim, shown.Desc))
 		for _, ln := range c.frame(sample) {
 			fmt.Println(ln)
 		}

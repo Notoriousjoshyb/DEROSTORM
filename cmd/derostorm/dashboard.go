@@ -155,6 +155,86 @@ type Snapshot struct {
 	ShowInput bool
 
 	Frame int
+
+	// ---------------------------------------------------------------------
+	// Everything below is read by the full-screen console only. The compact
+	// panel above ignores it, which is why it can be added without touching a
+	// single line of that layout.
+
+	// Avg1m, Avg5m and Avg15m are the load-average idea applied to a hashrate.
+	// One smoothed number says what the machine is doing now; three say
+	// whether that is what it has been doing, which is the question someone
+	// checking on a rig at the end of the day is actually asking.
+	Avg1m, Avg5m, Avg15m float64
+
+	// CPUHist and GPUHist are recent per-source rates for the activity
+	// spectra under the CPU and GPU panels.
+	CPUHist, GPUHist []float64
+
+	// ThreadRates is one entry per CPU mining thread, in slot order.
+	ThreadRates []float64
+
+	// History (above) is the one-second series. These are the longer windows,
+	// each already reduced to its own resolution so the chart never has to
+	// average a day of samples on the render thread.
+	Hist15m, Hist1h, Hist6h, Hist24h []float64
+
+	// Info is derod's own view of the chain, when an RPC endpoint answered.
+	// Info.OK false means every field it carries is drawn as "--".
+	Info NodeInfo
+
+	// Sys is the last machine poll: load, memory, CPU clock.
+	Sys SysSample
+
+	// TotalHashes is every hash this run has done, CPU and GPU together. The
+	// counter itself, not a rate: it is the only figure on screen that only
+	// ever goes up, which is what makes it the one to check a long run by.
+	TotalHashes uint64
+
+	// Share and connection accounting from the engine.
+	Submitted   uint64
+	BestShare   uint64
+	LastShare   time.Time
+	ConnectedAt time.Time
+	LastJob     time.Time
+	BlockEvent  time.Time
+
+	// HeightAt is when the chain height last moved, which is the only honest
+	// measure of "time since the last block" available to a miner: getwork
+	// announces a new height and says nothing about when the block before it
+	// was found.
+	HeightAt time.Time
+
+	// Run settings worth showing on the config screen. Copied rather than
+	// referenced so a frame is a consistent picture of one moment.
+	ConfigPath string
+	GPUList    []int
+	GPUBatch   int
+	GPUBlocks  int
+	ThemeName  string
+	SANote     string
+	NodeNote   string
+	SensorNote []string
+	LogFile    string
+}
+
+// Accepted is how many shares the node has confirmed. In DERO a confirmed
+// share is a miniblock, so this is not a separate counter -- but naming it
+// once here keeps every panel from having to know that.
+func (s Snapshot) Accepted() uint64 { return s.MiniBlocks }
+
+// ShareAcceptance is the accepted fraction of the shares the node has ruled
+// on, and whether it has ruled on any.
+//
+// The denominator is accepted plus rejected, not submitted. A share that has
+// been sent and not yet answered is not a rejection, and counting it as one
+// makes the acceptance rate dip every time a share is in flight.
+func (s Snapshot) ShareAcceptance() (float64, bool) {
+	judged := s.MiniBlocks + s.Rejected
+	if judged == 0 {
+		return 0, false
+	}
+	return float64(s.MiniBlocks) / float64(judged), true
 }
 
 // ---------------------------------------------------------------- console
@@ -396,13 +476,13 @@ func (c *Console) Banner(version, node, wallet string, testnet bool, themeNote s
 		if i == 2 {
 			colour = t.Accent2
 		}
-		fmt.Fprintf(c.out, "  %s\n", t.c(colour, row))
+		fmt.Fprintf(c.out, "  %s\n", t.C(colour, row))
 	}
 	fmt.Fprintf(c.out, "  %s\n\n",
-		t.c(t.Muted, "AstroBWTv3 miner for DERO  ·  "+version))
+		t.C(t.Muted, "AstroBWTv3 miner for DERO  ·  "+version))
 
 	kv := func(k, v string) {
-		fmt.Fprintf(c.out, "  %s  %s\n", t.c(t.Muted, pad(k, 10)), t.c(t.Text, v))
+		fmt.Fprintf(c.out, "  %s  %s\n", t.C(t.Muted, pad(k, 10)), t.C(t.Text, v))
 	}
 	net := "mainnet"
 	if testnet {
@@ -416,7 +496,7 @@ func (c *Console) Banner(version, node, wallet string, testnet bool, themeNote s
 	// above the live panel, and never redrawn, so a count here would still say
 	// 8 after "threads 12". The panel carries it instead, where it updates.
 	if themeNote != "" {
-		fmt.Fprintf(c.out, "  %s  %s\n", pad("", 10), t.c(t.Dim, themeNote))
+		fmt.Fprintf(c.out, "  %s  %s\n", pad("", 10), t.C(t.Dim, themeNote))
 	}
 	fmt.Fprintln(c.out)
 }
@@ -461,7 +541,7 @@ func (c *Console) PlainLog(e LogEntry) {
 	defer c.mu.Unlock()
 	t := c.theme
 	fmt.Fprintf(c.out, "%s  %s  %s\n",
-		e.At.Format("15:04:05"), pad(e.Tag, 10), t.c(c.levelColour(e.Level), e.Text))
+		e.At.Format("15:04:05"), pad(e.Tag, 10), t.C(c.levelColour(e.Level), e.Text))
 }
 
 func (c *Console) levelColour(l LogLevel) string {
@@ -733,7 +813,7 @@ func (c *Console) ruleWithTitles(left, right string) string {
 
 func (c *Console) divider() string {
 	t := c.theme
-	return t.c(t.Border, boxTeeL+strings.Repeat(boxH, c.width-2)+boxTeeR)
+	return t.C(t.Border, boxTeeL+strings.Repeat(boxH, c.width-2)+boxTeeR)
 }
 
 // titledDivider is a divider that names the section under it. Two named
@@ -848,7 +928,7 @@ func gpuEfficiency(s Snapshot) (float64, bool) {
 
 func (c *Console) bottom() string {
 	t := c.theme
-	return t.c(t.Border, boxBL+strings.Repeat(boxH, c.width-2)+boxBR)
+	return t.C(t.Border, boxBL+strings.Repeat(boxH, c.width-2)+boxBR)
 }
 
 func (c *Console) blank() string {

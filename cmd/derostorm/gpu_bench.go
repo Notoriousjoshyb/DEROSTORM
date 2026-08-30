@@ -37,18 +37,18 @@ const (
 // runGPUBench measures one device across its block-count candidates and prints
 // the curve. Returns the best rate, or 0 if the device could not be measured.
 func runGPUBench(t *Theme, device int, batch int) float64 {
-	fmt.Printf("\n  %s\n\n", t.c(t.Accent+t.Bold, fmt.Sprintf("GPU %d · %s", device, GPUKind)))
+	fmt.Printf("\n  %s\n\n", t.C(t.Accent+t.Bold, fmt.Sprintf("GPU %d · %s", device, GPUKind)))
 
 	// A generous block allocation, so the sweep has somewhere to go.
 	g, err := NewGPUContext(device, batch, 0)
 	if err != nil {
-		fmt.Printf("  %s\n\n", t.c(t.Err, err.Error()))
+		fmt.Printf("  %s\n\n", t.C(t.Err, err.Error()))
 		return 0
 	}
 	defer g.Close()
 
-	fmt.Printf("  %s\n", t.c(t.Muted, g.Name()))
-	fmt.Printf("  %s\n\n", t.c(t.Dim, fmt.Sprintf(
+	fmt.Printf("  %s\n", t.C(t.Muted, g.Name()))
+	fmt.Printf("  %s\n\n", t.C(t.Dim, fmt.Sprintf(
 		"%d hashes per batch · up to %d resident blocks", g.Batch(), g.MaxBlocks())))
 
 	// Prove the device before reporting a number for it: a card that disagrees
@@ -63,10 +63,10 @@ func runGPUBench(t *Theme, device int, batch int) float64 {
 	}
 
 	if err := verifyGPU(g, work, scratch); err != nil {
-		fmt.Printf("  %s\n\n", t.c(t.Err, "does not agree with the CPU: "+err.Error()))
+		fmt.Printf("  %s\n\n", t.C(t.Err, "does not agree with the CPU: "+err.Error()))
 		return 0
 	}
-	fmt.Printf("  %s\n\n", t.c(t.Good, "matches the CPU exactly"))
+	fmt.Printf("  %s\n\n", t.C(t.Good, "matches the CPU exactly"))
 
 	// 2^96 is far past any real DERO difficulty, so no nonce qualifies and the
 	// benchmark never has a share to deal with.
@@ -77,7 +77,7 @@ func runGPUBench(t *Theme, device int, batch int) float64 {
 	n := make([]int, len(cands))
 	nonce := uint32(0)
 
-	fmt.Printf("  %s\n", t.c(t.Dim, fmt.Sprintf(
+	fmt.Printf("  %s\n", t.C(t.Dim, fmt.Sprintf(
 		"measuring %d settings, %d interleaved rounds each", len(cands), benchRounds)))
 
 	failed := false
@@ -89,7 +89,7 @@ func runGPUBench(t *Theme, device int, batch int) float64 {
 			for k := 0; k < benchWarmup+benchTimed; k++ {
 				start := time.Now()
 				if _, err := g.Search(work, nonce, &target); err != nil {
-					fmt.Printf("\n  %s\n", t.c(t.Err, err.Error()))
+					fmt.Printf("\n  %s\n", t.C(t.Err, err.Error()))
 					failed = true
 					break
 				}
@@ -103,29 +103,29 @@ func runGPUBench(t *Theme, device int, batch int) float64 {
 				break
 			}
 		}
-		fmt.Printf("  %s", t.c(t.Dim, "·"))
+		fmt.Printf("  %s", t.C(t.Dim, "·"))
 	}
 	fmt.Printf("\n\n")
 
-	fmt.Printf("  %s\n", t.c(t.Muted, fmt.Sprintf("%8s %14s %14s", "blocks", "H/s", "ms/batch")))
+	fmt.Printf("  %s\n", t.C(t.Muted, fmt.Sprintf("%8s %14s %14s", "blocks", "H/s", "ms/batch")))
 	best, bestBlocks := 0.0, 0
 	for i, c := range cands {
 		if n[i] == 0 {
-			fmt.Printf("  %s\n", t.c(t.Dim, fmt.Sprintf("%8d %14s", c, "not measured")))
+			fmt.Printf("  %s\n", t.C(t.Dim, fmt.Sprintf("%8d %14s", c, "not measured")))
 			continue
 		}
 		rate := sum[i] / float64(n[i])
 		if rate > best {
 			best, bestBlocks = rate, c
 		}
-		fmt.Printf("  %s\n", t.c(t.Text, fmt.Sprintf("%8d %14.1f %14.0f",
+		fmt.Printf("  %s\n", t.C(t.Text, fmt.Sprintf("%8d %14.1f %14.0f",
 			c, rate, float64(g.Batch())/rate*1000)))
 	}
 
 	if best > 0 {
-		fmt.Printf("\n  %s\n", t.c(t.Accent+t.Bold,
+		fmt.Printf("\n  %s\n", t.C(t.Accent+t.Bold,
 			fmt.Sprintf("best %s at %d blocks", humanRate(best), bestBlocks)))
-		fmt.Printf("  %s\n", t.c(t.Dim, fmt.Sprintf(
+		fmt.Printf("  %s\n", t.C(t.Dim, fmt.Sprintf(
 			"pin it with --gpu-blocks=%d, or leave it and the miner measures it while mining",
 			bestBlocks)))
 	}

@@ -38,7 +38,7 @@ func runSABench(t *Theme, threads int, sorter func([]byte, []int32) bool) {
 		return
 	}
 
-	fmt.Printf("\n  %s\n\n", t.c(t.Accent+t.Bold, "suffix sort · the 90% of a hash"))
+	fmt.Printf("\n  %s\n\n", t.C(t.Accent+t.Bold, "suffix sort · the 90% of a hash"))
 
 	type acc struct {
 		d [2]time.Duration
@@ -129,9 +129,9 @@ func runSABench(t *Theme, threads int, sorter func([]byte, []int32) bool) {
 		return float64(n[i]) / d[i].Seconds() * float64(threads)
 	}
 
-	fmt.Printf("  %s\n", t.c(t.Muted, fmt.Sprintf("%-26s %14s", "sort", "H/s")))
-	fmt.Printf("  %s\n", t.c(t.Text, fmt.Sprintf("%-26s %14.1f", "built-in (Go SA-IS)", rate(0))))
-	fmt.Printf("  %s\n", t.c(t.Text, fmt.Sprintf("%-26s %14.1f", "descriptor + libsais", rate(1))))
+	fmt.Printf("  %s\n", t.C(t.Muted, fmt.Sprintf("%-26s %14s", "sort", "H/s")))
+	fmt.Printf("  %s\n", t.C(t.Text, fmt.Sprintf("%-26s %14.1f", "built-in (Go SA-IS)", rate(0))))
+	fmt.Printf("  %s\n", t.C(t.Text, fmt.Sprintf("%-26s %14.1f", "descriptor + libsais", rate(1))))
 
 	if rate(0) > 0 && rate(1) > 0 {
 		diff := (rate(1)/rate(0) - 1) * 100
@@ -139,7 +139,7 @@ func runSABench(t *Theme, threads int, sorter func([]byte, []int32) bool) {
 		if diff < 0 {
 			colour = t.Warn
 		}
-		fmt.Printf("\n  %s\n", t.c(colour+t.Bold,
+		fmt.Printf("\n  %s\n", t.C(colour+t.Bold,
 			fmt.Sprintf("the native sort is %+.1f%% at %s", diff, plural(threads, "thread"))))
 	}
 	fmt.Println()

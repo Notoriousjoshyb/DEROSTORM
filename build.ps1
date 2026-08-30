@@ -53,7 +53,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$Version  = '1.4.1'
+$Version  = '1.5.0'
 $Pkg      = './cmd/derostorm'
 $BoundsPkg = 'github.com/deroproject/derohe/astrobwt/astrobwtv3'
 $LdFlags  = '-s -w'
@@ -69,9 +69,9 @@ $OutDir   = Join-Path $PSScriptRoot 'bin'
 # exits. It is a separate switch rather than something a build does on its own,
 # because a build that quietly deletes things is a build nobody trusts.
 #
-# What it never touches: the three embedded libraries under cmd\derostorm. They
+# What it never touches: the four embedded libraries under cmd\derostorm. They
 # are inputs to the build, not outputs of it -- go:embed fails without them and
-# rebuilding them needs nvcc, MSVC and WSL. gpuectors.bin is left for the same
+# rebuilding them needs nvcc, MSVC and WSL. gpu\vectors.bin is left for the same
 # reason: the GPU tests read it.
 function Invoke-Clean {
     # bin is emptied of build output, not removed. It also holds derostorm.json,
@@ -89,8 +89,9 @@ function Invoke-Clean {
         'bin\*.log'
         'native\sabench*.exe'
         'native\saprof*.exe'
-        'native\sapro_*.exe'
+        'native\sab_*.exe'
         'native\shabench*.exe'
+        '*.obj'
         'gpu\*_test*.exe'
         'gpu\desc_test*.exe'
         'gpu\hash*.exe'
@@ -126,15 +127,17 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 # The embedded copies. Their presence is checked on every build, because a
 # missing one is a build error from go:embed with no hint as to the cause.
 #
-# The Linux CUDA library is the odd one out: nvcc targets the host it runs on,
-# so a .so cannot come from this toolchain and is built under WSL instead. That
-# is a build-time dependency only -- once the file exists, embedding it in a
-# GOOS=linux cross-build is no different from embedding the DLL, which is the
-# reason the GPU binding avoids cgo (see cmd/derostorm/gpu_cuda.go).
+# The two Linux libraries are the odd ones out: a compiler targets the host it
+# runs on, so neither .so can come from this toolchain and both are built under
+# WSL instead. That is a build-time dependency only -- once the file exists,
+# embedding it in a GOOS=linux cross-build is no different from embedding the
+# DLL, which is the reason these bindings avoid cgo (see
+# cmd/derostorm/gpu_cuda.go).
 $Embedded = @(
-    @{ Path = 'cmd\derostorm\derostorm_gpu.dll';   Script = 'gpu\buildlib.bat'; What = 'CUDA kernels (Windows)' }
-    @{ Path = 'cmd\derostorm\libderostorm_gpu.so'; Script = 'gpu/buildlib.sh';  What = 'CUDA kernels (Linux)'; Wsl = $true }
-    @{ Path = 'cmd\derostorm\derostorm_sa.dll';    Script = 'native\build.bat'; What = 'libsais suffix sort' }
+    @{ Path = 'cmd\derostorm\derostorm_gpu.dll';   Script = 'gpu\buildlib.bat';   What = 'CUDA kernels (Windows)' }
+    @{ Path = 'cmd\derostorm\libderostorm_gpu.so'; Script = 'gpu/buildlib.sh';    What = 'CUDA kernels (Linux)';   Wsl = $true; Needs = 'a Linux CUDA toolkit' }
+    @{ Path = 'cmd\derostorm\derostorm_sa.dll';    Script = 'native\build.bat';   What = 'descriptor suffix sort (Windows)' }
+    @{ Path = 'cmd\derostorm\libderostorm_sa.so';  Script = 'native/buildlib.sh'; What = 'descriptor suffix sort (Linux)'; Wsl = $true; Needs = 'gcc' }
 )
 
 if ($Native) {
@@ -163,7 +166,7 @@ if ($Native) {
 
 foreach ($lib in $Embedded) {
     if (-not (Test-Path $lib.Path)) {
-        $how = if ($lib.Wsl) { "run it under WSL with a Linux CUDA toolkit, or .\build.ps1 -Native" }
+        $how = if ($lib.Wsl) { "run $($lib.Script) under WSL with $($lib.Needs), or .\build.ps1 -Native" }
                else          { "run $($lib.Script), or .\build.ps1 -Native" }
         throw "$($lib.Path) is missing - $how"
     }

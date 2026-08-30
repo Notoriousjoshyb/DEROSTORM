@@ -21,13 +21,14 @@ const gpuLibFile = "derostorm_gpu.dll"
 // one installed. A machine without simply gets no telemetry.
 const nvmlLibName = "nvml.dll"
 
-// openGPULibrary loads the extracted DLL and returns a lookup for its exports.
+// openNativeLibrary loads a library by path and returns a lookup for its
+// exports. Used for both embedded libraries and for NVML.
 //
 // LazyProc rather than GetProcAddress by hand because Find reports a missing
 // export as an error instead of returning zero, and Addr is then a plain
 // function address -- which is all purego.RegisterFunc wants. Nothing is
 // actually lazy here: gpu_cuda.go resolves every name at load.
-func openGPULibrary(path string) (func(string) (uintptr, error), error) {
+func openNativeLibrary(path string) (func(string) (uintptr, error), error) {
 	dll := syscall.NewLazyDLL(path)
 	if err := dll.Load(); err != nil {
 		return nil, err

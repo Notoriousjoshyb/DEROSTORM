@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/notoriousjoshyb/derostorm/internal/ui"
 )
 
 var ansi = regexp.MustCompile("\x1b\\[[0-9;?]*[a-zA-Z]")
@@ -131,7 +133,7 @@ func TestPickThemeRespectsEnvironment(t *testing.T) {
 		t.Errorf("want copper, got %s", got.Name)
 	}
 	got, note := PickTheme("nonsense", true)
-	if got.Name != "default" || note == "" {
+	if got.Name != ui.DefaultTheme || note == "" {
 		t.Errorf("unknown theme should fall back with a note, got %s %q", got.Name, note)
 	}
 

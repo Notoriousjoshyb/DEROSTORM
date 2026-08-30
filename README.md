@@ -1,46 +1,72 @@
 # DeroStorm
 
 An AstroBWTv3 miner for DERO. Mines on the CPU and, when an NVIDIA card is
-present, on the GPU as well. Live themed console, guided first-run setup.
+present, on the GPU as well. Full-screen themed console, guided first-run
+setup.
 
 The proof-of-work output is bit-for-bit identical to the reference
 implementation — every optimisation here is a faster route to the same 32 bytes,
 and `astrobwt/difftest` compares the two on every build.
 
 ```
-╭─ DEROSTORM ──────────────────────────────────────── AstroBWTv3 · v1.4.1 ─╮
-│                                                                          │
-│  ◆ MINING                     125.35 KH/s                 15 CPU · 1 GPU │
-│       ▁▂▃▄▅▆▇▇▇▇▇▇▇▇▇▇█▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   60s │
-├─ DEVICES ────────────────────────────────────────────────────────────────┤
-│  CPU    ███████▌░░░░░░░░░░░░░░░░░░░░░░░░░  33.72 KH/s   27%  71°C        │
-│  GPU 0  ████████████████████████████████░  91.87 KH/s   73%  66°C  215W  │
-├─ NETWORK ────────────────────────────────────────────────────────────────┤
-│  HEIGHT      2,481,903                DIFFICULTY  132,000                │
-│  BLOCKS      9                        NETWORK     120.00 KH/s            │
-│  MINIBLOCKS  89                       SHARE       12.92% · ~8.5s         │
-│  REJECTED    1                        PEAK        126.10 KH/s            │
-│  UPTIME      00:12:47                 GPU EFF     427 H/W                │
-│  NODE        minernode1.dero.live:10100                                  │
-╰──────────────────────────────────────────────────────────────────────────╯
-  ▸ 11:04:00  connect    connected to minernode1.dero.live:10100
-  ▸ 11:04:17  job        height 2481903 · difficulty 132000
-  ▸ 11:04:24  accepted   miniblock 89 at height 2481903
-  ▸ 11:04:36  block      block 9 found at height 2481903
-
-  › threads 12▏
+      ░▒▒▒▒▒░        ██████  ███████ ██████   ██████  ███████ ████████  ██████  ██████  ███    ███
+    ░▒▓█████▓▒░      ██   ██ ██      ██   ██ ██    ██ ██         ██    ██    ██ ██   ██ ████  ████  ┌────────┐
+   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.5.0 │
+   ▒███████████▒     ██   ██ ██      ██   ██ ██    ██      ██    ██    ██    ██ ██   ██ ██  ██  ██  └────────┘
+    ░▒▓▓█▟▙█▓▒░      ██████  ███████ ██   ██  ██████  ███████    ██     ██████  ██   ██ ██      ██
+        ▝█▛                                    ASTROBWTv3 MINER FOR DERO
+ NODE: dero-node.mysrv.cloud:10100   NETWORK: mainnet   UPTIME: 03:12:08             DERO MINING CONTROL CENTRE
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ┌─◈─MINING PERFORMANCE──────────────┐┌─◈─HASHRATE HISTORY─────────5 MIN─┐┌─◈─NETWORK STATUS──────────────────┐
+ │  ╻  ┏━┓ ┏━╸     ╻  ╺━┓            ││120K ┤⠤⠤⠤⣀⢄⡠⠤⠤⢄⡠⣀⠤⡠⢄⡠⢄⠔⢄⠤⣀⠤⡠⠢⡠⢄⡠⢄ ││ STATUS                ● CONNECTED │
+ │  ┃  ┃ ┃ ┗━┓     ┃   ━┫            ││     │                            ││ NETWORK HASHRATE        5.59 MH/s │
+ │  ╹  ┗━┛ ╺━┛ ▄   ╹  ╺━┛  KH/s      ││ 60K ┤                            ││ DIFFICULTY            100,580,000 │
+ │ TOTAL HASHRATE                    ││     │                            ││ HEIGHT                  7,541,894 │
+ │ CPU 33.04 KH/s  ███▊░░░░░░░░  31% ││   0 ┤                            ││ PEERS                      6 / 12 │
+ │ GPU 72.09 KH/s  ████████▎░░░  69% ││     └5m──4m───3m───2m───1m───Now ││ LATENCY                     42 ms │
+ └───────────────────────────────────┘└──────────────────────────────────┘└───────────────────────────────────┘
+ ┌─◈─CPU PERFORMANCE────────────────┐┌─◈─GPU PERFORMANCE────────────────┐┌─◈─SHARE STATS─────────────ALL TIME─┐
+ │   ▄▄████▄▄    THREADS         15 ││   ▄▄████▄▄    TEMP          62°C ││   ▄▄████▄▄    ACCEPTED       1,245 │
+ │  ██▀    ▀██   TEMP          56°C ││  ██▀    ▀██        8.2 / 16.0 GB ││  ██▀    ▀██   REJECTED          12 │
+ │ ██  96%   ██  FREQ      4.22 GHz ││ ██  99%   ██  CLOCK     2730 MHz ││ ██ 99.0%  ██  STALE             -- │
+ │ ██  LOAD  ██  POWER           -- ││ ██  LOAD  ██  POWER        215 W ││ ██ACCEPTED██  INVALID           -- │
+ │  ██▄    ▄██                      ││  ██▄    ▄██                      ││  ██▄    ▄██                        │
+ │   ▀▀████▀▀                       ││   ▀▀████▀▀                       ││   ▀▀████▀▀    SUBMITTED      1,257 │
+ └──────────────────────────────────┘└──────────────────────────────────┘└────────────────────────────────────┘
+ ┌─◈─BLOCKCHAIN STATUS──────────┐┌─◈─SYSTEM OVERVIEW────────────┐┌─◈─LIVE MINING LOG──────────────────────────┐
+ │ HEIGHT             7,541,894 ││    CPU TEMP      GPU TEMP    ││ 09:18:20 [ACCEPTED] share accepted (12ms)… │
+ │ MINI BLOCKS            1,245 ││      56°C          62°C      ││ 09:18:16 [ACCEPTED] share accepted (15ms)… │
+ │ BLOCKS FOUND               0 ││  ████▌░░░░░░░  █████▌░░░░░░  ││ 09:18:00 [JOB]      new job received (dif… │
+ │ ORPHANED                  -- ││    CPU LOAD       MEMORY     ││ 09:17:40 [ACCEPTED] share accepted (11ms)… │
+ │ DIFFICULTY         5,587,798 ││      96%         8.2/32G     ││ 09:17:15 [WARN]     high difficulty detec… │
+ │ NET DIFF         100,580,000 ││  ███████████▋  ███▏░░░░░░░░  ││ 09:17:04 [INFO]     mining is running smo… │
+ └──────────────────────────────┘└──────────────────────────────┘└────────────────────────────────────────────┘
+ ┌─◈─ACTIVE THREADS─────15 CPU─┐┌─◈─MINING STATUS───────────────┐┌─◈─QUICK STATS───────────┐┌─◈─CONNECTION────┐
+ │ T01 █████████████████ 100%  ││              ⢀⡀⡀⣀⢀⢀⢀⢀⢀        ││ UPTIME         03:12:08 ││   ● CONNECTED   │
+ │ T02 ████████████████▌  97%  ││   ⡰⠂     M I N I N G    ⠁⠂⠢   ││ TOTAL H… 39,874,982,145 ││                 │
+ │ T03 ████████████████░  94%  ││   ⠳⢄    IN THE STORM          ││ ACCEPTED          1,245 ││ SIGNAL    ▁▃▄▆█ │
+ │ T04 ███████████████▌░  91%  ││     ⠈⠑⠐⠂⠤⠄⠤⠠⠤⠠⠤⠒⠊⠁   ⣀⠴⠃      ││ REJECTED             12 ││ LATENCY   42 ms │
+ │ +11 more                    ││              ⠄⠠⠠⠠⠐⠐⠂⠉         ││ STALE                -- ││      GOOD       │
+ └─────────────────────────────┘└───────────────────────────────┘└─────────────────────────┘└─────────────────┘
+ [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.5.0
 ```
 
-The **DEVICES** section is the part worth having. A single combined hashrate
-cannot tell you that a card stopped contributing an hour ago; a row per device
-can, and on a rig it says *which* card rather than only that the total dropped.
-Each row carries that device's temperature, and a GPU row its power draw.
+Eight screens, one key each. The **dashboard** above is the one you leave up;
+`M` `S` `N` `T` `C` `L` `P` `H` go to mining, statistics, network, threads,
+config, logs, pools and help, `Tab` cycles them and `Esc` comes back here.
 
-`SHARE` is your slice of the network and the mean gap between shares at the
-current difficulty, which is what says whether a change to the settings actually
-helped. `PEAK` beside the live figure is what says whether the machine is still
-as fast as it was, and `GPU EFF` is hashes per watt — on a machine that runs for
-months that is the number the electricity bill is denominated in.
+The split between **CPU** and **GPU** is the part worth having. A single
+combined hashrate cannot tell you that a card stopped contributing an hour ago;
+a bar per device can, and **ACTIVE THREADS** does the same job one level down —
+a core that has been taken by something else shows up as one short bar rather
+than as a total that is quietly 6% low. Each panel carries its device's
+temperature, and the GPU one its clock, VRAM and power draw.
+
+**SHARE STATS** is accepted against rejected, stale and invalid over the whole
+session, because those four fail for different reasons and a single "accepted
+%" hides which. **NETWORK STATUS** is the node's own view — peers, latency, the
+height it is handing out — so a stall shows as a node problem or a miner problem
+rather than only as a number that stopped moving.
 
 See [Temperatures](#temperatures) for where the two numbers come from, and why
 the CPU one is harder than the GPU one.
@@ -65,64 +91,91 @@ derostorm --setup
 
 ---
 
-## Runtime commands
+## Runtime keys and commands
 
-Type a command and press Enter while it is mining.
+While it is mining, one key does one thing. Nothing needs Enter.
+
+| Key | What it does |
+|---|---|
+| `M` `S` `N` `T` `C` `L` `P` `H` | Mining, statistics, network, threads, config, logs, pools, help. |
+| `Esc` or `D` | Back to the dashboard. |
+| `Tab` | Cycle the screens. |
+| arrows, `PgUp`, `PgDn` | Scroll the event log. `End` returns it to live. |
+| `:` | Open the command line. |
+| `Q` or `Ctrl-C` | Stop mining and print a session summary. |
+
+Press `:` first for anything that takes an argument, then type and press Enter:
 
 | Command | What it does |
 |---|---|
 | `threads <n>` | Change the thread count live. Also accepts `+2` or `-4`. |
-| `theme <name>` | Switch colour theme: `default`, `copper`, `mono`. |
+| `theme <name>` | Switch colour theme. |
 | `save` | Write the current settings to the config file. |
 | `config` | Show the active settings and where they came from. |
-| `help` | List the commands. |
-| `quit` | Stop mining and print a session summary. |
+| `quit` | Stop mining and exit. |
 
-Thread changes take effect immediately and are remembered for the session; run `save` to make them permanent.
+Thread changes take effect immediately and are remembered for the session; run
+`save` to make them permanent.
 
-`Ctrl-C` also quits cleanly.
+The full-screen console is the default on an interactive terminal. Two other
+modes exist for the cases it does not suit:
+
+| Flag | What you get |
+|---|---|
+| `--classic` | The compact in-place panel. It scrolls with the shell, so the scrollback above it survives. |
+| `--no-tui` | Plain scrolling lines. No cursor movement at all — for `tmux` logs, `systemd` units and CI. |
+
+Colour and cursor control are switched off automatically when output is not a
+terminal or when `NO_COLOR` is set, so piping to a log file or running as a
+service produces clean text with no flags at all.
 
 ---
 
 ## Themes
 
-Five themes ship with it. See them side by side without connecting to anything:
+Six themes ship with it. See any of them without connecting to anything:
 
 ```
 derostorm --preview
 derostorm --preview --theme=copper
+derostorm --preview --theme=aurora --screen=network --size=140x44
 ```
 
 | Theme | Look |
 |---|---|
-| `default` | cyan accent, violet secondary, near-black ground. The default. |
-| `copper` | burnt copper accent, slate secondary, charcoal ground. |
-| `aurora` | emerald and ice on a deep green-black. |
-| `ember` | amber and rose on a warm black. |
-| `mono` | no colour at all. |
+| `cyber` | neon cyan + violet on black — the control-centre look. **The default.** |
+| `default` | cyan + violet on near-black. Quieter than `cyber`. |
+| `copper` | burnt copper + slate on charcoal. |
+| `aurora` | emerald + ice on deep green-black. |
+| `ember` | amber + rose on warm black. |
+| `mono` | no colour at all — for logs, CI and dumb terminals. |
 
-Colour is switched off automatically when output is not a terminal or when `NO_COLOR` is set, so piping to a log file or running as a service produces clean text. A `theme` command cannot override that.
+`--preview` draws one real frame through the same code the live console uses,
+with representative data in it. A preview with a rendering path of its own would
+eventually be a picture of a program that does not exist, so there is only the
+one. `--screen` picks which of the eight to draw and `--size=<cols>x<rows>` a
+window you do not have, which is how a layout gets checked at a size before
+someone runs it at that size.
 
 ### Window size
 
-The panel needs about **98 columns by 38 rows** — the banner, the panel, the
-event log and the command line. It is two rows taller with a GPU than without,
-and one row taller again for every extra card, because every device gets its own
-row; DeroStorm sizes the window from the device count in the config before
-anything is drawn.
+The console redraws in place and reflows to whatever it is given. Panels drop
+out of each row as the window narrows, columns collapse, and labels shorten
+before they truncate. It is readable from about **100 columns by 32 rows**, and
+the layout above is what 112x40 looks like; the three-across rows want about 150
+columns to open up fully.
 
-DeroStorm asks the terminal for that on start-up, and only ever asks for more
-than it has, so a window someone has deliberately made large is left alone. Two
-mechanisms are tried, because neither covers both consoles: classic `conhost`
-honours the Win32 console calls and ignores the ANSI resize, Windows Terminal is
-the other way round.
+DeroStorm asks the terminal for a larger window on start-up, and only ever asks
+for more than it has, so a window someone has deliberately made large is left
+alone. Two mechanisms are tried, because neither covers both consoles: classic
+`conhost` honours the Win32 console calls and ignores the ANSI resize, Windows
+Terminal is the other way round.
 
-If the terminal refuses, or the screen is too small to grow into, the event log
-is trimmed until the panel fits. This is not cosmetic — the panel is redrawn by
-moving the cursor up over its own height, so one that is taller than the window
-would walk down the screen leaving a copy of itself behind on every frame. If it
-cannot fit even a two-line log, DeroStorm says so and prints plain scrolling
-output instead.
+Below the minimum it says so and falls back to plain scrolling output rather
+than drawing a frame wider than its window. If a frame ever *does* come out
+wider than the window — the one failure that leaves the screen unreadable —
+`--termdiag` reports what every source says the size is and rules a line that
+wide, which is enough to say which source is lying.
 
 ---
 
@@ -222,25 +275,44 @@ derostorm [options]
   --config=<path>                   Use a different config file.
   --wallet-address=<addr>           Override the saved wallet.
   --daemon-rpc-address=<host:port>  Override the saved node.
+  --rpc-address=<host:port>         derod JSON-RPC, for peer count, network
+                                    hashrate and block interval. Default: the
+                                    getwork host with the port two higher.
   --mining-threads=<n>              Override the saved thread count.
   --gpu=<list>                      Mine on these NVIDIA devices: 0, 0,1,
                                     all or off.
   --gpu-batch=<n>                   Nonces per GPU launch.
   --gpu-blocks=<n>                  Resident blocks in the GPU suffix kernel.
                                     Default: measure it while mining.
-  --theme=<name>                    default, copper, aurora, ember or mono.
-  --no-dashboard                    Plain scrolling output, no live panel.
+  --theme=<name>                    cyber, default, copper, aurora, ember
+                                    or mono.
+  --tui                             Force the full-screen console. Already the
+                                    default on an interactive terminal.
+  --classic                         The compact in-place panel instead.
+  --no-tui                          Plain scrolling output, no console at all.
+                                    --no-dashboard is the same thing.
   --testnet                         Use the DERO testnet.
   --debug                           Verbose logging to the log file.
   --bench                           Benchmark the hash function and exit.
                                     Add --gpu=all to benchmark the GPU too.
   --run-for=<sec>                   Mine for this long, then print a summary.
-  --preview                         Show the console with sample data and exit.
+  --cpuprofile=<path>               Write a CPU profile. Works with --bench
+                                    and with --run-for.
+  --preview                         Draw one console frame with sample data
+                                    and exit.
+  --size=<WxH>                      Size for --preview. Default: this terminal.
+  --screen=<name>                   Screen for --preview: dashboard, mining,
+                                    stats, network, threads, config, logs,
+                                    pools or help.
+  --preview-classic                 Preview the compact panel in every theme.
+  --termdiag                        Report what every source says the terminal
+                                    size is, and rule a line that wide.
 ```
 
 Command-line flags override the config file for that run; they do not rewrite it unless you run `save`.
 
-Logs go to `derostorm.exe.log` beside the executable — never to the console, so nothing scribbles over the live panel.
+Logs go to `derostorm.exe.log` beside the executable — never to the console, so
+nothing scribbles over the frame.
 
 ---
 
@@ -381,9 +453,9 @@ still pass. It costs a slower link and nothing else.
 
 ### Building the native libraries
 
-Three of them are embedded in the executable and bound at run time: the CUDA
-kernels for Windows, the same kernels for Linux, and libsais for the suffix
-sort. They are build products, not source, so they are not in git — build them
+Four of them are embedded in the executable and bound at run time: the CUDA
+kernels for Windows, the same kernels for Linux, and the descriptor suffix sort
+for each. They are build products, not source, so they are not in git — build them
 once and the copies under `cmd/derostorm/` are what `go:embed` picks up from
 then on. After that an ordinary build needs neither a C toolchain nor CUDA, and
 they only need rebuilding when their sources change.
@@ -394,7 +466,7 @@ targets the answer is none:
 | Target | Needs |
 | --- | --- |
 | `windows/amd64` | `derostorm_gpu.dll` and `derostorm_sa.dll` |
-| `linux/amd64` | `libderostorm_gpu.so` |
+| `linux/amd64` | `libderostorm_gpu.so` and `libderostorm_sa.so` |
 | `linux/arm64`, `darwin/amd64`, `darwin/arm64` | **nothing** |
 
 So building for macOS needs no GPU, no CUDA and no libraries: `./build.sh` on a
@@ -402,7 +474,7 @@ Mac produces a working CPU miner from a clean clone. `build.sh` checks only what
 the target it is building actually embeds.
 
 ```
-.\build.ps1 -Native      # both, then the miner
+.\build.ps1 -Native      # all four, then the miner
 ```
 
 or one at a time:
@@ -410,7 +482,8 @@ or one at a time:
 ```
 gpu\buildlib.bat         # CUDA kernels  -> cmd\derostorm\derostorm_gpu.dll
 gpu/buildlib.sh          # CUDA kernels  -> cmd\derostorm\libderostorm_gpu.so   (run under Linux)
-native\build.bat         # libsais       -> cmd\derostorm\derostorm_sa.dll
+native\build.bat         # suffix sort   -> cmd\derostorm\derostorm_sa.dll
+native/buildlib.sh       # suffix sort   -> cmd\derostorm\libderostorm_sa.so    (run under Linux)
 ```
 
 Each script copies its result into `cmd\derostorm\` itself, because doing that
@@ -418,11 +491,12 @@ by hand is how a stale library gets shipped. Both build scripts refuse to build
 if a copy is missing, since `go:embed` fails with no hint as to the cause.
 
 The CUDA halves need the toolkit and a host compiler — MSVC on Windows, gcc on
-Linux; the libsais half needs only MSVC.
+Linux; the suffix-sort halves need only the host compiler, MSVC or gcc.
 
-`gpu/buildlib.sh` is the odd one, because `nvcc` targets the host it runs on: a
-Linux `.so` cannot be produced from the Windows toolkit, whatever flags you
-pass. WSL is enough, and needs no GPU of its own — the build wants `nvcc`, not
+The two `.sh` scripts are the odd ones, because a compiler targets the host it
+runs on: a Linux `.so` cannot be produced from the Windows toolkit, whatever
+flags you pass. WSL is enough, and `gpu/buildlib.sh` needs no GPU of its own —
+the build wants `nvcc`, not
 a card:
 
 ```powershell
@@ -485,21 +559,33 @@ otherwise. Everything in this section except the *Before* columns and the
 *What does not help* experiments comes from `derostorm --bench`, which needs no
 node and no wallet, so you can reproduce it on your own machine in a minute.
 
-Headline, all of it at once, re-measured on 2026-08-29 at 1.4.0:
+Headline, all of it at once, re-measured on 2026-08-30 at 1.5.0:
 
-| | H/s | at 1.3.0 | at 1.1.0 |
-|---|---:|---:|---:|
-| CPU, 15 threads | 33,700 – 34,500 | 33,600 | 33,506 |
-| RTX 5080 | **91,870** | 71,650 | 63,400 |
-| **together, real mining path** | **124,700 – 125,400** | ~103,300 | — |
+| | H/s | at 1.4.0 | at 1.3.0 | at 1.1.0 |
+|---|---:|---:|---:|---:|
+| CPU, 15 threads | 34,293 | 33,700 – 34,500 | 33,600 | 33,506 |
+| RTX 5080 | **100,640** | 91,870 | 71,650 | 63,400 |
+| **together, real mining path** | **130,400 – 131,800** | 124,700 – 125,400 | ~103,300 | — |
 
-The combined figure is `--run-for=50 --gpu=all --gpu-blocks=672`, not the sum of
+The combined figure is `--run-for=55 --gpu=all --gpu-blocks=1252`, not the sum of
 the two above: on the real path the two share a memory system and a job feed, so
-the sum overstates it slightly.
+the sum overstates it slightly. Three runs, and the block count is pinned so the
+figure is not diluted by the tuning sweep the miner otherwise runs in its first
+twelve seconds.
 
-The GPU is where the gain is, and 1.4.0 is +28% on it in one session. All of it
-came from the same thing — see [The GPU was reading memory one byte at a
-time](#the-gpu-was-reading-memory-one-byte-at-a-time).
+The GPU is where the gain keeps coming from. 1.4.0 was +28% on it in one
+session, all of it the same mistake in different files — see [The GPU was
+reading memory one byte at a
+time](#the-gpu-was-reading-memory-one-byte-at-a-time). 1.5.0 is +9.5% more, from
+giving the few big colliding groups the whole block instead of one thread; the
+average group was never the cost.
+
+**1.5.0 is three things.** The console was rebuilt as a full-screen, eight-screen
+one, which is what most of the diff is and none of the hashrate. The GPU merge
+above is the speed. And Linux got the native suffix sort it had never had: those
+builds were quietly running the Go sort, so the same hardware read about a
+quarter of its Windows hashrate — see [the suffix sort](#cpu) for the numbers and
+why macOS and arm64 still cannot have it.
 
 **1.4.1 exists for one reason.** The 1.4.0 Linux archives shipped the *previous*
 CUDA kernels: `libderostorm_gpu.so` is built by `nvcc` under Linux, which was
@@ -587,6 +673,16 @@ on this data, by a consistent margin:
 | 8 | 4,986 H/s | 17,950 H/s | +260.0% |
 | 15 | 8,450 H/s | 29,707 H/s | +251.6% |
 
+Linux gets the same library and the same margin. It was Windows-only for a
+while — the sort was packaged as a DLL and nothing had been built for anything
+else — and that showed up as Linux rigs reporting a quarter of the hashrate the
+same hardware managed on Windows. It was never a tuning problem: those builds
+were running the Go sort. `native/buildlib.sh` now builds the `.so`, and
+`--bench` on linux/amd64 reads +248.9% at 8 threads against the Windows
++260.0% on the same row. macOS and arm64 still use the Go sort, because the
+descriptor merge is AVX2 and the paired hash is the x86 SHA extensions; that is
+a NEON port, not a recompile.
+
 These are whole hashes, not sorts, which is why they sit below the plain
 `--bench` throughput on the same thread count: the two sorts run interleaved so
 neither gets the quiet half of the machine. Run-to-run spread on the 15-thread
@@ -647,14 +743,53 @@ profile-guided optimisation (+1.2%).
 
 | | Before | Now | |
 |---|---:|---:|---:|
-| RTX 5080 | 7.45 KH/s | 91,870 H/s | +1133% |
+| RTX 5080 | 7.45 KH/s | 100,640 H/s | +1251% |
 
 *Before* is the GPU on its own on the real mining path
 (`--mining-threads=1 --gpu=0 --run-for=90`), measured when GPU support first
 worked. *Now* is `--bench --gpu=all`, which runs the same kernels over the same
 batch size without needing a node. The intermediate 12.28 KH/s this table used
 to carry was the gain from the packed-key change described below; the rest came
-from the block-count sweep and the stage-1 work after it.
+from the block-count sweep, the stage-1 work after it, the byte-load session at
+1.4.0, and the merge described next.
+
+**One thread was the phase.** The merge that resolves colliding descriptor
+groups gave each group to one thread. The average group holds seven positions,
+which is exactly why the code was written that way and exactly why the average
+was the wrong thing to look at: every thread waits at the barrier afterwards, so
+the phase costs whatever the *busiest* thread costs. Counted over the 512
+reference vectors, that thread does **43.5% of the whole text's merge
+comparisons**.
+
+The distribution says why. Of ~247 colliding groups in a text, the five or so
+holding more than 32 positions carry 62% of the comparisons:
+
+| positions in group | groups per text | share of comparisons |
+|---|---:|---:|
+| 1 – 32 | 241.6 | 38% |
+| 33 – 64 | 3.1 | 12% |
+| 65 – 128 | 0.7 | 6% |
+| 129 – 256 | 0.4 | 11% |
+| 257+ | 0.5 | 32% |
+
+So the big ones now go through a **block-wide** merge instead, one group at a
+time with all 256 threads on it, and the per-thread loop keeps the ~242 small
+ones it was always good at. The threshold (`DESC_MERGE_WIDE`, 128 positions) is
+a trade: a block-wide merge costs barriers, and below that size the barriers
+cost more than the serial tail they remove. `DESC_BIG_MAX` caps how many groups
+a text may hand over at 48 — there are about five, and a group past the cap is
+merged by one thread as before, slower and never wrong.
+
+The scatter was folded into the same pass while the code was open. It and the
+merge were two loops over all `nd` descriptors, and both opened by asking the
+same question of the same words — is this descriptor the first of its key group,
+and does the group hold anything else. Two global reads a descriptor, asked
+twice: ~50,000 loads a text spent re-deriving what the previous loop had already
+worked out.
+
+Together: **91,870 → 100,640 H/s, +9.5%** on the 5080, output bit-identical —
+`gpu/hash_parallel_test.exe` still matches all 512 CPU vectors and the miner
+still re-verifies the device against the CPU before it will submit anything.
 
 **The GPU was reading memory one byte at a time.** The largest single session of
 gains on this card, +28% end to end, and every part of it was the same mistake in
@@ -1238,14 +1373,25 @@ phase shares were, what was changed, and what was tried and thrown away.
 derostorm/
 ├── bin/                    built binaries
 ├── cmd/derostorm/          the miner
-│   ├── main.go             flags, startup order, run loop, benchmark, preview
+│   ├── main.go             flags and startup order
+│   ├── runloop.go          the run loop, and which console it drives
 │   ├── setup.go            first-run wizard
 │   ├── config.go           the derostorm.json file
 │   ├── engine.go           getwork + the mining threads
 │   ├── target.go           allocation-free difficulty check
-│   ├── dashboard.go        the live console
-│   ├── theme.go            palettes
+│   ├── tui.go              the full-screen console: input, frame, resize
+│   ├── tui_layout.go       which panels fit, at this window size
+│   ├── tui_panels.go       every panel on the dashboard
+│   ├── tui_screens.go      the other seven screens
+│   ├── tui_preview.go      --preview: one frame, sample data, no node
+│   ├── dashboard.go        the compact in-place panel (--classic)
+│   ├── theme.go            palette lookup, over internal/ui
 │   ├── commands.go         runtime command line
+│   ├── nodeinfo.go         derod JSON-RPC: peers, net hashrate, block time
+│   ├── sysinfo*.go         CPU load, frequency and memory, per platform
+│   ├── sensors.go          temperatures, fan, power
+│   ├── termdiag*.go        --termdiag: what each source says the size is
+│   ├── termprobe*.go       asks the terminal for a bigger window
 │   ├── affinity.go         CPU-slot → logical-CPU map
 │   ├── gpu_cuda.go         binds the CUDA library and drives it
 │   ├── gpu_cuda_windows.go   embeds the .dll, finds symbols with LoadLibrary
@@ -1254,18 +1400,32 @@ derostorm/
 │   ├── gpu_worker.go       the GPU mining worker
 │   ├── gpu_tune.go         measures the suffix kernel's block count
 │   ├── gpu_bench.go        --bench for the GPU
-│   ├── sa_windows.go       loads libsais, proves it, installs the hook
+│   ├── sa_lib.go           the shared suffix-sort binding
+│   ├── sa_windows.go       embeds the .dll, proves it, installs the hook
+│   ├── sa_linux.go         embeds the .so, same three steps
 │   ├── sa_test.go          332 inputs through both sorts, hashes compared
 │   ├── sa_bench.go         --bench: the two sorts, interleaved
 │   └── default.pgo         profile for -pgo=auto
+├── internal/ui/            the widgets the console is drawn from
+│   ├── canvas.go           the cell grid everything writes into
+│   ├── panel.go            bordered boxes and their titles
+│   ├── chart.go            sparklines, bars, the braille history plot
+│   ├── gauge.go            rings, meters and dials
+│   ├── art.go              the wordmark, the cloud, the block glyphs
+│   ├── text.go             wrapping, truncation, alignment
+│   ├── format.go           hashrates, counts, durations
+│   └── theme.go            the six palettes
 ├── native/                 the C suffix sort
 │   ├── derostorm_sa.c      the C API: sort, version, self-test
 │   ├── descriptor.c        the structure-exploiting suffix sort
 │   ├── sabench.c           checks and times both sorts on the real texts
+│   ├── build.bat           builds the Windows .dll
+│   ├── buildlib.sh         builds the Linux .so
 │   └── libsais/            upstream libsais, unmodified (Apache-2.0)
 ├── gpu/                    the CUDA kernels and their test harnesses
 │   ├── derostorm_gpu.cu    the three kernels and the C API
 │   ├── stage1.cuh          the 256-way state machine, thread per hash
+│   ├── desc.cuh            the descriptor suffix sort, block per hash
 │   ├── sa_doubling.cuh     suffix array by prefix doubling, block per hash
 │   ├── blockradix.cuh      the block-wide radix sort under it
 │   ├── hash_parallel_test.cu  whole hash against 512 real CPU vectors

@@ -167,6 +167,40 @@ static_assert(DESC_CHUNKS * DESC_CHUNK_COLS == 256,
 // than O(total * L). For the worst group that is 7,000 comparisons instead of
 // 230,000, and a comparison here walks ~97 bytes of text before it decides.
 
+// Positions at which a colliding group stops being one thread's work and
+// becomes the whole block's. See step 6b.
+//
+// The average group is not the cost and never was. Measured over the 512
+// vectors, one thread per group leaves the busiest thread of a block doing
+// **43.5% of the whole text's merge comparisons** -- and since every thread
+// waits at the barrier after, that one thread is the phase. The distribution
+// says why: of 247 colliding groups a text, the ~5 holding more than 32
+// positions carry 62% of the comparisons.
+//
+// So those few go through a block-wide merge instead, one group at a time, and
+// the per-thread loop keeps the ~242 small ones it was always good at.
+//
+//   positions   groups   share of comparisons
+//     1 - 32    241.6         38%
+//    33 - 64      3.1         12%
+//    65 -128      0.7          6%
+//   129 -256      0.4         11%
+//     257+       0.5          32%
+//
+// The threshold is a trade between the barriers a block-wide merge costs and
+// the serial tail it removes: below ~128 positions the barriers cost more than
+// the tail they remove. The distribution above, and the +9.5% it is worth on a
+// 5080, are written up in the README under "One thread was the phase".
+#ifndef DESC_MERGE_WIDE
+#define DESC_MERGE_WIDE 128
+#endif
+
+// Groups a text may hand to the block-wide merge. There are ~5, and a group
+// past this cap is merged by one thread as before -- slower, never wrong.
+#ifndef DESC_BIG_MAX
+#define DESC_BIG_MAX 48
+#endif
+
 // Bits of the descriptor word. The key takes the top 32 so the radix sorts on
 // it directly, and the arena offset and length share the bottom 32.
 #define DESC_LEN_BITS 12
@@ -350,13 +384,17 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
     __shared__ int     s_ndesc;
     __shared__ int     s_fail;
     __shared__ int     s_bump;   // bump allocator for the merge's boundaries
+    __shared__ int     s_nbig;   // colliding groups handed to the block-wide merge
+    __shared__ int     s_bbase;  // that merge's boundary allocation, one at a time
 
     PROF_DECL;
     const int tid = threadIdx.x;
     const int nblocks = n / 256;
     PROF_MARK();
 
-    if (tid == 0) { s_ndesc = 0; s_fail = 0; s_bump = 0; }
+    // The bump allocator starts past the slot the big-group list occupies; see
+    // step 6b, which parks that list in the same dead array.
+    if (tid == 0) { s_ndesc = 0; s_fail = 0; s_bump = 2 * DESC_BIG_MAX; s_nbig = 0; }
     blockRadixInit(sh);   // zeroes the per-tile matrix the sort relies on
 
     // ---- 1. run boundaries.
@@ -588,63 +626,84 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
     blockScanFlags(sc.offs, nd, sh);   // inclusive; exclusive = offs[i] - len
     PROF_ADD(PH_D_SCAN);
 
-    // ---- 5. the scatter.
-    //
-    // A descriptor whose key nothing else shares is already in its final place
-    // relative to everything else, so its positions go straight out. That is
-    // ~98.7% of them.
-    for (int i = tid; i < nd; i += BR_BLOCK) {
-        const uint64_t w = sorted[i];
-        const uint32_t key = (uint32_t)(w >> 32);
-        const uint32_t len = (uint32_t)(w & DESC_LEN_MASK);
-        const uint32_t off = (uint32_t)((w >> DESC_LEN_BITS) & 0xFFFFFu);
-
-#ifndef DESC_NO_MERGE
-        const bool first = (i == 0) || ((uint32_t)(sorted[i - 1] >> 32) != key);
-        const bool last = (i == nd - 1) || ((uint32_t)(sorted[i + 1] >> 32) != key);
-        if (!(first && last)) continue;
-#else
-        /* DESC_NO_MERGE writes every descriptor, colliding or not, in whatever
-         * order the arena holds it, and skips step 6 entirely. The answer is
-         * then wrong inside colliding groups but must still be a *permutation*
-         * of 0..n-1, and that is what separates two very different faults.
-         *
-         * It earned its place finding one. The merge was writing 41 positions
-         * twice and losing 41 others per text; with this defined the output was
-         * a clean permutation, which said the walk, the arena partition, the
-         * radix sort and the offset scan were all correct and put the fault in
-         * the merge, where it was: the boundary arrays were indexed by output
-         * offset over a closed interval, so each group's last boundary word
-         * landed on the next group's first. */
-        (void)key;
-#endif
-
-        const int32_t o = sc.offs[i] - (int32_t)len;
-        for (uint32_t x = 0; x < len; x++) sa[o + x] = (int32_t)sc.arena[off + x];
-    }
-
-    PROF_ADD(PH_D_SCATTER);
-
     // The radix sort leaves its result in one of its two arrays; the other is
     // finished with, and is where the merge below keeps its list boundaries.
     // Two int32 per uint64, so it holds 2n of them and the merge needs 2n.
     int32_t* const dead = (int32_t*)(sorted == sc.words ? sc.words2 : sc.words);
 
-    // ---- 6. the groups that collide on all four bytes. One thread per group:
-    // there are ~247 of them per text holding ~7 positions each, so this is a
-    // small amount of work spread thinly, and a block-wide treatment would cost
-    // more in barriers than it saved.
-#ifndef DESC_NO_MERGE
+    // ---- 5. the scatter, and the colliding groups, in one pass.
+    //
+    // A descriptor whose key nothing else shares is already in its final place
+    // relative to everything else, so its positions go straight out. That is
+    // ~98.7% of them.
+    //
+    // The scatter and the merge used to be two loops over all nd descriptors,
+    // and both opened by asking the same question of the same words: is this
+    // descriptor the first of its key group, and does the group hold anything
+    // else. Two global reads a descriptor, asked twice -- ~50,000 loads a text
+    // spent re-deriving what the previous loop had already worked out. One pass
+    // answers it once: a lone descriptor is written here, and a group head goes
+    // straight on to the merge below it.
+    //
+    // The merge itself is one thread per group for the small ones -- there are
+    // ~242 of them a text holding ~7 positions each, and a block-wide treatment
+    // of those would cost more in barriers than it saved. The ~5 large ones are
+    // set aside for step 6, because one thread on the largest of them was 43.5%
+    // of the phase; see DESC_MERGE_WIDE.
+#ifdef DESC_NO_MERGE
+    /* DESC_NO_MERGE writes every descriptor, colliding or not, in whatever
+     * order the arena holds it, and skips the merge entirely. The answer is
+     * then wrong inside colliding groups but must still be a *permutation* of
+     * 0..n-1, and that is what separates two very different faults.
+     *
+     * It earned its place finding one. The merge was writing 41 positions twice
+     * and losing 41 others per text; with this defined the output was a clean
+     * permutation, which said the walk, the arena partition, the radix sort and
+     * the offset scan were all correct and put the fault in the merge, where it
+     * was: the boundary arrays were indexed by output offset over a closed
+     * interval, so each group\'s last boundary word landed on the next group\'s
+     * first. */
     for (int i = tid; i < nd; i += BR_BLOCK) {
-        const uint32_t key = (uint32_t)(sorted[i] >> 32);
+        const uint64_t w = sorted[i];
+        const uint32_t len = (uint32_t)(w & DESC_LEN_MASK);
+        const uint32_t off = (uint32_t)((w >> DESC_LEN_BITS) & 0xFFFFFu);
+        const int32_t o = sc.offs[i] - (int32_t)len;
+        for (uint32_t x = 0; x < len; x++) sa[o + x] = (int32_t)sc.arena[off + x];
+    }
+    __syncthreads();
+#else
+    for (int i = tid; i < nd; i += BR_BLOCK) {
+        const uint64_t w = sorted[i];
+        const uint32_t key = (uint32_t)(w >> 32);
         if (i > 0 && (uint32_t)(sorted[i - 1] >> 32) == key) continue;  // not first
 
         int j = i + 1;
         while (j < nd && (uint32_t)(sorted[j] >> 32) == key) j++;
-        if (j == i + 1) continue;   // singleton, already written
 
-        const int32_t o = sc.offs[i] - (int32_t)(sorted[i] & DESC_LEN_MASK);
+        const uint32_t len0 = (uint32_t)(w & DESC_LEN_MASK);
+        const int32_t o = sc.offs[i] - (int32_t)len0;
+
+        if (j == i + 1) {   // nothing shares this key: straight out
+            const uint32_t off = (uint32_t)((w >> DESC_LEN_BITS) & 0xFFFFFu);
+            for (uint32_t x = 0; x < len0; x++)
+                sa[o + x] = (int32_t)sc.arena[off + x];
+            continue;
+        }
+
         const int nlist0 = j - i;
+
+        // Large groups go to the block. offs is an inclusive scan of the
+        // lengths, so the group\'s total is known here without gathering it
+        // first. A group past the list\'s capacity falls through and is merged
+        // by this one thread, which is the old behaviour and still correct.
+        if (sc.offs[j - 1] - o >= DESC_MERGE_WIDE) {
+            const int bi = atomicAdd(&s_nbig, 1);
+            if (bi < DESC_BIG_MAX) {
+                dead[2 * bi] = i;
+                dead[2 * bi + 1] = j;
+                continue;
+            }
+        }
 
         // The data goes at this group's own output offset: output spans are
         // disjoint, so no two groups can touch the same words.
@@ -710,6 +769,139 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         // An odd number of merge rounds leaves the answer in the scratch half.
         if (a != sa + o) {
             for (int x = 0; x < total; x++) sa[o + x] = a[x];
+        }
+    }
+    __syncthreads();
+    PROF_ADD(PH_D_SCATTER);
+
+    // ---- 6. the few large colliding groups, the whole block on one at a time.
+    //
+    // Same algorithm as above -- merge adjacent pairs of sorted lists until one
+    // is left -- with the round spread across the block instead of run by one
+    // thread. Two things make that possible.
+    //
+    // A round's output occupies exactly the same index range as its input,
+    // because a pair of lists merges into the span the two of them already fill.
+    // So the whole round is one array of `total` outputs, and a thread can be
+    // given a contiguous slice of it without knowing anything about the pairs.
+    //
+    // And a merge can be entered in the middle. For output position d of a pair,
+    // the split (i, j) with i + j = d that a serial merge would have reached is
+    // the unique one where the last element taken from either list is not
+    // greater than the next element of the other -- a *merge path*, found by
+    // binary search over i alone in O(log) comparisons. So a thread binary
+    // searches its way to its own starting split and then merges serially from
+    // there.
+    //
+    // The comparison count is what matters, because a comparison here walks ~62
+    // bytes of text before it decides and the kernel is memory bound. This costs
+    // the serial merge's comparisons plus one binary search per thread per pair
+    // it touches, and nothing else. Placing every element independently by
+    // binary search would have been simpler and multiplies the comparisons by
+    // log of the list length, which on a memory-bound kernel is a loss.
+    {
+        const int nbig = s_nbig < DESC_BIG_MAX ? s_nbig : DESC_BIG_MAX;
+        for (int bg = 0; bg < nbig; bg++) {
+            const int gi = dead[2 * bg], gj = dead[2 * bg + 1];
+            const int L = gj - gi;
+            const int32_t o = sc.offs[gi] - (int32_t)(sorted[gi] & DESC_LEN_MASK);
+            const int total = sc.offs[gj - 1] - o;
+
+            if (tid == 0) s_bbase = atomicAdd(&s_bump, 2 * (L + 1));
+            __syncthreads();
+            const int bbase = s_bbase;
+            if (bbase + 2 * (L + 1) > 2 * n) {
+                if (tid == 0) atomicExch(&s_fail, 1);
+                __syncthreads();
+                continue;
+            }
+
+            int32_t* a  = sa + o;
+            int32_t* b  = sc.mbuf + o;
+            int32_t* ba = dead + bbase;
+            int32_t* bb = ba + (L + 1);
+
+            // Gather the lists end to end. Each descriptor's start is its own
+            // exclusive offset relative to the group's, so this needs no scan
+            // and no atomic -- one thread per descriptor, all independent.
+            for (int k = gi + tid; k < gj; k += BR_BLOCK) {
+                const uint64_t w = sorted[k];
+                const uint32_t len = (uint32_t)(w & DESC_LEN_MASK);
+                const uint32_t off = (uint32_t)((w >> DESC_LEN_BITS) & 0xFFFFFu);
+                const int32_t base = sc.offs[k] - (int32_t)len - o;
+                ba[k - gi] = base;
+                for (uint32_t x = 0; x < len; x++)
+                    a[base + x] = (int32_t)sc.arena[off + x];
+            }
+            if (tid == 0) ba[L] = total;
+            __syncthreads();
+
+            int nlist = L;
+            while (nlist > 1) {
+                const int npairs = (nlist + 1) >> 1;
+
+                // Pair p merges lists 2p and 2p+1, so it owns output
+                // [ba[2p], ba[2p+2]). An odd list out pairs with an empty one.
+                for (int p = tid; p <= npairs; p += BR_BLOCK)
+                    bb[p] = (2 * p < nlist) ? ba[2 * p] : total;
+                __syncthreads();
+
+                const int d0 = (int)(((int64_t)total * tid) / BR_BLOCK);
+                const int d1 = (int)(((int64_t)total * (tid + 1)) / BR_BLOCK);
+
+                int d = d0;
+                while (d < d1) {
+                    // Which pair owns output d.
+                    int plo = 0, phi = npairs - 1;
+                    while (plo < phi) {
+                        const int pm = (plo + phi + 1) >> 1;
+                        if (bb[pm] <= d) plo = pm; else phi = pm - 1;
+                    }
+                    const int s0 = ba[2 * plo];
+                    const int e0 = ba[2 * plo + 1];
+                    const int s1 = e0;
+                    const int e1 = (2 * plo + 2 <= nlist) ? ba[2 * plo + 2] : total;
+                    const int n0 = e0 - s0, n1 = e1 - s1;
+                    const int diag = d - s0;
+
+                    // The largest i for which taking i from the first list and
+                    // diag-i from the second is a prefix of the merge. The
+                    // predicate falls from true to false as i grows, so this is
+                    // an ordinary binary search; the bounds keep both indices
+                    // inside their lists, which is why neither end case appears.
+                    int lo = diag - n1 > 0 ? diag - n1 : 0;
+                    int hi = diag < n0 ? diag : n0;
+                    while (lo < hi) {
+                        const int mid = (lo + hi + 1) >> 1;
+                        if (descSuffixLessFrom(t, n, a[s1 + diag - mid],
+                                               a[s0 + mid - 1], 4))
+                            hi = mid - 1;
+                        else
+                            lo = mid;
+                    }
+
+                    int i = lo, j = diag - lo;
+                    const int endp = bb[plo + 1];
+                    const int stop = d1 < endp ? d1 : endp;
+                    while (d < stop) {
+                        const bool takeB = (i >= n0) ||
+                            (j < n1 && descSuffixLessFrom(t, n, a[s1 + j],
+                                                          a[s0 + i], 4));
+                        b[d++] = takeB ? a[s1 + j++] : a[s0 + i++];
+                    }
+                }
+                __syncthreads();
+
+                int32_t* tv = a; a = b; b = tv;
+                int32_t* tb = ba; ba = bb; bb = tb;
+                nlist = npairs;
+            }
+
+            // An odd number of rounds leaves the answer in the scratch half.
+            if (a != sa + o) {
+                for (int x = tid; x < total; x += BR_BLOCK) sa[o + x] = a[x];
+            }
+            __syncthreads();
         }
     }
 #endif

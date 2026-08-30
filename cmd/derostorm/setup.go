@@ -29,16 +29,16 @@ type setupUI struct {
 
 func (s *setupUI) title(text string) {
 	t := s.theme
-	fmt.Fprintf(s.out, "\n  %s\n", t.c(t.Accent+t.Bold, text))
+	fmt.Fprintf(s.out, "\n  %s\n", t.C(t.Accent+t.Bold, text))
 }
 
 func (s *setupUI) note(text string) {
-	fmt.Fprintf(s.out, "  %s\n", s.theme.c(s.theme.Dim, text))
+	fmt.Fprintf(s.out, "  %s\n", s.theme.C(s.theme.Dim, text))
 }
 
 func (s *setupUI) fail(text string) {
 	t := s.theme
-	fmt.Fprintf(s.out, "  %s %s\n", t.c(t.Err, "×"), t.c(t.Err, text))
+	fmt.Fprintf(s.out, "  %s %s\n", t.C(t.Err, "×"), t.C(t.Err, text))
 }
 
 // ask prints one numbered prompt and returns the trimmed answer, or def when
@@ -48,15 +48,15 @@ func (s *setupUI) ask(step int, label, def, help string) (string, error) {
 	t := s.theme
 	fmt.Fprintln(s.out)
 	fmt.Fprintf(s.out, "  %s  %s\n",
-		t.c(t.Accent2, fmt.Sprintf("%d/%d", step, s.total)),
-		t.c(t.Text+t.Bold, label))
+		t.C(t.Accent2, fmt.Sprintf("%d/%d", step, s.total)),
+		t.C(t.Text+t.Bold, label))
 	if help != "" {
-		fmt.Fprintf(s.out, "       %s\n", t.c(t.Dim, help))
+		fmt.Fprintf(s.out, "       %s\n", t.C(t.Dim, help))
 	}
 	if def != "" {
-		fmt.Fprintf(s.out, "       %s\n", t.c(t.Muted, "default: "+def))
+		fmt.Fprintf(s.out, "       %s\n", t.C(t.Muted, "default: "+def))
 	}
-	fmt.Fprintf(s.out, "  %s ", t.c(t.Accent, "›"))
+	fmt.Fprintf(s.out, "  %s ", t.C(t.Accent, "›"))
 
 	line, err := s.in.ReadString('\n')
 	if err != nil && line == "" {
@@ -180,7 +180,7 @@ func RunSetup(theme *Theme, preferred, path string, existing *Config, flagTestne
 			continue
 		}
 		cfg.Wallet = addr.String()
-		fmt.Fprintf(s.out, "  %s %s\n", t.c(t.Good, "✓"), t.c(t.Dim, "valid "+netName(cfg.Testnet)+" address"))
+		fmt.Fprintf(s.out, "  %s %s\n", t.C(t.Good, "✓"), t.C(t.Dim, "valid "+netName(cfg.Testnet)+" address"))
 		break
 	}
 
@@ -227,8 +227,8 @@ func RunSetup(theme *Theme, preferred, path string, existing *Config, flagTestne
 			continue
 		}
 		if n > cpus {
-			fmt.Fprintf(s.out, "  %s %s\n", t.c(t.Warn, "!"),
-				t.c(t.Dim, fmt.Sprintf("more threads than CPUs (%d) — this is normally slower, not faster", cpus)))
+			fmt.Fprintf(s.out, "  %s %s\n", t.C(t.Warn, "!"),
+				t.C(t.Dim, fmt.Sprintf("more threads than CPUs (%d) — this is normally slower, not faster", cpus)))
 		}
 		cfg.Threads = n
 		break
@@ -257,8 +257,8 @@ func RunSetup(theme *Theme, preferred, path string, existing *Config, flagTestne
 				for i := 0; i < gpuCount && i < maxGPUs; i++ {
 					cfg.GPUs = append(cfg.GPUs, i)
 				}
-				fmt.Fprintf(s.out, "  %s %s\n", t.c(t.Good, "✓"),
-					t.c(t.Dim, fmt.Sprintf("mining on %d GPU(s) as well as %d CPU threads",
+				fmt.Fprintf(s.out, "  %s %s\n", t.C(t.Good, "✓"),
+					t.C(t.Dim, fmt.Sprintf("mining on %d GPU(s) as well as %d CPU threads",
 						len(cfg.GPUs), cfg.Threads)))
 			}
 			break
@@ -286,8 +286,8 @@ func RunSetup(theme *Theme, preferred, path string, existing *Config, flagTestne
 		return nil, fmt.Errorf("could not save config: %w", err)
 	}
 
-	fmt.Fprintf(s.out, "\n  %s %s\n", t.c(t.Good, "✓"), t.c(t.Text, "saved to "+path))
-	fmt.Fprintf(s.out, "  %s\n\n", t.c(t.Dim, "run with --setup any time to change these"))
+	fmt.Fprintf(s.out, "\n  %s %s\n", t.C(t.Good, "✓"), t.C(t.Text, "saved to "+path))
+	fmt.Fprintf(s.out, "  %s\n\n", t.C(t.Dim, "run with --setup any time to change these"))
 	return cfg, nil
 }
 

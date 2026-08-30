@@ -40,7 +40,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION=1.4.1
+VERSION=1.5.0
 PKG=./cmd/derostorm
 BOUNDS_PKG=github.com/deroproject/derohe/astrobwt/astrobwtv3
 LDFLAGS="-s -w"
@@ -94,9 +94,10 @@ mkdir -p "$OUTDIR"
 #
 # Which ones a build needs is decided by build tags, not by the host:
 #
-#   windows/amd64   derostorm_gpu.dll   gpu/buildlib.bat   (built on Windows)
-#                   derostorm_sa.dll    native/build.bat   (built on Windows)
-#   linux/amd64     libderostorm_gpu.so gpu/buildlib.sh    (built on Linux)
+#   windows/amd64   derostorm_gpu.dll    gpu/buildlib.bat     (built on Windows)
+#                   derostorm_sa.dll     native/build.bat     (built on Windows)
+#   linux/amd64     libderostorm_gpu.so  gpu/buildlib.sh      (built on Linux)
+#                   libderostorm_sa.so   native/buildlib.sh   (built on Linux)
 #   everything else nothing
 #
 # Checking all three whatever the target is what an earlier version did, and it
@@ -115,7 +116,8 @@ check_embedded() {
   case "$goos/$goarch" in
     windows/*)   entries="cmd/derostorm/derostorm_gpu.dll:gpu/buildlib.bat, on Windows
 cmd/derostorm/derostorm_sa.dll:native/build.bat, on Windows" ;;
-    linux/amd64) entries="cmd/derostorm/libderostorm_gpu.so:gpu/buildlib.sh, on Linux" ;;
+    linux/amd64) entries="cmd/derostorm/libderostorm_gpu.so:gpu/buildlib.sh, on Linux
+cmd/derostorm/libderostorm_sa.so:native/buildlib.sh, on Linux" ;;
     *)           return 0 ;;
   esac
   while IFS= read -r entry; do

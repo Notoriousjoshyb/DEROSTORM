@@ -27,10 +27,10 @@ const gpuLibFile = "libderostorm_gpu.so"
 // toolkit is installed, while .so.1 ships with the driver itself.
 const nvmlLibName = "libnvidia-ml.so.1"
 
-// openGPULibrary dlopens the extracted library and returns a lookup for its
-// symbols. purego does this without cgo, which is the whole point: the Linux
+// openNativeLibrary dlopens a library by path and returns a lookup for its
+// symbols. Used for both embedded libraries and for NVML. purego does this without cgo, which is the whole point: the Linux
 // miner is cross-compiled from Windows, and cgo would have ended that.
-func openGPULibrary(path string) (func(string) (uintptr, error), error) {
+func openNativeLibrary(path string) (func(string) (uintptr, error), error) {
 	// RTLD_NOW so an unresolved symbol is an error here rather than a crash at
 	// some later call, and RTLD_LOCAL because nothing else in the process wants
 	// these names -- the CUDA runtime is linked in statically, so there is no

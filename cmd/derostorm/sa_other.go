@@ -1,18 +1,26 @@
-//go:build !windows
+//go:build !windows && !(linux && amd64)
 
 package main
 
-// The faster suffix sort is packaged as a Windows DLL embedded in the
-// executable; see sa_windows.go. The library itself (libsais) is portable C, so
-// the same trick needs a .so or .dylib plus dlopen here, exactly as GPU support
-// does. Until that exists these builds use the Go SA-IS, which is what every
-// build used before and is correct, just slower.
+// The faster suffix sort is a C library embedded in the executable and bound at
+// run time; see sa_lib.go. There is one built for windows/amd64 and one for
+// linux/amd64, and nothing for the targets this file covers, so these builds
+// use the Go SA-IS -- what every build used before, correct, just slower.
 //
-// Shape matches sa_windows.go so main.go needs no build tag of its own.
+// The reason differs by target, and only one of them is real work:
+//
+//   darwin/amd64   Nothing but packaging. The sort is the same x86 code and
+//                  would run; it needs a .dylib built on a Mac, which is a
+//                  machine this project does not have.
+//   darwin/arm64   A port. The descriptor merge's scatter is AVX2 and the
+//   linux/arm64    paired hash is the x86 SHA extensions, so both need
+//                  rewriting in NEON before there is anything to embed.
+//
+// Shape matches sa_lib.go so main.go needs no build tag of its own.
 
 // InstallFastSuffixSort does nothing here and says so.
 func InstallFastSuffixSort() (string, bool) {
-	return "suffix sort: built-in (the faster library is Windows-only so far)", false
+	return "suffix sort: built-in (no faster library is built for this platform)", false
 }
 
 // PairedSHAAvailable reports whether nonces should be hashed two at a time. The

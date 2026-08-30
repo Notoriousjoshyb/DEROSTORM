@@ -40,6 +40,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"embed"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -80,18 +81,22 @@ var (
 	libErr  error
 )
 
-// extractLib writes the embedded library somewhere stable and returns its path.
-// The name carries a hash of the contents, so a rebuilt library lands beside
-// the old one instead of failing to overwrite a copy some other process has
-// open.
-func extractLib() (string, error) {
-	data, err := gpuLibFS.ReadFile(gpuLibFile)
+// extractEmbeddedLib writes an embedded library somewhere stable and returns
+// its path. The name carries a hash of the contents, so a rebuilt library lands
+// beside the old one instead of failing to overwrite a copy some other process
+// has open.
+//
+// Shared with the suffix-sort library in sa_lib.go, which is packaged exactly
+// this way and for the same reasons. Both are embedded on precisely the
+// platforms this file is built for, so one copy serves both.
+func extractEmbeddedLib(libFS embed.FS, file string) (string, error) {
+	data, err := libFS.ReadFile(file)
 	if err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(data)
-	ext := filepath.Ext(gpuLibFile)
-	name := strings.TrimSuffix(gpuLibFile, ext) + "-" + hex.EncodeToString(sum[:6]) + ext
+	ext := filepath.Ext(file)
+	name := strings.TrimSuffix(file, ext) + "-" + hex.EncodeToString(sum[:6]) + ext
 
 	base, err := os.UserCacheDir()
 	if err != nil {
@@ -146,12 +151,12 @@ func extractLib() (string, error) {
 // including a failure, is remembered.
 func loadGPU() error {
 	libOnce.Do(func() {
-		path, err := extractLib()
+		path, err := extractEmbeddedLib(gpuLibFS, gpuLibFile)
 		if err != nil {
 			libErr = fmt.Errorf("cannot unpack the GPU library: %w", err)
 			return
 		}
-		sym, err := openGPULibrary(path)
+		sym, err := openNativeLibrary(path)
 		if err != nil {
 			libErr = fmt.Errorf("cannot load the GPU library: %w", err)
 			return

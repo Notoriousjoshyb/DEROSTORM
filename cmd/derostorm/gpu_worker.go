@@ -207,7 +207,7 @@ func (e *Engine) RunGPUMiner(device, batch, blocks int, stop <-chan struct{}) {
 				binary.BigEndian.PutUint32(work[block.MINIBLOCK_SIZE-5:], hit)
 				powhash := astrobwtv3.AstroBWTv3_scratch(work[:], scratch)
 				if target.Meets(&powhash) {
-					e.submit(myjob, work[:])
+					e.submit(myjob, work[:], &powhash)
 				} else {
 					// The GPU claimed a share the CPU does not agree with. That
 					// is a hardware fault, not a rounding difference, so say so

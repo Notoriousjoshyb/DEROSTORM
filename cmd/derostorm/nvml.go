@@ -76,7 +76,7 @@ func openNVML(devices []int) string {
 	}
 	note := ""
 	nvmlOnce.Do(func() {
-		sym, err := openGPULibrary(nvmlLibName)
+		sym, err := openNativeLibrary(nvmlLibName)
 		if err != nil {
 			note = "GPU telemetry unavailable: cannot load " + nvmlLibName
 			return
