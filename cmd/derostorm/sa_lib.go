@@ -22,8 +22,10 @@ package main
 // per platform is two copies of one thing falling out of step unnoticed.
 //
 // If anything at all goes wrong -- no AVX2, library missing, entry point
-// missing, self-test disagreeing -- this reports why and the miner uses the Go
-// sort. The only thing lost is the speed.
+// missing, self-test disagreeing -- this reports why and the miner uses the
+// portable Go descriptor sort. That is the same algorithm as the C, not the
+// Go SA-IS, so a missing library is a few percent rather than a quarter of
+// the hashrate.
 
 import (
 	"errors"
@@ -33,6 +35,7 @@ import (
 
 	"github.com/deroproject/derohe/astrobwt/astrobwtv3"
 	"github.com/ebitengine/purego"
+	"github.com/notoriousjoshyb/derostorm/internal/dsa"
 	"golang.org/x/sys/cpu"
 )
 
@@ -163,7 +166,8 @@ func fastSuffixSort(text []byte, sa []int32) bool {
 // did in words fit for the console. Called once, before mining starts.
 func InstallFastSuffixSort() (string, bool) {
 	if err := loadSA(); err != nil {
-		return err.Error() + " — using the built-in sort", false
+		astrobwtv3.SuffixSort = dsa.SuffixArray
+		return err.Error() + " — using the portable descriptor sort", true
 	}
 	astrobwtv3.SuffixSort = fastSuffixSort
 	v := saVersion

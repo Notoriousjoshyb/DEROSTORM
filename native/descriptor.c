@@ -72,13 +72,29 @@
 
 #include "descriptor.h"
 
-/* AVX2 is used in one place, the scatter in the merge. MSVC does not define
- * __AVX2__ from /arch:AVX2, so this asks the other way round: __AVX2__ for the
- * compilers that do define it, and the MSVC AVX flag for the one that does not.
+/* AVX2 is used in the merge scatter, the run-boundary popcount, the constant
+ * column mask, and the suffix comparison. MSVC does not define __AVX2__ from
+ * /arch:AVX2, so this asks the other way round: __AVX2__ for the compilers that
+ * do define it, and the MSVC AVX flag for the one that does not.
  * Define DSA_NO_AVX2 to force the scalar path. */
 #if !defined(DSA_NO_AVX2) && (defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX__)))
 #define DSA_AVX2 1
 #include <immintrin.h>
+#endif
+
+/* NEON is the same three places on arm64 -- Apple Silicon and linux/arm64.
+ * The masked store has no NEON equivalent of _mm256_maskstore_epi32, so that
+ * one stays a short scalar write; everything that was a 32-byte vector on
+ * x86 is a 16-byte vector here. */
+#if !defined(DSA_AVX2) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+#define DSA_NEON 1
+#include <arm_neon.h>
+#endif
+
+#if defined(_MSC_VER)
+#define DSA_CTZ32(v) _tzcnt_u32(v)
+#elif defined(__GNUC__) || defined(__clang__)
+#define DSA_CTZ32(v) ((uint32_t)__builtin_ctz(v))
 #endif
 
 #if defined(_MSC_VER)
@@ -372,33 +388,83 @@ static inline uint32_t key32(const uint8_t* t, size_t n, size_t p)
     return k;
 }
 
-/* suffix_less is the tie-break, used only where four bytes were not enough.
+/* suffix_less_from is the tie-break, used where the leading key bytes were
+ * not enough. `from` is a count of leading bytes the caller already knows are
+ * equal -- a colliding key group agrees on DSA_KEY_BYTES by definition -- so
+ * the comparison starts past them rather than gathering them again and finding
+ * them equal. The GPU does the same (descSuffixLessFrom); the CPU used not to,
+ * and every merge comparison opened by re-proving the fact that put the two
+ * suffixes in the same group.
  *
  * memcmp is the obvious body and the wrong one. The length handed to it is
  * n - max(a,b), tens of thousands of bytes, so it is a call into a routine that
  * sets up an alignment-handling loop -- for a comparison that in this text
  * decides within the first few bytes almost every time. Comparing 32 bytes
- * inline first, eight at a time, settles nearly all of them without the call,
- * and memcmp still finishes the rare pair that shares a long prefix.
+ * inline first, with a vector compare where we have one, settles nearly all of
+ * them without the call, and memcmp still finishes the rare pair that shares a
+ * long prefix.
  *
  * The byte swap is what makes an integer comparison give the byte order: on a
  * little-endian load the first byte of the text lands in the low bits, so it
  * has to be moved to the top before comparing as a number. */
-static inline int suffix_less(const uint8_t* t, size_t n, uint32_t a, uint32_t b)
+static inline int suffix_less_from(const uint8_t* t, size_t n, uint32_t a, uint32_t b,
+                                    uint32_t from)
 {
     PROF_STAT(ST_CMP, 1);
     const size_t la = n - a, lb = n - b;
     const size_t m = la < lb ? la : lb;
-    const size_t q = m < 32 ? (m & ~(size_t)7) : 32;
-    for (size_t i = 0; i < q; i += 8) {
+    size_t i = (m >= (size_t)from) ? (size_t)from : 0;
+
+#if defined(DSA_AVX2)
+    /* 32 bytes at a time. Colliding suffixes share a long prefix by
+     * construction -- mean LCP on this data is ~97 bytes -- so the 8-byte
+     * loop was twelve matching iterations before a decision. One vector
+     * compare is three instructions for the same 32 bytes. */
+    for (; i + 32 <= m; i += 32) {
+        const __m256i x = _mm256_loadu_si256((const __m256i*)(t + a + i));
+        const __m256i y = _mm256_loadu_si256((const __m256i*)(t + b + i));
+        const uint32_t eq =
+            (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y));
+        if (eq != 0xFFFFFFFFu) {
+            const uint32_t tz = DSA_CTZ32(~eq);
+            return t[a + i + tz] < t[b + i + tz];
+        }
+    }
+#elif defined(DSA_NEON)
+    for (; i + 16 <= m; i += 16) {
+        const uint8x16_t x = vld1q_u8(t + a + i);
+        const uint8x16_t y = vld1q_u8(t + b + i);
+        const uint8x16_t eq = vceqq_u8(x, y);
+        const uint64x2_t eq64 = vreinterpretq_u64_u8(eq);
+        if (vgetq_lane_u64(eq64, 0) != ~0ull || vgetq_lane_u64(eq64, 1) != ~0ull) {
+            const uint64_t lo = vgetq_lane_u64(eq64, 0);
+            if (lo != ~0ull) {
+                const uint32_t tz = (uint32_t)__builtin_ctzll(~lo);
+                return t[a + i + tz / 8] < t[b + i + tz / 8];
+            }
+            const uint64_t hi = vgetq_lane_u64(eq64, 1);
+            const uint32_t tz = (uint32_t)__builtin_ctzll(~hi);
+            return t[a + i + 8 + tz / 8] < t[b + i + 8 + tz / 8];
+        }
+    }
+#endif
+
+    const size_t remain = m - i;
+    const size_t q = remain < 32 ? (remain & ~(size_t)7) : 32;
+    for (size_t k = 0; k < q; k += 8) {
         uint64_t x, y;
-        memcpy(&x, t + a + i, 8);
-        memcpy(&y, t + b + i, 8);
+        memcpy(&x, t + a + i + k, 8);
+        memcpy(&y, t + b + i + k, 8);
         if (x != y) return DSA_BSWAP64(x) < DSA_BSWAP64(y);
     }
-    const int c = memcmp(t + a + q, t + b + q, m - q);
+    const int c = memcmp(t + a + i + q, t + b + i + q, remain - q);
     if (c != 0) return c < 0;
     return la < lb;   /* a prefix sorts before what it prefixes */
+}
+
+static inline int suffix_less(const uint8_t* t, size_t n, uint32_t a, uint32_t b)
+{
+    return suffix_less_from(t, n, a, b, 0);
 }
 
 /* ---------------------------------------------------------------------------
@@ -519,6 +585,92 @@ static inline void column_step(const uint8_t* t, uint32_t* order, uint32_t* tmp,
     memcpy(order, tmp, blocks * sizeof(uint32_t));
 }
 
+/* column_step_keys is column_step with the keys riding along.
+ *
+ * The walk now slides a key per block rather than re-reading four text bytes
+ * at every column -- see emit_run. Stepping one column left then has to
+ * permute those keys with the order, or they stop corresponding. The sort is
+ * still by one byte (the new leading byte of the slid key), stably, so the
+ * three bodies below are the same three as column_step, just moving two
+ * arrays instead of one. */
+static inline void column_step_keys(uint32_t* order, uint32_t* keys, uint32_t* tmp,
+                                    uint32_t blocks)
+{
+    const uint32_t top = 8u * (DSA_KEY_BYTES - 1);
+
+    if (blocks == 4) {
+        const uint32_t v0 = ((keys[0] >> top) << 9) | 0u;
+        const uint32_t v1 = ((keys[1] >> top) << 9) | 1u;
+        const uint32_t v2 = ((keys[2] >> top) << 9) | 2u;
+        const uint32_t v3 = ((keys[3] >> top) << 9) | 3u;
+        const uint32_t r0 = (uint32_t)(v1 < v0) + (uint32_t)(v2 < v0) + (uint32_t)(v3 < v0);
+        const uint32_t r1 = (uint32_t)(v0 < v1) + (uint32_t)(v2 < v1) + (uint32_t)(v3 < v1);
+        const uint32_t r2 = (uint32_t)(v0 < v2) + (uint32_t)(v1 < v2) + (uint32_t)(v3 < v2);
+        const uint32_t r3 = (uint32_t)(v0 < v3) + (uint32_t)(v1 < v3) + (uint32_t)(v2 < v3);
+        uint32_t ko[4], kk[4];
+        ko[r0] = order[0]; kk[r0] = keys[0];
+        ko[r1] = order[1]; kk[r1] = keys[1];
+        ko[r2] = order[2]; kk[r2] = keys[2];
+        ko[r3] = order[3]; kk[r3] = keys[3];
+        memcpy(order, ko, 4 * sizeof(uint32_t));
+        memcpy(keys, kk, 4 * sizeof(uint32_t));
+        return;
+    }
+
+    if (blocks <= DSA_RANK_MAX) {
+        uint32_t v[DSA_RANK_MAX];
+        uint32_t ko[DSA_RANK_MAX], kk[DSA_RANK_MAX];
+        for (uint32_t x = 0; x < blocks; x++) {
+            v[x] = ((keys[x] >> top) << 9) | x;
+        }
+        for (uint32_t x = 0; x < blocks; x++) {
+            uint32_t r = 0;
+            for (uint32_t y = 0; y < blocks; y++) r += (v[y] < v[x]);
+            ko[r] = order[x];
+            kk[r] = keys[x];
+        }
+        memcpy(order, ko, blocks * sizeof(uint32_t));
+        memcpy(keys, kk, blocks * sizeof(uint32_t));
+        return;
+    }
+
+    if (blocks < DSA_COUNT_MIN) {
+        for (uint32_t x = 1; x < blocks; x++) {
+            const uint32_t vo = order[x];
+            const uint32_t vk = keys[x];
+            const uint32_t kb = vk >> top;
+            uint32_t y = x;
+            while (y > 0 && (keys[y - 1] >> top) > kb) {
+                order[y] = order[y - 1];
+                keys[y] = keys[y - 1];
+                y--;
+            }
+            order[y] = vo;
+            keys[y] = vk;
+        }
+        return;
+    }
+
+    uint32_t cnt[256];
+    memset(cnt, 0, sizeof(cnt));
+    for (uint32_t x = 0; x < blocks; x++) cnt[keys[x] >> top]++;
+
+    uint32_t sum = 0;
+    for (uint32_t b = 0; b < 256; b++) {
+        const uint32_t c = cnt[b];
+        cnt[b] = sum;
+        sum += c;
+    }
+    uint32_t ktmp[DSA_RUN_MAX];
+    for (uint32_t x = 0; x < blocks; x++) {
+        const uint32_t slot = cnt[keys[x] >> top]++;
+        tmp[slot] = order[x];
+        ktmp[slot] = keys[x];
+    }
+    memcpy(order, tmp, blocks * sizeof(uint32_t));
+    memcpy(keys, ktmp, blocks * sizeof(uint32_t));
+}
+
 /* ---------------------------------------------------------------------------
  * the column walk
  * ------------------------------------------------------------------------ */
@@ -587,6 +739,19 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
                                 _mm256_and_si256(acc, one));
         }
     }
+#elif defined(DSA_NEON)
+    {
+        const uint8_t* const b0 = t + base;
+        const uint8x16_t one = vdupq_n_u8(1);
+        for (uint32_t off = 0; off < DSA_BLOCK; off += 16) {
+            const uint8x16_t v0 = vld1q_u8(b0 + off);
+            uint8x16_t acc = vdupq_n_u8(0xFF);
+            for (uint32_t g = 1; g < blocks; g++) {
+                acc = vandq_u8(acc, vceqq_u8(v0, vld1q_u8(b0 + g * DSA_BLOCK + off)));
+            }
+            vst1q_u8(constant + off, vandq_u8(acc, one));
+        }
+    }
 #else
     for (uint32_t rel = 0; rel < DSA_BLOCK; rel++) {
         const uint8_t c = t[base + rel];
@@ -621,56 +786,67 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
     for (uint32_t rel = DSA_BLOCK - DSA_KEY_BYTES + 1; rel < DSA_BLOCK; rel++)
         same_key[rel] = 0;
 
+    /* One key per block, slid rather than re-read. A descriptor key is the
+     * DSA_KEY_BYTES bytes at order[x]+rel, and stepping to column rel-1 keeps
+     * all but one of them:
+     *
+     *   K(q-1) = t[q-1] << 8*(KEY-1) | (K(q) >> 8)
+     *
+     * The GPU found this was a quarter of the sort: the walk was re-reading
+     * four text bytes at every column of every block, three of which it
+     * already had. The identity needs no end-of-text case -- the shift drops
+     * exactly the byte the zero padding would have invented. */
+    uint32_t keys[DSA_RUN_MAX];
+    for (uint32_t i = 0; i < blocks; i++) keys[i] = key32(t, n, order[i] + 255);
+    const uint32_t key_shift = 8u * (DSA_KEY_BYTES - 1);
+
     for (int rel = DSA_BLOCK - 1; rel >= 0; rel--) {
         const uint32_t r = (uint32_t)rel;
 
         /* Split the (already ordered) suffixes into maximal groups sharing
-         * their four leading bytes, and record each as one descriptor. */
+         * their leading key bytes, and record each as one descriptor. */
         if (*desc_len + blocks > desc_room) return 0;   /* grow and retry */
 
 #ifndef DSA_NO_SAME4
         if (same_key[r]) {
-            /* Every block shares this column's four bytes, so there is exactly
+            /* Every block shares this column's key bytes, so there is exactly
              * one group and the scan below would only prove it the long way. */
             Desc* d = &s->desc[*desc_len];
-            d->key = key32(t, n, order[0] + r);
+            d->key = keys[0];
             d->packed = desc_pack((uint32_t)*arena_len, blocks);
             for (uint32_t x = 0; x < blocks; x++) s->arena[(*arena_len)++] = order[x] + r;
             (*desc_len)++;
-#if !defined(DSA_ABLATE)
-            if (rel > 0 && !constant[r - 1])
-                column_step(t, order, s->order2, blocks, r - 1);
+        } else
 #endif
-            continue;
-        }
-#endif
+        {
+            uint32_t i = 0;
+            while (i < blocks) {
+                const uint32_t k = keys[i];
+                uint32_t j = i + 1;
+                while (j < blocks && keys[j] == k) j++;
 
-        uint32_t i = 0;
-        while (i < blocks) {
-            const uint32_t k = key32(t, n, order[i] + r);
-            uint32_t j = i + 1;
-            while (j < blocks && key32(t, n, order[j] + r) == k) j++;
-
-            Desc* d = &s->desc[*desc_len];
-            d->key = k;
-            d->packed = desc_pack((uint32_t)*arena_len, j - i);
-            /* The masked store that is worth 16% in the merge does nothing here
-             * -- 3,999 texts/s against 4,013 -- and the difference is instructive.
-             * There the four stores overlapped, because they wrote a fixed four
-             * words and advanced by a variable length. Here the write advances by
-             * exactly what it wrote, so consecutive stores already abut and there
-             * was never a store-buffer conflict to remove. */
-            for (uint32_t x = i; x < j; x++) s->arena[(*arena_len)++] = order[x] + r;
-            (*desc_len)++;
-            i = j;
+                Desc* d = &s->desc[*desc_len];
+                d->key = k;
+                d->packed = desc_pack((uint32_t)*arena_len, j - i);
+                for (uint32_t x = i; x < j; x++) s->arena[(*arena_len)++] = order[x] + r;
+                (*desc_len)++;
+                i = j;
+            }
         }
 
-        /* Step left. A constant column prepends the same byte to every suffix,
-         * so the order is unchanged and there is nothing to do -- this is where
-         * the time is saved. */
+        if (rel == 0) break;
+
+        /* Slide first, because the keys move whether or not the order does.
+         * A constant column prepends the same byte to every suffix, so the
+         * order is unchanged and there is nothing further to do. */
+        const uint32_t col = r - 1;
+        for (uint32_t x = 0; x < blocks; x++) {
+            const uint8_t c = t[order[x] + col];
+            keys[x] = ((uint32_t)c << key_shift) | (keys[x] >> 8);
+        }
 #if !defined(DSA_ABLATE)
-        if (rel > 0 && !constant[r - 1]) {
-            column_step(t, order, s->order2, blocks, r - 1);
+        if (!constant[col]) {
+            column_step_keys(order, keys, s->order2, blocks);
         }
 #endif
     }
@@ -795,6 +971,13 @@ retry:
                 const uint32_t eq =
                     (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb));
                 diff += 32 - (int)_mm_popcnt_u32(eq);
+            }
+#elif defined(DSA_NEON)
+            for (uint32_t o = 0; o < DSA_BLOCK; o += 16) {
+                const uint8x16_t ne = vmvnq_u8(vceqq_u8(vld1q_u8(a + o), vld1q_u8(b + o)));
+                const uint8x16_t ones = vandq_u8(vshrq_n_u8(ne, 7), vdupq_n_u8(1));
+                const uint64x2_t s = vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(ones)));
+                diff += (int)(vgetq_lane_u64(s, 0) + vgetq_lane_u64(s, 1));
             }
 #else
             for (int i = 0; i < DSA_BLOCK && diff <= DSA_RUN_SPLIT; i++) {
@@ -1019,7 +1202,8 @@ retry:
                         uint32_t p0 = ba[l], e0 = ba[l + 1];
                         uint32_t p1 = ba[l + 1], e1 = ba[l + 2];
                         while (p0 < e0 && p1 < e1)
-                            b[pos++] = suffix_less(t, n, a[p1], a[p0]) ? a[p1++] : a[p0++];
+                            b[pos++] = suffix_less_from(t, n, a[p1], a[p0], DSA_KEY_BYTES)
+                                           ? a[p1++] : a[p0++];
                         while (p0 < e0) b[pos++] = a[p0++];
                         while (p1 < e1) b[pos++] = a[p1++];
                     }

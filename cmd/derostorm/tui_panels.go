@@ -67,6 +67,9 @@ func panelMining(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
 	y := in.Y
 
 	mark, colour, label := stateLabel(s, t, frame)
+	if !s.LastShare.IsZero() && time.Since(s.LastShare) < 700*time.Millisecond {
+		colour = t.Good
+	}
 	num, unit := ui.SplitRate(s.Hashrate)
 
 	if in.H >= 5 && in.W >= 30 {
@@ -79,7 +82,14 @@ func panelMining(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
 			cv.Set(in.Right()-lw, y, []rune(mark)[0], ui.Style{FG: colour})
 			cv.Text(in.Right()-lw+2, y, label, ui.Style{FG: colour, Bold: true})
 			if in.H >= 6 {
-				ui.Sparkline(cv, in.Right()-12, y+2, 12, s.History, t)
+				sw := in.W - w - lw - 3
+				if sw < 8 {
+					sw = 8
+				}
+				if sw > in.W-2 {
+					sw = 12
+				}
+				ui.Sparkline(cv, in.Right()-sw, y+2, sw, s.History, t)
 			}
 		}
 		y += 3
@@ -126,6 +136,11 @@ func panelMining(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
 	// Every source or none. Giving the CPU a bar row and then running out
 	// before the GPU drops the comparison the split exists to make.
 	ownRow := in.W >= 16 && in.Bottom()-y >= 2*len(sources)
+
+	if in.W >= 16 && in.Bottom()-y > len(sources)+1 && (s.GPUs > 0 || s.GPURate > 0) {
+		ui.DrawSplitBar(cv, in.X, y, in.W, s.CPURate/total, s.GPURate/total, t.Accent, t.Accent2, t.Dim)
+		y++
+	}
 
 	for _, row := range sources {
 		if y >= in.Bottom() {

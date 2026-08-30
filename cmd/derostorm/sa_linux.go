@@ -5,12 +5,10 @@ package main
 // The Linux half of the suffix-sort binding: which library is embedded.
 // Everything the miner actually calls is in sa_lib.go.
 //
-// amd64 only, because native/buildlib.sh builds an x86-64 .so and nothing else.
-// The sort is C and would build for arm64, but two of the three things that
-// make it fast here are not portable: descriptor.c's merge scatter is AVX2, and
-// the paired hash is the x86 SHA extensions. An arm64 port is a NEON rewrite of
-// both, not a recompile. Until then those builds take the sa_other.go path and
-// use the Go sort, which is what they did before this file existed.
+// amd64 only, because native/buildlib.sh's default target is an x86-64 .so.
+// darwin and linux/arm64 take sa_other.go: the same descriptor algorithm, either
+// compiled in with cgo (internal/sacgo) when the miner is built on the machine
+// that runs it, or the portable Go port (internal/dsa) when it is not.
 //
 // Built by native/buildlib.sh, which needs gcc. Windows cannot build it -- a
 // Linux .so has to come from a Linux toolchain -- but WSL is enough, and by the

@@ -328,6 +328,8 @@ func run(o runOpts) {
 			Info:        nodes.Info(),
 			Height:      int64(job.Height),
 			Difficulty:  parseUint(job.Difficulty),
+			// DERO difficulty is already in hashes per second, so the job's
+			// difficulty is the network hashrate. See NodeInfo.NetHashrate.
 			NetHashes:   job.Difficultyuint64,
 			Blocks:      job.Blocks,
 			MiniBlocks:  job.MiniBlocks,

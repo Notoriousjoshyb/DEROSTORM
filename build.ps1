@@ -53,15 +53,20 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$Version  = '1.5.0'
+$Version  = '1.5.1'
 $Pkg      = './cmd/derostorm'
 $BoundsPkg = 'github.com/deroproject/derohe/astrobwt/astrobwtv3'
 $LdFlags  = '-s -w'
 
 # -B is passed on amd64 and nowhere else. See boundsFlags below.
 function Get-GcFlags($goarch) {
-    if ($goarch -eq 'amd64') { return "$BoundsPkg=-B" }
-    return ''
+    if ($goarch -eq 'amd64') {
+        return @(
+            "$BoundsPkg=-B"
+            'github.com/notoriousjoshyb/derostorm/internal/dsa=-B'
+        )
+    }
+    return @()
 }
 $OutDir   = Join-Path $PSScriptRoot 'bin'
 
@@ -186,14 +191,19 @@ function Build-Target($goos, $goarch) {
     Write-Host "building $name" -ForegroundColor Cyan
     $env:GOOS = $goos
     $env:GOARCH = $goarch
-    $gc = Get-GcFlags $goarch
-    if ($gc) {
-        go build -trimpath -pgo=auto -gcflags="$gc" -ldflags="$LdFlags" -o $out $Pkg
-    } else {
-        go build -trimpath -pgo=auto -ldflags="$LdFlags" -o $out $Pkg
+    $hostOS = go env GOOS
+    $hostArch = go env GOARCH
+    if ($goos -ne $hostOS -or $goarch -ne $hostArch) {
+        $env:CGO_ENABLED = '0'
     }
+    $gc = Get-GcFlags $goarch
+    $args = @('-trimpath', '-pgo=auto', "-ldflags=$LdFlags", '-o', $out, $Pkg)
+    foreach ($g in $gc) {
+        $args = @("-gcflags=$g") + $args
+    }
+    go build @args
     $code = $LASTEXITCODE
-    Remove-Item Env:GOOS, Env:GOARCH -ErrorAction SilentlyContinue
+    Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
     if ($code -ne 0) { throw "build failed for $goos/$goarch" }
 
     $kb = [math]::Round((Get-Item $out).Length / 1MB, 1)

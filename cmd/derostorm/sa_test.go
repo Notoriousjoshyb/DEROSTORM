@@ -14,6 +14,7 @@ import (
 
 	"github.com/deroproject/derohe/astrobwt/astrobwtv3"
 	"github.com/deroproject/derohe/block"
+	"github.com/notoriousjoshyb/derostorm/internal/dsa"
 )
 
 // withSuffixSort runs f with the hook set to sorter, and restores it after.
@@ -25,27 +26,7 @@ func withSuffixSort(t *testing.T, sorter func([]byte, []int32) bool, f func()) {
 	f()
 }
 
-func TestFastSuffixSortGivesTheSameHash(t *testing.T) {
-	note, ok := InstallFastSuffixSort()
-	// Restore immediately: the rest of the package's tests should run against
-	// whatever they would normally.
-	sorter := astrobwtv3.SuffixSort
-	astrobwtv3.SuffixSort = nil
-	if !ok {
-		t.Skipf("no faster suffix sort here: %s", note)
-	}
-	t.Log(note)
-	if sorter == nil {
-		t.Fatal("InstallFastSuffixSort reported success but installed nothing")
-	}
-
-	scratch := astrobwtv3.Pool.Get().(*astrobwtv3.ScratchData)
-	defer astrobwtv3.Pool.Put(scratch)
-
-	before := astrobwtv3.RecoveredPanics
-
-	// Miniblock-shaped inputs across a nonce sweep, which is what mining does,
-	// plus random ones and every short length, which is what finds the edges.
+func suffixSortTestInputs() [][]byte {
 	var cases [][]byte
 
 	work := make([]byte, block.MINIBLOCK_SIZE)
@@ -84,8 +65,16 @@ func TestFastSuffixSortGivesTheSameHash(t *testing.T) {
 	for i := range ones {
 		ones[i] = 0xff
 	}
-	cases = append(cases, ones)
+	return append(cases, ones)
+}
 
+func checkSuffixSortHashes(t *testing.T, sorter func([]byte, []int32) bool) {
+	t.Helper()
+	scratch := astrobwtv3.Pool.Get().(*astrobwtv3.ScratchData)
+	defer astrobwtv3.Pool.Put(scratch)
+
+	before := astrobwtv3.RecoveredPanics
+	cases := suffixSortTestInputs()
 	for i, in := range cases {
 		var want, got [32]byte
 		withSuffixSort(t, nil, func() {
@@ -95,14 +84,33 @@ func TestFastSuffixSortGivesTheSameHash(t *testing.T) {
 			got = astrobwtv3.AstroBWTv3_scratch(in, scratch)
 		})
 		if got != want {
-			t.Fatalf("case %d (%d bytes): hash differs\n libsais %x\n built-in %x", i, len(in), got, want)
+			t.Fatalf("case %d (%d bytes): hash differs\n fast %x\n built-in %x", i, len(in), got, want)
 		}
 	}
-
 	if p := astrobwtv3.RecoveredPanics - before; p != 0 {
 		t.Fatalf("%d hash(es) panicked and returned a falsified result", p)
 	}
 	t.Logf("%d inputs, every hash identical to the built-in sort", len(cases))
+}
+
+func TestFastSuffixSortGivesTheSameHash(t *testing.T) {
+	note, ok := InstallFastSuffixSort()
+	// Restore immediately: the rest of the package's tests should run against
+	// whatever they would normally.
+	sorter := astrobwtv3.SuffixSort
+	astrobwtv3.SuffixSort = nil
+	if !ok {
+		t.Skipf("no faster suffix sort here: %s", note)
+	}
+	t.Log(note)
+	if sorter == nil {
+		t.Fatal("InstallFastSuffixSort reported success but installed nothing")
+	}
+	checkSuffixSortHashes(t, sorter)
+}
+
+func TestPortableDescriptorGivesTheSameHash(t *testing.T) {
+	checkSuffixSortHashes(t, dsa.SuffixArray)
 }
 
 // A sorter that declines must be fallen back on, not trusted. This is what makes

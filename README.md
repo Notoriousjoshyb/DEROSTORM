@@ -11,7 +11,7 @@ and `astrobwt/difftest` compares the two on every build.
 ```
       ░▒▒▒▒▒░        ██████  ███████ ██████   ██████  ███████ ████████  ██████  ██████  ███    ███
     ░▒▓█████▓▒░      ██   ██ ██      ██   ██ ██    ██ ██         ██    ██    ██ ██   ██ ████  ████  ┌────────┐
-   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.5.0 │
+   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.5.1 │
    ▒███████████▒     ██   ██ ██      ██   ██ ██    ██      ██    ██    ██    ██ ██   ██ ██  ██  ██  └────────┘
     ░▒▓▓█▟▙█▓▒░      ██████  ███████ ██   ██  ██████  ███████    ██     ██████  ██   ██ ██      ██
         ▝█▛                                    ASTROBWTv3 MINER FOR DERO
@@ -48,7 +48,7 @@ and `astrobwt/difftest` compares the two on every build.
  │ T04 ███████████████▌░  91%  ││     ⠈⠑⠐⠂⠤⠄⠤⠠⠤⠠⠤⠒⠊⠁   ⣀⠴⠃      ││ REJECTED             12 ││ LATENCY   42 ms │
  │ +11 more                    ││              ⠄⠠⠠⠠⠐⠐⠂⠉         ││ STALE                -- ││      GOOD       │
  └─────────────────────────────┘└───────────────────────────────┘└─────────────────────────┘└─────────────────┘
- [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.5.0
+ [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.5.1
 ```
 
 Eight screens, one key each. The **dashboard** above is the one you leave up;
@@ -585,7 +585,20 @@ one, which is what most of the diff is and none of the hashrate. The GPU merge
 above is the speed. And Linux got the native suffix sort it had never had: those
 builds were quietly running the Go sort, so the same hardware read about a
 quarter of its Windows hashrate — see [the suffix sort](#cpu) for the numbers and
-why macOS and arm64 still cannot have it.
+why macOS and arm64 still could not have it then. 1.5.1 is that port.
+
+**1.5.1 is the suffix sort on Mac.** Windows and Linux already had the descriptor
+sort; macOS and arm64 were still on the Go SA-IS, about a quarter of the same
+silicon. They now use the same algorithm. GitHub archives are cross-compiled
+with cgo off, so they ship it in Go plus hardware SHA pairing. `./build.sh` on
+the Mac compiles the C sort and ARMv8 SHA-2 pairing into the binary. Darwin
+mining threads request user-interactive QoS so they prefer P-cores.
+
+DERO difficulty is already hashes per second. The console was dividing it by
+the eighteen-second block target and showing the network eighteen times slower
+than it was.
+
+GPU kernels are unchanged from 1.5.0.
 
 **1.4.1 exists for one reason.** The 1.4.0 Linux archives shipped the *previous*
 CUDA kernels: `libderostorm_gpu.so` is built by `nvcc` under Linux, which was
@@ -679,9 +692,9 @@ else — and that showed up as Linux rigs reporting a quarter of the hashrate th
 same hardware managed on Windows. It was never a tuning problem: those builds
 were running the Go sort. `native/buildlib.sh` now builds the `.so`, and
 `--bench` on linux/amd64 reads +248.9% at 8 threads against the Windows
-+260.0% on the same row. macOS and arm64 still use the Go sort, because the
-descriptor merge is AVX2 and the paired hash is the x86 SHA extensions; that is
-a NEON port, not a recompile.
++260.0% on the same row. macOS and arm64 use the same algorithm from 1.5.1:
+NEON in the C sort when the binary is built on the machine, the portable Go
+descriptor otherwise, and ARMv8 SHA-2 pairing either way.
 
 These are whole hashes, not sorts, which is why they sit below the plain
 `--bench` throughput on the same thread count: the two sorts run interleaved so
@@ -1403,9 +1416,15 @@ derostorm/
 │   ├── sa_lib.go           the shared suffix-sort binding
 │   ├── sa_windows.go       embeds the .dll, proves it, installs the hook
 │   ├── sa_linux.go         embeds the .so, same three steps
+│   ├── sa_other.go         darwin / linux-arm64: portable descriptor, then cgo
+│   ├── sa_cgo.go           installs the native sort when built with cgo
 │   ├── sa_test.go          332 inputs through both sorts, hashes compared
 │   ├── sa_bench.go         --bench: the two sorts, interleaved
+│   ├── thread_darwin.go    P-core QoS on macOS
 │   └── default.pgo         profile for -pgo=auto
+├── internal/dsa/           portable descriptor sort (Mac, and the fallback)
+├── internal/sacgo/         cgo bundle of the native sort
+├── internal/shapair/      paired SHA-256 without the native library
 ├── internal/ui/            the widgets the console is drawn from
 │   ├── canvas.go           the cell grid everything writes into
 │   ├── panel.go            bordered boxes and their titles

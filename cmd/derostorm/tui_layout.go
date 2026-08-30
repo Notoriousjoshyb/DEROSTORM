@@ -71,7 +71,7 @@ func drawHeader(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
 	// looks like a rendering fault rather than like a cloud.
 	markW := 0
 	if avail := runY - inner.Y; avail >= len(ui.StormCloud) && inner.W >= 96 {
-		ui.DrawArt(cv, inner.X+2, inner.Y, ui.StormCloud, ui.Shade(t), t.Accent)
+		ui.DrawArt(cv, inner.X+2, inner.Y, ui.StormCloud, ui.StormShade(t, frame), t.Accent)
 		markW = ui.ArtWidth(ui.StormCloud) + 4
 	}
 
@@ -103,7 +103,6 @@ func drawHeader(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
 		cv.TextCenter(nameArea.X, sub, nameArea.W,
 			ui.Clip("ASTROBWTv3 MINER FOR DERO", nameArea.W), ui.Style{FG: t.Muted})
 	}
-	_ = frame
 }
 
 func drawBadge(cv *ui.Canvas, x, y int, s string, t *Theme) {

@@ -66,6 +66,43 @@ func DrawBar(cv *Canvas, x, y, w int, frac float64, fg, track string) {
 	}
 }
 
+// DrawSplitBar is two values sharing one track: CPU then GPU, each in its
+// own colour, so the headline split is a picture rather than two percentages
+// to add up. a and b are fractions of the whole and should sum to at most 1.
+func DrawSplitBar(cv *Canvas, x, y, w int, a, b float64, aFG, bFG, track string) {
+	if w < 1 {
+		return
+	}
+	a, b = clamp01(a), clamp01(b)
+	if a+b > 1 {
+		s := a + b
+		a, b = a/s, b/s
+	}
+	ae := int(a*float64(w)*8 + 0.5)
+	be := int(b*float64(w)*8 + 0.5)
+	i := 0
+	af, ar := ae/8, ae%8
+	for ; i < af && i < w; i++ {
+		cv.Set(x+i, y, BlockFull, Style{FG: aFG})
+	}
+	if ar > 0 && i < w {
+		cv.Set(x+i, y, BarParts[ar-1], Style{FG: aFG})
+		i++
+	}
+	bf, br := be/8, be%8
+	end := i + bf
+	for ; i < end && i < w; i++ {
+		cv.Set(x+i, y, BlockFull, Style{FG: bFG})
+	}
+	if br > 0 && i < w {
+		cv.Set(x+i, y, BarParts[br-1], Style{FG: bFG})
+		i++
+	}
+	for ; i < w; i++ {
+		cv.Set(x+i, y, BlockLight, Style{FG: track})
+	}
+}
+
 // MeterRow is the labelled bar used for the CPU/GPU split and the thread list:
 // name, bar, and a right-aligned figure. Returns nothing; it owns its row.
 //

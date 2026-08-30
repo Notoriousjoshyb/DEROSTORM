@@ -40,7 +40,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION=1.5.0
+VERSION=1.5.1
 PKG=./cmd/derostorm
 BOUNDS_PKG=github.com/deroproject/derohe/astrobwt/astrobwtv3
 LDFLAGS="-s -w"
@@ -148,12 +148,22 @@ build() {
 
   # -B on amd64 and nowhere else; see the note at the top of this file. Empty
   # is a valid -gcflags spec, so the build line stays one shape either way.
-  local gc=""
-  [ "$goarch" = "amd64" ] && gc="${BOUNDS_PKG}=-B"
+  local gc="" gc2=""
+  if [ "$goarch" = "amd64" ]; then
+    gc="${BOUNDS_PKG}=-B"
+    gc2="github.com/notoriousjoshyb/derostorm/internal/dsa=-B"
+  fi
 
-  GOOS="$goos" GOARCH="$goarch" go build \
+  # Cross-compiles cannot use cgo: darwin's native sort is compiled in with
+  # cgo only when this script is running on the Mac that will mine.
+  local cgo=""
+  if [ "$goos" != "$(go env GOOS)" ] || [ "$goarch" != "$(go env GOARCH)" ]; then
+    cgo="CGO_ENABLED=0"
+  fi
+
+  env $cgo GOOS="$goos" GOARCH="$goarch" go build \
     -trimpath -pgo=auto \
-    -gcflags="$gc" -ldflags="$LDFLAGS" \
+    ${gc:+-gcflags="$gc"} ${gc2:+-gcflags="$gc2"} -ldflags="$LDFLAGS" \
     -o "$OUTDIR/$name" "$PKG"
   echo "  -> $OUTDIR/$name"
 }

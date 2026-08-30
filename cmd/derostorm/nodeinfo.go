@@ -46,8 +46,8 @@ type NodeInfo struct {
 	Height     int64
 	TopoHeight int64
 	Difficulty uint64
-	// BlockTime is the chain's target seconds per block, which is what turns a
-	// difficulty into a hashrate.
+	// BlockTime is the chain's target seconds per block, shown next to the
+	// measured average so a stalling chain is visible.
 	BlockTime      uint64
 	AvgBlockTime50 float64
 	Version        string
@@ -63,14 +63,21 @@ type NodeInfo struct {
 }
 
 // NetHashrate is the network's hashrate in H/s, and whether it could be
-// computed. Difficulty divided by the block time: difficulty is the expected
-// number of hashes per block, so at one block every BlockTime seconds the
-// network must be doing that many hashes per second.
+// computed.
+//
+// It is the difficulty, unchanged. That looks like a missing division, so it
+// is worth saying why there is none: DERO's difficulty is already denominated
+// in hashes per second, not in hashes per block. derod agrees with itself on
+// this -- Get_Network_HashRate() in blockchain.go is a one-line return of
+// Get_Difficulty(), and config.go labels a bootstrap difficulty of 10,000,000
+// as "10 MH/s". Dividing by the eighteen-second block target, as a chain with
+// per-block difficulty would need, reported the network eighteen times slower
+// than it was.
 func (n NodeInfo) NetHashrate() (float64, bool) {
-	if !n.OK || n.Difficulty == 0 || n.BlockTime == 0 {
+	if !n.OK || n.Difficulty == 0 {
 		return 0, false
 	}
-	return float64(n.Difficulty) / float64(n.BlockTime), true
+	return float64(n.Difficulty), true
 }
 
 // NodeWatcher polls derod's JSON-RPC in the background.

@@ -65,6 +65,18 @@ func Shade(t *Theme) ArtPalette {
 	}
 }
 
+// StormShade is Shade with the bolt flashing. The cloud is on screen for the
+// whole session, so the flash is slow -- four frames of fourteen -- enough to
+// read as weather and not as a cursor.
+func StormShade(t *Theme, frame int) ArtPalette {
+	pal := Shade(t)
+	if frame%14 < 4 {
+		pal['█'] = t.Accent2
+		pal['▓'] = t.Accent
+	}
+	return pal
+}
+
 // ---------------------------------------------------------------- wordmark
 
 // WordmarkLarge is DEROSTORM at five rows, for a window wide enough to carry
