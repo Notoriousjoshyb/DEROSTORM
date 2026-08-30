@@ -48,6 +48,14 @@ func (g *GPUContext) Search(work []byte, nonceStart uint32, t *Target) ([]uint32
 	return nil, errNoGPUHere
 }
 
+func (g *GPUContext) Submit(work []byte, nonceStart uint32, t *Target) error {
+	return errNoGPUHere
+}
+
+func (g *GPUContext) Collect() ([]uint32, error) { return nil, errNoGPUHere }
+
+func (g *GPUContext) InFlight() int { return 0 }
+
 func (g *GPUContext) HashOne(work []byte, nonce uint32) ([32]byte, error) {
 	return [32]byte{}, errNoGPUHere
 }

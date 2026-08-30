@@ -78,6 +78,29 @@ DSG_API int dsg_search(dsg_context* ctx,
                int target_all,
                uint32_t* nonces, int max_nonces, int* found);
 
+/* dsg_search split in two, so the caller can keep the card fed.
+ *
+ * dsg_search enqueues a batch and then blocks until it is done, which leaves
+ * the GPU idle for the whole of the host's wake-up and re-enqueue. On a machine
+ * whose cores are all busy mining CPU hashes, that gap is a scheduler quantum
+ * and it costs real hashrate.
+ *
+ * dsg_submit queues a batch and returns at once; dsg_collect waits for the
+ * oldest outstanding one. Submitting a second batch before collecting the first
+ * means the card starts it the instant the first ends. Up to two batches may be
+ * in flight; a third dsg_submit fails rather than overwriting a live slot.
+ *
+ * Arguments are as dsg_search's. dsg_inflight reports how many batches are
+ * queued and not yet collected, which is what a caller draining before a job
+ * change loops on. */
+DSG_API int dsg_submit(dsg_context* ctx,
+               const uint8_t work[DSG_WORK_SIZE],
+               uint32_t nonce_start,
+               const uint64_t target[4],
+               int target_all);
+DSG_API int dsg_collect(dsg_context* ctx, uint32_t* nonces, int max_nonces, int* found);
+DSG_API int dsg_inflight(dsg_context* ctx);
+
 /* Hashes one nonce and writes the 32-byte result. For verifying the GPU
  * against the CPU at start-up; not for the hot path. */
 DSG_API int dsg_hash_one(dsg_context* ctx,

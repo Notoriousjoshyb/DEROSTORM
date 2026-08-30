@@ -81,7 +81,18 @@
 // neighbours; counting would make a parallel phase sequential to speed up a
 // sequential one. A grid cut bounds run length just as well.
 //
-// Swept in the README. The answer is the default below.
+// Swept in the README. The answer is the default below, and the sweep is worth
+// keeping in mind before anyone reaches for this again: every cap is far worse
+// than no cap, and not by a little. Measured against the current kernel on a
+// 5080, suffix milliseconds for 512 vectors at 336 blocks:
+//
+//     no cap  130      64  188      32  236      24  274
+//         16  338      12  384       8  515       6  618       4  797
+//
+// The reason is descriptors, not columns. A run split in two emits its own
+// descriptors on both halves, so the count the radix sort and the merge have to
+// carry grows with every cut. Buying threads that way costs more than the
+// threads are worth.
 #ifndef DESC_RUN_MAX
 #define DESC_RUN_MAX 0
 #endif
@@ -112,6 +123,23 @@
 #define DESC_WIDE_LOAD 1
 #endif
 
+// First eight-byte compare via three aligned 32-bit loads instead of two
+// descLoadBE32 (four loads). Kept: ~+1% at 336 on a 5080, and clearer at
+// 168 where thermals are not the measurement.
+#ifndef DESC_LOAD64
+#define DESC_LOAD64 1
+#endif
+
+// Use descLoadBE64 for the wide tail as well as the first eight bytes.
+// At 336 it is a tie; at 42–168 it is ~+1.5%, so it is the default for
+// cards that cannot fill four blocks per SM.
+#ifndef DESC_LOAD64_WIDE
+#define DESC_LOAD64_WIDE 1
+#endif
+#ifndef DESC_WIDE_STEP
+#define DESC_WIDE_STEP 32
+#endif
+
 // Pieces the 256 columns of a run are cut into, each walked by its own thread.
 //
 // The walk is sequential in the columns because column rel-1 inherits the order
@@ -134,6 +162,27 @@
 #endif
 #define DESC_CHUNK_COLS (256 / DESC_CHUNKS)
 
+// Four, and the curve around it is sharp: 2 measures 141 ms and 8 measures 215,
+// against 130 at 4. Eight loses because the order and key tables are indexed by
+// chunk, so doubling the chunks doubles them, and that costs a block per SM.
+//
+// A variable split -- more chunks for long runs, fewer for short ones -- was
+// built and measured and is not here. The imbalance it aimed at is real: the
+// walk's slowest thread takes 1.98x the average (gpu/prof/prof.exe reports it),
+// so a perfectly balanced walk would cost half of what this one does, and the
+// walk is ~32% of the kernel. But splitting columns does not collect it. Every
+// chunk of a run repeats that run's seed insertion sort and its full key read,
+// which is quadratic in the run's length, so the chunks a long run needs to
+// come down to average cost add back about what the balance saves. Swept over
+// five threshold pairs, from boosting runs past 4 blocks to past 16, every one
+// landed within noise of the flat split. The packing that paid for it -- the
+// order table as a block index rather than a text position, two bytes instead
+// of four -- measured neutral on its own and went with it.
+//
+// So the imbalance stands, and it is the largest single thing known to be wrong
+// with this kernel. What it needs is a way to cut the per-chunk seeding cost,
+// not another way to cut the columns.
+//
 // Must divide 256 exactly, or the pieces do not cover the columns and the
 // suffix array is silently wrong -- 3 and 6 were both measured producing a
 // wrong answer before this line existed, because 3*85 and 6*42 leave a
@@ -188,11 +237,60 @@ static_assert(DESC_CHUNKS * DESC_CHUNK_COLS == 256,
 //     257+       0.5          32%
 //
 // The threshold is a trade between the barriers a block-wide merge costs and
-// the serial tail it removes: below ~128 positions the barriers cost more than
-// the tail they remove. The distribution above, and the +9.5% it is worth on a
-// 5080, are written up in the README under "One thread was the phase".
+// the serial tail it removes. 128 was the answer against the old uniform
+// compare; after the merge started with an eight-byte step, 64 pulled more
+// groups onto the block and measured faster at 336 and 672 on a 5080.
 #ifndef DESC_MERGE_WIDE
-#define DESC_MERGE_WIDE 128
+#define DESC_MERGE_WIDE 64
+#endif
+
+// Touch the whole text before the column walk's scattered loads. A PTX
+// L2 prefetch per 64-byte sector beat a coalesced byte touch by ~1% at 336
+// on a 5080, and a 64-byte stride beat 128 by a fraction more.
+#ifndef DESC_PREFETCH_TEXT
+#define DESC_PREFETCH_TEXT 1
+#endif
+#ifndef DESC_PREFETCH_L2
+#define DESC_PREFETCH_L2 1
+#endif
+#ifndef DESC_PREFETCH_L1
+#define DESC_PREFETCH_L1 0
+#endif
+#ifndef DESC_PREFETCH_STRIDE
+#define DESC_PREFETCH_STRIDE 64
+#endif
+
+// Copy the ~69 KB text into dynamic shared so the walk and merge hit SMEM
+// instead of four texts thrashing a 128 KB L1. Caps occupancy at two blocks
+// per SM on a 5080 (register file still allows four). Off until measured.
+#ifndef DESC_TEXT_SHARED
+#define DESC_TEXT_SHARED 0
+#endif
+#ifndef DESC_TEXT_CAP
+#define DESC_TEXT_CAP 70928
+#endif
+#define DESC_LAUNCH_SHARED (BR_SHARED_BYTES + ((DESC_TEXT_SHARED) ? DESC_TEXT_CAP : 0))
+
+// Place the sorted positions with one thread per output position instead of one
+// thread per descriptor.
+//
+// A descriptor is a run of ~5.7 positions and the old scatter gave a whole one
+// to a thread, which then copied it a word at a time. Neighbouring threads were
+// therefore writing addresses ~23 bytes apart and reading arena slots with no
+// relation to each other at all, so a warp's 32 words cost ~28 memory
+// transactions where 4 would do. Measured, that scatter was 26.5% of the suffix
+// kernel -- the largest single phase in it.
+//
+// Turning it inside out fixes the writes completely: output position q always
+// lands at sa[q], so a warp writes 32 consecutive words. What it costs is
+// finding which descriptor owns q, and that is what the tile tables in step 5a
+// are for -- one coalesced pass over the descriptors covering a tile, then a
+// binary search in shared memory rather than a walk through global.
+//
+// Set to 0 for the old one-thread-per-descriptor scatter. Both are exact; this
+// only moves who writes what.
+#ifndef DESC_COOP_SCATTER
+#define DESC_COOP_SCATTER 1
 #endif
 
 // Groups a text may hand to the block-wide merge. There are ~5, and a group
@@ -272,6 +370,24 @@ __device__ __forceinline__ uint32_t descLoadBE32(const uint8_t* t, int p)
 #endif
 }
 
+// Eight text bytes at an arbitrary offset, as one big-endian word.
+//
+// Two descLoadBE32 issue four aligned loads; this issues three because the
+// middle word is shared. The second load of the pair reaches four bytes past
+// p+7 in the worst alignment, still inside the eight-byte text tail.
+#if DESC_LOAD64
+__device__ __forceinline__ uint64_t descLoadBE64(const uint8_t* t, int p)
+{
+    const uintptr_t a = (uintptr_t)(t + p);
+    const uint32_t  m = (uint32_t)(a & 3u);
+    const uint32_t* w = (const uint32_t*)(a & ~(uintptr_t)3);
+    const uint32_t sel = 0x0123u + 0x1111u * m;
+    const uint32_t lo = __byte_perm(w[0], w[1], sel);
+    const uint32_t hi = __byte_perm(w[1], w[2], sel);
+    return ((uint64_t)lo << 32) | (uint64_t)hi;
+}
+#endif
+
 __device__ __forceinline__ uint32_t descKey32(const uint8_t* t, int n, int p)
 {
     if (p + 4 <= n) return descLoadBE32(t, p);
@@ -333,7 +449,52 @@ __device__ __forceinline__ bool descSuffixLessFrom(const uint8_t* t, int n,
     //
     // Colliding suffixes are long-prefix matches by construction -- they come
     // from near-copy blocks -- so reading ahead is rarely wasted. Swept in the
-    // README.
+    // README as a uniform width. The first eight bytes are a different trade:
+    // most merge pairs separate there (the shared key is already skipped), so
+    // one two-word step first, then the wide loop for the tail, issues fewer
+    // loads on the common path without giving up in-flight loads on the long
+    // ones.
+    if (i + 8 <= m) {
+#if DESC_LOAD64
+        const uint64_t wa = descLoadBE64(t, a + i);
+        const uint64_t wb = descLoadBE64(t, b + i);
+        if (wa != wb) return wa < wb;
+#else
+        const uint32_t wa0 = descLoadBE32(t, a + i);
+        const uint32_t wb0 = descLoadBE32(t, b + i);
+        if (wa0 != wb0) return wa0 < wb0;
+        const uint32_t wa1 = descLoadBE32(t, a + i + 4);
+        const uint32_t wb1 = descLoadBE32(t, b + i + 4);
+        if (wa1 != wb1) return wa1 < wb1;
+#endif
+        i += 8;
+    }
+
+#if DESC_LOAD64 && DESC_LOAD64_WIDE
+    for (; i + DESC_WIDE_STEP <= m; i += DESC_WIDE_STEP) {
+        const uint64_t wa0 = descLoadBE64(t, a + i);
+        const uint64_t wb0 = descLoadBE64(t, b + i);
+        if (wa0 != wb0) return wa0 < wb0;
+#if DESC_WIDE_STEP >= 16
+        const uint64_t wa1 = descLoadBE64(t, a + i + 8);
+        const uint64_t wb1 = descLoadBE64(t, b + i + 8);
+        if (wa1 != wb1) return wa1 < wb1;
+#endif
+#if DESC_WIDE_STEP >= 32
+        const uint64_t wa2 = descLoadBE64(t, a + i + 16);
+        const uint64_t wb2 = descLoadBE64(t, b + i + 16);
+        if (wa2 != wb2) return wa2 < wb2;
+        const uint64_t wa3 = descLoadBE64(t, a + i + 24);
+        const uint64_t wb3 = descLoadBE64(t, b + i + 24);
+        if (wa3 != wb3) return wa3 < wb3;
+#endif
+    }
+    for (; i + 8 <= m; i += 8) {
+        const uint64_t wa = descLoadBE64(t, a + i);
+        const uint64_t wb = descLoadBE64(t, b + i);
+        if (wa != wb) return wa < wb;
+    }
+#else
     for (; i + 4 * DESC_CMP_WORDS <= m; i += 4 * DESC_CMP_WORDS) {
         uint32_t wa[DESC_CMP_WORDS], wb[DESC_CMP_WORDS];
 #pragma unroll
@@ -347,6 +508,7 @@ __device__ __forceinline__ bool descSuffixLessFrom(const uint8_t* t, int n,
             if (wa[w] != wb[w]) return wa[w] < wb[w];
         }
     }
+#endif
 
     for (; i + 4 <= m; i += 4) {
         const uint32_t wa = descLoadBE32(t, a + i);
@@ -396,6 +558,16 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
     // step 6b, which parks that list in the same dead array.
     if (tid == 0) { s_ndesc = 0; s_fail = 0; s_bump = 2 * DESC_BIG_MAX; s_nbig = 0; }
     blockRadixInit(sh);   // zeroes the per-tile matrix the sort relies on
+
+#if DESC_TEXT_SHARED
+    if (n + 8 <= DESC_TEXT_CAP) {
+        uint8_t* s_text = (uint8_t*)sh + BR_SHARED_BYTES;
+        for (int i = tid; i < n + 8; i += BR_BLOCK)
+            s_text[i] = (i < n) ? t[i] : (uint8_t)0;
+        __syncthreads();
+        t = s_text;
+    }
+#endif
 
     // ---- 1. run boundaries.
     //
@@ -468,6 +640,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
     if (tid == 0) { s_nruns = nruns; s_start[nruns] = nblocks; }
     __syncthreads();
     PROF_ADD(PH_D_RUNS);
+    PROF_RUNS(s_start, s_nruns);
 
     // ---- 2. the column walk, one thread per run.
     //
@@ -495,6 +668,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
     // walk it always was.
     const int ntask = s_nruns * DESC_CHUNKS;
 
+    PROF_WALK_BEG();
     for (int q = tid; q < ntask; q += BR_BLOCK) {
         const int r = q / DESC_CHUNKS;
         const int c = q - r * DESC_CHUNKS;    // 0 is the top of the text
@@ -528,6 +702,49 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         // The chunk's one full key read; every column below it slides.
         for (int i = 0; i < len; i++) key[i] = descKey32(t, n, ord[i] + hi);
 
+        // Which of this chunk's columns are constant across the run, in address
+        // order. The walk used to rediscover that with `len` scattered loads per
+        // column; a constant column then still paid those loads just to skip the
+        // sort. One sequential pass lets those columns slide from t[base+col]
+        // and skip the gather. Chunks start at 0/64/128/192, so the uint4 path
+        // is aligned on the same texts the run finder already requires.
+        uint8_t col_same[DESC_CHUNK_COLS];
+        {
+            int off = 0;
+            if ((((uintptr_t)(t + base + lo)) & 15u) == 0) {
+                for (; off + 16 <= DESC_CHUNK_COLS; off += 16) {
+                    const uint32_t* b0 =
+                        (const uint32_t*)(t + (size_t)base + lo + off);
+                    const uint32_t a0 = b0[0], a1 = b0[1], a2 = b0[2], a3 = b0[3];
+                    uint32_t m0 = 0xFFFFFFFFu, m1 = m0, m2 = m0, m3 = m0;
+                    for (int g = 1; g < len; g++) {
+                        const uint32_t* bg =
+                            (const uint32_t*)(t + (size_t)base + g * 256 + lo + off);
+                        m0 &= __vcmpeq4(a0, bg[0]);
+                        m1 &= __vcmpeq4(a1, bg[1]);
+                        m2 &= __vcmpeq4(a2, bg[2]);
+                        m3 &= __vcmpeq4(a3, bg[3]);
+                    }
+                    const uint32_t ms[4] = { m0, m1, m2, m3 };
+                    for (int k = 0; k < 4; k++) {
+                        const uint32_t m = ms[k];
+                        col_same[off + 4 * k + 0] = (uint8_t)( m        & 1u);
+                        col_same[off + 4 * k + 1] = (uint8_t)((m >>  8) & 1u);
+                        col_same[off + 4 * k + 2] = (uint8_t)((m >> 16) & 1u);
+                        col_same[off + 4 * k + 3] = (uint8_t)((m >> 24) & 1u);
+                    }
+                }
+            }
+            for (; off < DESC_CHUNK_COLS; off++) {
+                const uint8_t c0 = t[base + lo + off];
+                uint8_t same = 1;
+                for (int g = 1; g < len; g++) {
+                    if (t[base + g * 256 + lo + off] != c0) { same = 0; break; }
+                }
+                col_same[off] = same;
+            }
+        }
+
         for (int rel = hi; rel >= lo; rel--) {
             // Where this column's positions go. Every column of a run emits
             // every one of its blocks exactly once, so the offset is the column
@@ -553,27 +770,23 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
 
             if (rel == lo) break;
 
-            // Step left, reading each block's byte in this column exactly once.
-            // Slide first, because the keys move whether or not the order does.
-            //
-            // The constant test walks ord rather than the blocks in address
-            // order, which is the same set of bytes and so the same predicate:
-            // every block of the run appears in ord exactly once.
+            // Step left. A constant column prepends the same byte to every
+            // suffix, so the order does not change; col_same already knows, and
+            // t[base+col] is that byte.
             const int col = rel - 1;
-            const uint8_t c0 = (uint8_t)t[ord[0] + col];
-            key[0] = ((uint32_t)c0 << 24) | (key[0] >> 8);
-
-            bool constant = true;
-            for (int x = 1; x < len; x++) {
-                const uint8_t c = (uint8_t)t[ord[x] + col];
-                constant &= (c == c0);
-                key[x] = ((uint32_t)c << 24) | (key[x] >> 8);
+            if (col_same[col - lo]) {
+                const uint32_t c0 = (uint32_t)t[base + col];
+                for (int x = 0; x < len; x++)
+                    key[x] = (c0 << 24) | (key[x] >> 8);
+                continue;
             }
 
-            // A column holding the same byte in every block of the run prepends
-            // the same byte to every suffix, so the order does not change and
-            // there is nothing further to do. This is the whole saving.
-            if (constant) continue;
+            const uint8_t c0 = (uint8_t)t[ord[0] + col];
+            key[0] = ((uint32_t)c0 << 24) | (key[0] >> 8);
+            for (int x = 1; x < len; x++) {
+                const uint8_t c = (uint8_t)t[ord[x] + col];
+                key[x] = ((uint32_t)c << 24) | (key[x] >> 8);
+            }
 
             // Stable insertion sort by that one byte, which is now the top byte
             // of the slid key, so this reads no text at all. The existing order
@@ -595,6 +808,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         }
     }
 
+    PROF_WALK_END();
     PROF_ADD(PH_D_WALK);
 
     // The bytes past the last whole block belong to no run, so they get one
@@ -631,19 +845,74 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
     // Two int32 per uint64, so it holds 2n of them and the merge needs 2n.
     int32_t* const dead = (int32_t*)(sorted == sc.words ? sc.words2 : sc.words);
 
-    // ---- 5. the scatter, and the colliding groups, in one pass.
+#if DESC_COOP_SCATTER
+    // ---- 5a. place every position, one thread per output position.
+    //
+    // The output is the arena read in sorted-descriptor order, so output
+    // position q belongs to the descriptor whose span contains it and sa[q] is
+    // where it goes. Driving the loop by q rather than by descriptor is what
+    // makes the writes coalesce; see DESC_COOP_SCATTER.
+    //
+    // Colliding groups are written here too, in arena order rather than sorted
+    // order. That is the order the merge below expects to find them in -- it
+    // used to gather them itself, from the same arena, into the same words --
+    // so both merges lose their gather loop and keep everything else.
+    {
+        // Window tables, carved out of the radix sort's shared scratch, which
+        // is finished with by now.
+        //
+        // The loop walks descriptors, not output positions, and that is the
+        // whole reason it is cheap. A window of BR_BLOCK descriptors is read
+        // once, coalesced, into shared memory; the output positions it covers
+        // -- about 1,460 of them, since a descriptor holds ~5.7 -- are then
+        // written from it. Driving by output instead would reread the offset
+        // array once per tile of 256 outputs, which is 5.7 times the loads for
+        // the same answer, and would take 5.7 times the barriers to do it.
+        int32_t*  const s_beg = (int32_t*)sh;              // first output of k
+        uint32_t* const s_aof = (uint32_t*)(s_beg + BR_BLOCK);  // its arena slot
+        __shared__ int32_t s_end;                          // one past the window
+
+        for (int dbase = 0; dbase < nd; dbase += BR_BLOCK) {
+            const int nt = (nd - dbase) < BR_BLOCK ? (nd - dbase) : BR_BLOCK;
+
+            if (tid < nt) {
+                const uint64_t w = sorted[dbase + tid];
+                const int32_t  e = sc.offs[dbase + tid];
+                s_beg[tid] = e - (int32_t)(w & DESC_LEN_MASK);
+                s_aof[tid] = (uint32_t)((w >> DESC_LEN_BITS) & 0xFFFFFu);
+                if (tid == nt - 1) s_end = e;
+            }
+            __syncthreads();
+
+            for (int q = s_beg[0] + tid; q < s_end; q += BR_BLOCK) {
+                // The last descriptor of the window whose span starts at or
+                // before q owns it. Eight steps of shared memory, against a
+                // walk through global memory.
+                int lo = 0, hi = nt - 1;
+                while (lo < hi) {
+                    const int mid = (lo + hi + 1) >> 1;
+                    if (s_beg[mid] <= q) lo = mid; else hi = mid - 1;
+                }
+                sa[q] = (int32_t)sc.arena[s_aof[lo] + (q - s_beg[lo])];
+            }
+            __syncthreads();
+        }
+    }
+    __syncthreads();
+    PROF_ADD(PH_D_EXPAND);
+#endif
+
+    // ---- 5. the colliding groups.
     //
     // A descriptor whose key nothing else shares is already in its final place
-    // relative to everything else, so its positions go straight out. That is
-    // ~98.7% of them.
+    // relative to everything else -- that is ~98.7% of them, and step 5a has
+    // finished with all of them. What is left is the ~1.3% that collide, whose
+    // positions are in sa but in arena order rather than sorted order.
     //
-    // The scatter and the merge used to be two loops over all nd descriptors,
-    // and both opened by asking the same question of the same words: is this
-    // descriptor the first of its key group, and does the group hold anything
-    // else. Two global reads a descriptor, asked twice -- ~50,000 loads a text
-    // spent re-deriving what the previous loop had already worked out. One pass
-    // answers it once: a lone descriptor is written here, and a group head goes
-    // straight on to the merge below it.
+    // This pass is what finds them: one loop over the descriptors asking, of
+    // each, whether it is the first of a key group and whether that group holds
+    // anything else. Both questions are answered from the two words a thread
+    // has already read, and only a group head does any work.
     //
     // The merge itself is one thread per group for the small ones -- there are
     // ~242 of them a text holding ~7 positions each, and a block-wide treatment
@@ -663,6 +932,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
      * was: the boundary arrays were indexed by output offset over a closed
      * interval, so each group\'s last boundary word landed on the next group\'s
      * first. */
+#if !DESC_COOP_SCATTER
     for (int i = tid; i < nd; i += BR_BLOCK) {
         const uint64_t w = sorted[i];
         const uint32_t len = (uint32_t)(w & DESC_LEN_MASK);
@@ -670,6 +940,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         const int32_t o = sc.offs[i] - (int32_t)len;
         for (uint32_t x = 0; x < len; x++) sa[o + x] = (int32_t)sc.arena[off + x];
     }
+#endif
     __syncthreads();
 #else
     for (int i = tid; i < nd; i += BR_BLOCK) {
@@ -683,11 +954,13 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         const uint32_t len0 = (uint32_t)(w & DESC_LEN_MASK);
         const int32_t o = sc.offs[i] - (int32_t)len0;
 
-        if (j == i + 1) {   // nothing shares this key: straight out
+        if (j == i + 1) {   // nothing shares this key
+#if !DESC_COOP_SCATTER
             const uint32_t off = (uint32_t)((w >> DESC_LEN_BITS) & 0xFFFFFu);
             for (uint32_t x = 0; x < len0; x++)
                 sa[o + x] = (int32_t)sc.arena[off + x];
-            continue;
+#endif
+            continue;   // 5a placed it
         }
 
         const int nlist0 = j - i;
@@ -728,13 +1001,18 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         int32_t* ba = dead + bbase;
         int32_t* bb = dead + bbase + nlist0 + 1;
 
+        // The lists are already end to end at a: 5a wrote every descriptor at
+        // its own output offset, and within a group those offsets are exactly
+        // this layout. All that is left is where each one starts.
         int total = 0;
         for (int k = i; k < j; k++) {
-            const uint64_t w = sorted[k];
-            const uint32_t len = (uint32_t)(w & DESC_LEN_MASK);
-            const uint32_t off = (uint32_t)((w >> DESC_LEN_BITS) & 0xFFFFFu);
+            const uint64_t wk = sorted[k];
+            const uint32_t len = (uint32_t)(wk & DESC_LEN_MASK);
             ba[k - i] = total;
+#if !DESC_COOP_SCATTER
+            const uint32_t off = (uint32_t)((wk >> DESC_LEN_BITS) & 0xFFFFFu);
             for (uint32_t x = 0; x < len; x++) a[total + x] = (int32_t)sc.arena[off + x];
+#endif
             total += (int)len;
         }
         ba[nlist0] = total;
@@ -821,17 +1099,20 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
             int32_t* ba = dead + bbase;
             int32_t* bb = ba + (L + 1);
 
-            // Gather the lists end to end. Each descriptor's start is its own
+            // Where each list starts. Each descriptor's start is its own
             // exclusive offset relative to the group's, so this needs no scan
-            // and no atomic -- one thread per descriptor, all independent.
+            // and no atomic -- one thread per descriptor, all independent. The
+            // data itself is already there; see step 5a.
             for (int k = gi + tid; k < gj; k += BR_BLOCK) {
-                const uint64_t w = sorted[k];
-                const uint32_t len = (uint32_t)(w & DESC_LEN_MASK);
-                const uint32_t off = (uint32_t)((w >> DESC_LEN_BITS) & 0xFFFFFu);
+                const uint64_t wk = sorted[k];
+                const uint32_t len = (uint32_t)(wk & DESC_LEN_MASK);
                 const int32_t base = sc.offs[k] - (int32_t)len - o;
                 ba[k - gi] = base;
+#if !DESC_COOP_SCATTER
+                const uint32_t off = (uint32_t)((wk >> DESC_LEN_BITS) & 0xFFFFFu);
                 for (uint32_t x = 0; x < len; x++)
                     a[base + x] = (int32_t)sc.arena[off + x];
+#endif
             }
             if (tid == 0) ba[L] = total;
             __syncthreads();

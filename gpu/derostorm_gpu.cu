@@ -81,6 +81,41 @@
 #define DSG_BATCH_MAX 32768
 #endif
 
+// Batches that may be in flight at once. Two is the whole point: one running on
+// the card, one queued behind it. See dsg_slot.
+#define DSG_SLOTS 2
+
+// Winning nonces one batch can report. A share is rare enough that this is
+// never approached; it only bounds the buffer.
+#define DSG_MAX_HITS 64
+
+// One batch's private state. Two of these hang off a context, so one batch can
+// be enqueued while the previous one is still on the card. Everything a batch
+// needs that is not shared scratch lives here: the uploaded work and target,
+// the winning nonces, and the event that says the readback is done.
+//
+// The shared scratch (texts, lens, sa, next) needs no second copy. Both batches
+// ride the same stream, so batch N's last kernel has finished before batch
+// N+1's first one starts and they never touch it at the same time. What the
+// second slot buys is not overlap on the card; it is that the card always has
+// the next batch queued behind the one it is running, so it never sits idle
+// while the host wakes up and re-enqueues.
+struct dsg_slot {
+    uint8_t*  dWork;
+    uint64_t* dTarget;
+    uint32_t* dNonces;
+    int32_t*  dFound;
+
+    // Page-locked, so the uploads and the readback are real DMA and the host
+    // never blocks inside a copy.
+    uint8_t*  hWork;
+    uint64_t* hTarget;
+    uint32_t* hNonces;
+    int32_t*  hFound;
+
+    cudaEvent_t done;
+};
+
 struct dsg_context {
     int   device;
     int   batch;        // nonces per dsg_search call
@@ -102,11 +137,13 @@ struct dsg_context {
     // are ordered against each other and against nothing else.
     cudaStream_t stream;
 
-    uint8_t*  dWork;
-    uint64_t* dTarget;
-    uint32_t* dNonces;
-    int32_t*  dFound;
     uint8_t*  dHashOne;
+
+    dsg_slot slot[DSG_SLOTS];
+
+    int head;       // slot the next submit fills
+    int tail;       // slot the next collect waits on
+    int inflight;   // batches submitted and not yet collected
 };
 
 // Per-thread so two GPU workers cannot overwrite each other's message.
@@ -265,6 +302,19 @@ __global__ __launch_bounds__(BR_BLOCK) void suffix_kernel(
         const uint8_t* text = texts + (size_t)h * ASTRO_MAX_TEXT;
         int32_t* out = saOut + (size_t)h * ASTRO_MAX_TEXT;
 
+#if DESC_PREFETCH_TEXT
+#if DESC_PREFETCH_L2
+        for (int i = (int)threadIdx.x * DESC_PREFETCH_STRIDE; i < n; i += BR_BLOCK * DESC_PREFETCH_STRIDE) {
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(text + i));
+        }
+#else
+        for (int i = threadIdx.x; i < n; i += BR_BLOCK) {
+            (void)*(((const volatile uint8_t*)text) + i);
+        }
+#endif
+        __syncthreads();
+#endif
+
         // The descriptor sort first. It knows how stage 1 built this text --
         // whole 256-byte states written out one after another, at most 32 bytes
         // changing between them -- and skips the columns that did not change.
@@ -401,6 +451,11 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
         setErr("shared memory limit", e);
         return DSG_ERR_STATE;
     }
+    if ((e = cudaFuncSetCacheConfig(suffix_kernel,
+                                   cudaFuncCachePreferShared)) != cudaSuccess) {
+        setErr("cache config", e);
+        return DSG_ERR_STATE;
+    }
 
     dsg_context* c = (dsg_context*)calloc(1, sizeof(dsg_context));
     if (!c) { snprintf(g_err, sizeof(g_err), "out of host memory"); return DSG_ERR_ALLOC; }
@@ -487,17 +542,43 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     ALLOC(c->lens,  (size_t)c->chunk * 4);
     ALLOC(c->sa,    (size_t)c->chunk * ASTRO_MAX_TEXT * 4);
     ALLOC(c->next,  sizeof(int32_t));
-    ALLOC(c->dWork, DSG_WORK_SIZE);
-    ALLOC(c->dTarget, 4 * sizeof(uint64_t));
-    ALLOC(c->dNonces, 64 * sizeof(uint32_t));
-    ALLOC(c->dFound, sizeof(int32_t));
     ALLOC(c->dHashOne, 32);
+
+    // A few hundred bytes a slot. The second slot is what lets the miner keep
+    // the card fed, and it costs nothing measurable against the gigabytes the
+    // chunk takes.
+    for (int i = 0; i < DSG_SLOTS; i++) {
+        ALLOC(c->slot[i].dWork,   DSG_WORK_SIZE);
+        ALLOC(c->slot[i].dTarget, 4 * sizeof(uint64_t));
+        ALLOC(c->slot[i].dNonces, DSG_MAX_HITS * sizeof(uint32_t));
+        ALLOC(c->slot[i].dFound,  sizeof(int32_t));
+    }
 #undef ALLOC
+
+#define HALLOC(p, bytes) do {         if ((e = cudaHostAlloc((void**)&(p), (bytes), cudaHostAllocDefault)) != cudaSuccess) {             setErr("cudaHostAlloc", e); dsg_free(c); return DSG_ERR_ALLOC; }     } while (0)
+
+    for (int i = 0; i < DSG_SLOTS; i++) {
+        HALLOC(c->slot[i].hWork,   DSG_WORK_SIZE);
+        HALLOC(c->slot[i].hTarget, 4 * sizeof(uint64_t));
+        HALLOC(c->slot[i].hNonces, DSG_MAX_HITS * sizeof(uint32_t));
+        HALLOC(c->slot[i].hFound,  sizeof(int32_t));
+    }
+#undef HALLOC
 
     // cudaStreamNonBlocking: this must not be serialised against the legacy
     // default stream, which is where the plain cudaMemcpy calls elsewhere run.
     if ((e = cudaStreamCreateWithFlags(&c->stream, cudaStreamNonBlocking)) != cudaSuccess) {
         setErr("cudaStreamCreate", e); dsg_free(c); return DSG_ERR_ALLOC;
+    }
+
+    // cudaEventDisableTiming: these events only ever gate a wait. Timing
+    // events carry extra bookkeeping this does not read.
+    for (int i = 0; i < DSG_SLOTS; i++) {
+        if ((e = cudaEventCreateWithFlags(&c->slot[i].done,
+                                          cudaEventDisableTiming | cudaEventBlockingSync))
+            != cudaSuccess) {
+            setErr("cudaEventCreate", e); dsg_free(c); return DSG_ERR_ALLOC;
+        }
     }
 
     *out = c;
@@ -536,18 +617,30 @@ extern "C" DSG_API void dsg_free(dsg_context* ctx)
 {
     if (!ctx) return;
     cudaSetDevice(ctx->device);
-    if (ctx->stream) cudaStreamDestroy(ctx->stream);
+    // Anything still in flight is reading this memory. Wait for it before any
+    // of it is freed.
+    if (ctx->stream) {
+        cudaStreamSynchronize(ctx->stream);
+        cudaStreamDestroy(ctx->stream);
+    }
     cudaFree(ctx->texts);
     cudaFree(ctx->lens);
     cudaFree(ctx->sa);
     cudaFree(ctx->next);
     cudaFree(ctx->words);
     cudaFree(ctx->keys);
-    cudaFree(ctx->dWork);
-    cudaFree(ctx->dTarget);
-    cudaFree(ctx->dNonces);
-    cudaFree(ctx->dFound);
     cudaFree(ctx->dHashOne);
+    for (int i = 0; i < DSG_SLOTS; i++) {
+        cudaFree(ctx->slot[i].dWork);
+        cudaFree(ctx->slot[i].dTarget);
+        cudaFree(ctx->slot[i].dNonces);
+        cudaFree(ctx->slot[i].dFound);
+        cudaFreeHost(ctx->slot[i].hWork);
+        cudaFreeHost(ctx->slot[i].hTarget);
+        cudaFreeHost(ctx->slot[i].hNonces);
+        cudaFreeHost(ctx->slot[i].hFound);
+        if (ctx->slot[i].done) cudaEventDestroy(ctx->slot[i].done);
+    }
     free(ctx);
 }
 
@@ -557,8 +650,8 @@ extern "C" DSG_API void dsg_free(dsg_context* ctx)
 // Everything goes on the context's one stream, which is what orders the work
 // counter's reset against the kernel that reads it and each chunk against the
 // last.
-static cudaError_t runChunk(dsg_context* c, uint32_t base, int count,
-                            int targetAll, int cap)
+static cudaError_t runChunk(dsg_context* c, const dsg_slot* sl,
+                            uint32_t base, int count, int targetAll, int cap)
 {
     Pool pool; pool.words = c->words; pool.keys = c->keys;
     cudaStream_t st = c->stream;
@@ -566,7 +659,7 @@ static cudaError_t runChunk(dsg_context* c, uint32_t base, int count,
 
     stage1_kernel<<<(count + S1_BLOCK - 1) / S1_BLOCK, S1_BLOCK,
                     S1_BLOCK * S1_STRIDE, st>>>(
-        c->dWork, base, count, c->texts, c->lens);
+        sl->dWork, base, count, c->texts, c->lens);
 
     if ((e = cudaMemsetAsync(c->next, 0, sizeof(int32_t), st)) != cudaSuccess) return e;
 
@@ -575,11 +668,138 @@ static cudaError_t runChunk(dsg_context* c, uint32_t base, int count,
 
     sha_check_kernel<<<(count + 63) / 64, 64, 0, st>>>(
         c->sa, c->lens, count, base,
-        c->dTarget, targetAll, c->dNonces, cap, c->dFound);
+        sl->dTarget, targetAll, sl->dNonces, cap, sl->dFound);
 
     return cudaSuccess;
 }
 
+// Queues one batch and returns without waiting for it.
+//
+// This is the half of dsg_search that decides GPU throughput. The old
+// interface enqueued a batch and then blocked until it was done, which left the
+// card idle for the whole of the host's wake-up, readback and re-enqueue. On a
+// machine whose cores are all busy mining, that wake-up is a scheduler quantum
+// rather than microseconds, and it cost double-digit percentages of GPU
+// hashrate -- visibly so, since dropping a couple of CPU mining threads made
+// the GPU faster.
+//
+// With submit and collect split, the caller keeps a second batch queued behind
+// the running one, so the card starts it the instant the first ends and the
+// host's wake-up happens off the critical path.
+extern "C" DSG_API int dsg_submit(dsg_context* ctx,
+                                  const uint8_t work[DSG_WORK_SIZE],
+                                  uint32_t nonce_start,
+                                  const uint64_t target[4],
+                                  int target_all)
+{
+    if (!ctx || !work || !target) {
+        snprintf(g_err, sizeof(g_err), "dsg_submit: null argument"); return DSG_ERR_STATE;
+    }
+    if (ctx->inflight >= DSG_SLOTS) {
+        snprintf(g_err, sizeof(g_err), "dsg_submit: %d batches already in flight", ctx->inflight);
+        return DSG_ERR_STATE;
+    }
+
+    cudaError_t e;
+    if ((e = cudaSetDevice(ctx->device)) != cudaSuccess) { setErr("cudaSetDevice", e); return DSG_ERR_STATE; }
+
+    dsg_slot* sl = &ctx->slot[ctx->head];
+
+    // Staged through this slot's page-locked buffers. The slot is not in
+    // flight -- inflight was checked above -- so nothing on the card is reading
+    // them, and a page-locked source is what keeps the upload from bouncing
+    // through a driver copy on the calling thread.
+    memcpy(sl->hWork, work, DSG_WORK_SIZE);
+    memcpy(sl->hTarget, target, 4 * sizeof(uint64_t));
+
+    if ((e = cudaMemcpyAsync(sl->dWork, sl->hWork, DSG_WORK_SIZE,
+                             cudaMemcpyHostToDevice, ctx->stream)) != cudaSuccess) {
+        setErr("upload work", e); return DSG_ERR_LAUNCH;
+    }
+    if ((e = cudaMemcpyAsync(sl->dTarget, sl->hTarget, 4 * sizeof(uint64_t),
+                             cudaMemcpyHostToDevice, ctx->stream)) != cudaSuccess) {
+        setErr("upload target", e); return DSG_ERR_LAUNCH;
+    }
+    if ((e = cudaMemsetAsync(sl->dFound, 0, sizeof(int32_t), ctx->stream)) != cudaSuccess) {
+        setErr("reset counter", e); return DSG_ERR_LAUNCH;
+    }
+
+    for (int done = 0; done < ctx->batch; done += ctx->chunk) {
+        const int count = (ctx->batch - done) < ctx->chunk ? (ctx->batch - done) : ctx->chunk;
+        if ((e = runChunk(ctx, sl, nonce_start + (uint32_t)done, count,
+                          target_all, DSG_MAX_HITS)) != cudaSuccess) {
+            setErr("launch", e); return DSG_ERR_LAUNCH;
+        }
+        if ((e = cudaGetLastError()) != cudaSuccess) { setErr("kernel", e); return DSG_ERR_LAUNCH; }
+    }
+
+    // The readback rides the stream too, so by the time the event fires the
+    // results are already in host memory and collect only has to read them.
+    // The whole nonce buffer comes back rather than just the winners, because
+    // the count is not known on the host until it arrives; 256 bytes is
+    // cheaper than the extra round trip it would take to find out first.
+    if ((e = cudaMemcpyAsync(sl->hFound, sl->dFound, sizeof(int32_t),
+                             cudaMemcpyDeviceToHost, ctx->stream)) != cudaSuccess) {
+        setErr("read counter", e); return DSG_ERR_LAUNCH;
+    }
+    if ((e = cudaMemcpyAsync(sl->hNonces, sl->dNonces, DSG_MAX_HITS * sizeof(uint32_t),
+                             cudaMemcpyDeviceToHost, ctx->stream)) != cudaSuccess) {
+        setErr("read nonces", e); return DSG_ERR_LAUNCH;
+    }
+    if ((e = cudaEventRecord(sl->done, ctx->stream)) != cudaSuccess) {
+        setErr("record event", e); return DSG_ERR_LAUNCH;
+    }
+
+    ctx->head = (ctx->head + 1) % DSG_SLOTS;
+    ctx->inflight++;
+    g_err[0] = 0;
+    return DSG_OK;
+}
+
+// Waits for the oldest outstanding batch and reports its winning nonces.
+extern "C" DSG_API int dsg_collect(dsg_context* ctx,
+                                   uint32_t* nonces, int max_nonces, int* found)
+{
+    if (!ctx || !found) { snprintf(g_err, sizeof(g_err), "dsg_collect: null argument"); return DSG_ERR_STATE; }
+    *found = 0;
+    if (ctx->inflight <= 0) {
+        snprintf(g_err, sizeof(g_err), "dsg_collect: nothing in flight");
+        return DSG_ERR_STATE;
+    }
+
+    cudaError_t e;
+    dsg_slot* sl = &ctx->slot[ctx->tail];
+
+    // The event is a blocking one, so this parks the thread rather than
+    // spinning a core the CPU miners want. The card is not waiting on it: the
+    // next batch is already queued behind this one.
+    if ((e = cudaEventSynchronize(sl->done)) != cudaSuccess) {
+        setErr("kernel", e); return DSG_ERR_LAUNCH;
+    }
+    if ((e = cudaGetLastError()) != cudaSuccess) { setErr("kernel", e); return DSG_ERR_LAUNCH; }
+
+    ctx->tail = (ctx->tail + 1) % DSG_SLOTS;
+    ctx->inflight--;
+
+    int cap = max_nonces < DSG_MAX_HITS ? max_nonces : DSG_MAX_HITS;
+    if (cap < 0) cap = 0;
+    int32_t nf = *sl->hFound;
+    if (nf < 0) nf = 0;
+    if (nf > cap) nf = cap;
+    if (nf > 0 && nonces) memcpy(nonces, sl->hNonces, (size_t)nf * sizeof(uint32_t));
+    *found = nf;
+    return DSG_OK;
+}
+
+// How many batches are queued and not yet collected.
+extern "C" DSG_API int dsg_inflight(dsg_context* ctx)
+{
+    return ctx ? ctx->inflight : 0;
+}
+
+// Submit plus collect: one batch, start to finish. Kept for the benchmark and
+// the block-count sweep, which measure one setting at a time and want no second
+// batch blurring the timing. Mining uses dsg_submit and dsg_collect.
 extern "C" DSG_API int dsg_search(dsg_context* ctx,
                                   const uint8_t work[DSG_WORK_SIZE],
                                   uint32_t nonce_start,
@@ -589,54 +809,9 @@ extern "C" DSG_API int dsg_search(dsg_context* ctx,
 {
     if (!ctx || !found) { snprintf(g_err, sizeof(g_err), "dsg_search: null argument"); return DSG_ERR_STATE; }
     *found = 0;
-
-    cudaError_t e;
-    if ((e = cudaSetDevice(ctx->device)) != cudaSuccess) { setErr("cudaSetDevice", e); return DSG_ERR_STATE; }
-
-    // Uploaded on the context's stream, which is what puts them in place before
-    // the stage-1 kernel that reads them. A plain cudaMemcpy would not order
-    // against a non-blocking stream.
-    if ((e = cudaMemcpyAsync(ctx->dWork, work, DSG_WORK_SIZE,
-                             cudaMemcpyHostToDevice, ctx->stream)) != cudaSuccess) {
-        setErr("upload work", e); return DSG_ERR_LAUNCH;
-    }
-    if ((e = cudaMemcpyAsync(ctx->dTarget, target, 4 * sizeof(uint64_t),
-                             cudaMemcpyHostToDevice, ctx->stream)) != cudaSuccess) {
-        setErr("upload target", e); return DSG_ERR_LAUNCH;
-    }
-    if ((e = cudaMemsetAsync(ctx->dFound, 0, sizeof(int32_t), ctx->stream)) != cudaSuccess) {
-        setErr("reset counter", e); return DSG_ERR_LAUNCH;
-    }
-
-    const int cap = max_nonces < 64 ? max_nonces : 64;
-
-    for (int done = 0; done < ctx->batch; done += ctx->chunk) {
-        const int count = (ctx->batch - done) < ctx->chunk ? (ctx->batch - done) : ctx->chunk;
-        if ((e = runChunk(ctx, nonce_start + (uint32_t)done, count,
-                          target_all, cap)) != cudaSuccess) {
-            setErr("launch", e); return DSG_ERR_LAUNCH;
-        }
-        if ((e = cudaGetLastError()) != cudaSuccess) { setErr("kernel", e); return DSG_ERR_LAUNCH; }
-    }
-
-    if ((e = cudaStreamSynchronize(ctx->stream)) != cudaSuccess) {
-        setErr("kernel", e); return DSG_ERR_LAUNCH;
-    }
-    if ((e = cudaGetLastError()) != cudaSuccess) { setErr("kernel", e); return DSG_ERR_LAUNCH; }
-
-    int32_t nf = 0;
-    if ((e = cudaMemcpy(&nf, ctx->dFound, sizeof(int32_t), cudaMemcpyDeviceToHost)) != cudaSuccess) {
-        setErr("read counter", e); return DSG_ERR_LAUNCH;
-    }
-    if (nf > cap) nf = cap;
-    if (nf > 0) {
-        if ((e = cudaMemcpy(nonces, ctx->dNonces, (size_t)nf * sizeof(uint32_t),
-                            cudaMemcpyDeviceToHost)) != cudaSuccess) {
-            setErr("read nonces", e); return DSG_ERR_LAUNCH;
-        }
-    }
-    *found = nf;
-    return DSG_OK;
+    int rc = dsg_submit(ctx, work, nonce_start, target, target_all);
+    if (rc != DSG_OK) return rc;
+    return dsg_collect(ctx, nonces, max_nonces, found);
 }
 
 extern "C" DSG_API int dsg_hash_one(dsg_context* ctx,
@@ -647,7 +822,7 @@ extern "C" DSG_API int dsg_hash_one(dsg_context* ctx,
 
     cudaError_t e;
     if ((e = cudaSetDevice(ctx->device)) != cudaSuccess) { setErr("cudaSetDevice", e); return DSG_ERR_STATE; }
-    if ((e = cudaMemcpy(ctx->dWork, work, DSG_WORK_SIZE, cudaMemcpyHostToDevice)) != cudaSuccess) {
+    if ((e = cudaMemcpy(ctx->slot[0].dWork, work, DSG_WORK_SIZE, cudaMemcpyHostToDevice)) != cudaSuccess) {
         setErr("upload work", e); return DSG_ERR_LAUNCH;
     }
 
@@ -656,7 +831,7 @@ extern "C" DSG_API int dsg_hash_one(dsg_context* ctx,
     if ((e = cudaMemset(ctx->next, 0, sizeof(int32_t))) != cudaSuccess) {
         setErr("reset work counter", e); return DSG_ERR_LAUNCH;
     }
-    stage1_kernel<<<1, S1_BLOCK, S1_BLOCK * S1_STRIDE>>>(ctx->dWork, nonce, 1,
+    stage1_kernel<<<1, S1_BLOCK, S1_BLOCK * S1_STRIDE>>>(ctx->slot[0].dWork, nonce, 1,
                                                          ctx->texts, ctx->lens);
     suffix_kernel<<<1, BR_BLOCK, BR_SHARED_BYTES>>>(ctx->texts, ctx->lens,
                                                     1, pool, ctx->sa, ctx->next);

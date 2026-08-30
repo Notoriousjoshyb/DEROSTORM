@@ -74,6 +74,10 @@ var (
 	dsgSearch      func(ctx uintptr, work *byte, nonceStart uint32, target *uint64,
 		targetAll int32, nonces *uint32, maxNonces int32, found *int32) int32
 	dsgSetBlocks func(ctx uintptr, blocks int32) int32
+	dsgSubmit    func(ctx uintptr, work *byte, nonceStart uint32, target *uint64,
+		targetAll int32) int32
+	dsgCollect  func(ctx uintptr, nonces *uint32, maxNonces int32, found *int32) int32
+	dsgInflight func(ctx uintptr) int32
 )
 
 var (
@@ -178,6 +182,9 @@ func loadGPU() error {
 			{"dsg_init", &dsgInit},
 			{"dsg_search", &dsgSearch},
 			{"dsg_set_blocks", &dsgSetBlocks},
+			{"dsg_submit", &dsgSubmit},
+			{"dsg_collect", &dsgCollect},
+			{"dsg_inflight", &dsgInflight},
 		} {
 			addr, err := sym(b.name)
 			if err != nil {
@@ -256,6 +263,12 @@ type GPUContext struct {
 	// allocation on the hot path; 64 is far more than a batch can produce at
 	// any real difficulty.
 	hits [64]uint32
+
+	// The target limbs a Submit was given, kept alive here rather than on the
+	// caller's stack. The library copies them into page-locked memory before it
+	// returns, so this is belt and braces, but a pointer handed to a C function
+	// should not be to something the collector may move under it.
+	limbs [4]uint64
 }
 
 // NewGPUContext opens a device. batch is the number of nonces hashed per call;
@@ -297,8 +310,10 @@ func (g *GPUContext) MaxBlocks() int { return g.maxBlocks }
 // candidates are expressed as multiples of.
 func (g *GPUContext) SMs() int { return g.sms }
 
-// SetBlocks changes the resident block count. Call between searches, not
-// during one.
+// SetBlocks changes the resident block count. Call it with nothing in flight:
+// it takes effect at the next launch, so a change made between a Submit and its
+// Collect lands on the batch after the one being measured. That is why the
+// block sweep uses Search rather than the pipeline.
 func (g *GPUContext) SetBlocks(n int) error {
 	if g == nil || g.ctx == 0 {
 		return errors.New("gpu: context is closed")
@@ -349,6 +364,62 @@ func (g *GPUContext) Search(work []byte, nonceStart uint32, t *Target) ([]uint32
 		found = int32(len(g.hits))
 	}
 	return g.hits[:found], nil
+}
+
+// Submit queues a batch and returns without waiting for it. Collect takes the
+// results of the oldest queued batch.
+//
+// Splitting the two is what keeps the card busy. A Search leaves the GPU idle
+// from the moment its last kernel ends until the host has woken up, read the
+// results and enqueued the next batch -- and on a machine mining on every core,
+// waking up means waiting for a scheduler slot. Submitting the next batch
+// before collecting the current one moves that whole gap off the critical path:
+// the card starts the queued batch the instant the running one ends.
+//
+// Two batches may be in flight. A third Submit fails rather than overwriting a
+// batch still on the card.
+func (g *GPUContext) Submit(work []byte, nonceStart uint32, t *Target) error {
+	if g == nil || g.ctx == 0 {
+		return errors.New("gpu: context is closed")
+	}
+	if len(work) != gpuWorkSize {
+		return fmt.Errorf("gpu: work is %d bytes, want %d", len(work), gpuWorkSize)
+	}
+
+	g.limbs = t.limb
+	all := int32(0)
+	if t.all {
+		all = 1
+	}
+	if dsgSubmit(g.ctx, &work[0], nonceStart, &g.limbs[0], all) != 0 {
+		return fmt.Errorf("gpu submit: %s", lastGPUError())
+	}
+	return nil
+}
+
+// Collect waits for the oldest batch Submit queued and returns the nonces that
+// met its target. The slice aliases an internal buffer and is only valid until
+// the next call.
+func (g *GPUContext) Collect() ([]uint32, error) {
+	if g == nil || g.ctx == 0 {
+		return nil, errors.New("gpu: context is closed")
+	}
+	var found int32
+	if dsgCollect(g.ctx, &g.hits[0], int32(len(g.hits)), &found) != 0 {
+		return nil, fmt.Errorf("gpu collect: %s", lastGPUError())
+	}
+	if found < 0 || int(found) > len(g.hits) {
+		found = int32(len(g.hits))
+	}
+	return g.hits[:found], nil
+}
+
+// InFlight is how many batches are queued and not yet collected.
+func (g *GPUContext) InFlight() int {
+	if g == nil || g.ctx == 0 {
+		return 0
+	}
+	return int(dsgInflight(g.ctx))
 }
 
 // HashOne runs a single nonce through the GPU and returns the PoW hash. Used at

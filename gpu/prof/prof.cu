@@ -99,7 +99,8 @@ static const char* phName[PH_N] = {
     "desc: tail descriptors",
     "desc: radix sort",
     "desc: offset scan",
-    "desc: singleton scatter",
+    "desc: expand to sa",
+    "desc: find groups",
     "desc: merge collisions",
 };
 
@@ -190,5 +191,45 @@ int main(int argc, char** argv)
         printf("  %-30s %16llu %7.1f%%\n", phName[i], prof[i], 100.0 * prof[i] / tot);
     }
     printf("  %-30s %16llu\n\n", "total attributed", tot);
+    {
+        unsigned long long hist[65], mx = 0, sum = 0, cnt = 0;
+        cudaMemcpyFromSymbol(hist, g_runlen, sizeof(hist));
+        cudaMemcpyFromSymbol(&mx, g_runmax, sizeof(mx));
+        cudaMemcpyFromSymbol(&sum, g_runsum, sizeof(sum));
+        cudaMemcpyFromSymbol(&cnt, g_runcnt, sizeof(cnt));
+        if (cnt) {
+            printf("  run lengths: %llu runs, mean %.2f, longest %llu\n",
+                   cnt, (double)sum / (double)cnt, mx);
+            printf("  %-8s %10s %8s %10s\n", "len", "runs", "share", "cum work");
+            double work = 0;
+            for (int i = 0; i <= 64; i++) {
+                if (!hist[i]) continue;
+                work += (double)hist[i] * i;
+                printf("  %-8d %10llu %7.1f%% %9.1f%%\n", i, hist[i],
+                       100.0 * (double)hist[i] / (double)cnt,
+                       100.0 * work / (double)sum);
+            }
+            printf("\n");
+        }
+    }
+    {
+        unsigned long long wsum = 0, wcnt = 0, wblk = 0, wmax = 0;
+        cudaMemcpyFromSymbol(&wsum, g_wsum, sizeof(wsum));
+        cudaMemcpyFromSymbol(&wcnt, g_wcnt, sizeof(wcnt));
+        cudaMemcpyFromSymbol(&wblk, g_wblk, sizeof(wblk));
+        cudaMemcpyFromSymbol(&wmax, g_wmax, sizeof(wmax));
+        if (wcnt) {
+            const double mean = (double)wsum / (double)wcnt;
+            const double blocks = (double)wcnt / (double)BR_BLOCK;
+            const double bmax = (double)wblk / blocks;
+            printf("  column walk, per thread:\n");
+            printf("    mean          %12.0f cycles\n", mean);
+            printf("    block waits   %12.0f cycles  (mean of the per-block maxima)\n", bmax);
+            printf("    worst block   %12llu cycles\n", wmax);
+            printf("    imbalance     %12.2fx  -- a balanced walk would cost %.0f%% of what it does\n",
+                   bmax / mean, 100.0 * mean / bmax);
+            printf("\n");
+        }
+    }
     return bad ? 1 : 0;
 }

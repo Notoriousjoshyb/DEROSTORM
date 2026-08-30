@@ -8,6 +8,13 @@ package main
 //   - It hashes a whole batch per call (thousands of nonces), so it can only
 //     notice a new job between batches. The batch size is therefore a latency
 //     knob, not just a throughput one.
+//   - It keeps a second batch queued behind the running one. A card that is
+//     only handed its next batch after the host has woken up, read the last
+//     one's results and re-enqueued is idle for the whole of that, and on a
+//     machine mining on every core the wake-up alone is a scheduler quantum.
+//     That is why the GPU used to speed up when CPU threads were taken away.
+//     With one batch queued behind the other, the card starts the next the
+//     instant the current one ends and the host has a full batch of slack.
 //   - Its nonce space is kept disjoint from the CPU threads'. Byte 47 of the
 //     miniblock is the CPU's thread id; GPUs take 0xf0 upwards, so no CPU
 //     thread and no other GPU can ever hash the same input.
@@ -37,6 +44,19 @@ const maxGPUs = 8
 // gpuWorkSize is the miniblock the GPU library expects, and must equal the
 // DSG_WORK_SIZE the kernels are compiled with.
 const gpuWorkSize = block.MINIBLOCK_SIZE
+
+// Raising this thread's priority was the other half of the same idea and is
+// deliberately absent. Measured on a 5080 with every core busy it is not one
+// trade but two opposite ones: +4.8% at 1,024 nonces a batch, where the wake-up
+// is a real share of the batch, and -4.0% at the default 32,768, where it is
+// not and the preemption costs more than it buys. The default is the case that
+// matters, so the pipeline does the work and the scheduler is left alone.
+//
+// gpuPipelineDepth is how many batches are kept in flight. Two is what the
+// library allocates slots for (DSG_SLOTS), and two is all that is wanted: one
+// running on the card and one queued behind it. A third would buy no more
+// slack and would add a batch to how long a new job takes to reach the card.
+const gpuPipelineDepth = 2
 
 // gpuNonceTag is byte 47 for GPU device i. CPU threads use their thread id,
 // which is far below this in any real configuration.
@@ -89,6 +109,7 @@ func (e *Engine) RunGPUMiner(device, batch, blocks int, stop <-chan struct{}) {
 	// be allowed to migrate between them mid-batch.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+
 
 	g, err := NewGPUContext(device, batch, blocks)
 	if err != nil {
@@ -186,19 +207,31 @@ func (e *Engine) RunGPUMiner(device, batch, blocks int, stop <-chan struct{}) {
 			verified = true
 		}
 
-		for localJobCounter == atomic.LoadInt64(&e.jobCounter) && !done() {
-			// The batch is timed whether or not the tuner wants it. A stopped
-			// tuner ignores the sample, and timing a call that is about to
-			// block for a second anyway costs nothing measurable.
-			started := time.Now()
-			hits, err := g.Search(work[:], nonce, &target)
+		// take is one collected batch: count it, time it, and turn any winning
+		// nonce into a share. Shared by the mining loop and the drain below, so
+		// a batch that was already on the card when the job changed is still
+		// checked rather than thrown away.
+		//
+		// Batches are timed collect-to-collect rather than around the call. In
+		// a full pipeline the call itself is only the part of a batch that was
+		// left when the host got round to waiting, so the gap between two
+		// collections is what a batch actually takes. The first collection
+		// after priming has no previous one to measure from and is skipped.
+		timed := false
+		lastDone := time.Now()
+		take := func() bool {
+			hits, err := g.Collect()
 			if err != nil {
 				e.post(LogError, "gpu", "device %d: %v — stopping", device, err)
-				return
+				return false
 			}
 			atomic.AddUint64(hashes, uint64(g.Batch()))
-			nonce += uint32(g.Batch())
-			tuner.observe(time.Since(started), g.Batch())
+
+			now := time.Now()
+			if timed {
+				tuner.observe(now.Sub(lastDone), g.Batch())
+			}
+			lastDone, timed = now, true
 			if noteSettled != nil {
 				noteSettled()
 			}
@@ -215,6 +248,44 @@ func (e *Engine) RunGPUMiner(device, batch, blocks int, stop <-chan struct{}) {
 					e.post(LogWarn, "gpu", "device %d produced a share the CPU rejects — check clocks", device)
 				}
 			}
+			return true
+		}
+
+		failed := false
+		for localJobCounter == atomic.LoadInt64(&e.jobCounter) && !done() {
+			// Fill the queue before waiting on it. The submit is what keeps the
+			// card fed; the collect below is where this thread sleeps.
+			for g.InFlight() < gpuPipelineDepth {
+				if err := g.Submit(work[:], nonce, &target); err != nil {
+					e.post(LogError, "gpu", "device %d: %v — stopping", device, err)
+					failed = true
+					break
+				}
+				nonce += uint32(g.Batch())
+			}
+			if failed || !take() {
+				failed = true
+				break
+			}
+		}
+
+		// Whatever is still on the card was submitted against this job and this
+		// work, so it is worth collecting rather than abandoning: a share found
+		// in it is still a share. Nothing is lost by waiting either — closing
+		// the context waits for the same kernels.
+		for !failed && g.InFlight() > 0 {
+			if !take() {
+				break
+			}
+		}
+		if failed {
+			// Drain quietly so Close is not left tidying up after an error.
+			for g.InFlight() > 0 {
+				if _, err := g.Collect(); err != nil {
+					break
+				}
+			}
+			return
 		}
 	}
 }

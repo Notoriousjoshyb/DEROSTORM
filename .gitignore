@@ -11,6 +11,8 @@ bin/
 *.exp
 *.pdb
 *.ilk
+*.pgd
+*.pgc
 
 # --- generated test data (rebuild: go run ./gpu/vectors -n 512 -out gpu/vectors.bin) ---
 gpu/vectors.bin

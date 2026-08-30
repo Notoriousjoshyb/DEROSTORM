@@ -93,8 +93,10 @@
 
 #if defined(_MSC_VER)
 #define DSA_CTZ32(v) _tzcnt_u32(v)
+#define DSA_CTZ64(v) _tzcnt_u64(v)
 #elif defined(__GNUC__) || defined(__clang__)
 #define DSA_CTZ32(v) ((uint32_t)__builtin_ctz(v))
+#define DSA_CTZ64(v) ((uint32_t)__builtin_ctzll(v))
 #endif
 
 #if defined(_MSC_VER)
@@ -415,11 +417,34 @@ static inline int suffix_less_from(const uint8_t* t, size_t n, uint32_t a, uint3
     const size_t m = la < lb ? la : lb;
     size_t i = (m >= (size_t)from) ? (size_t)from : 0;
 
-#if defined(DSA_AVX2)
-    /* 32 bytes at a time. Colliding suffixes share a long prefix by
-     * construction -- mean LCP on this data is ~97 bytes -- so the 8-byte
-     * loop was twelve matching iterations before a decision. One vector
-     * compare is three instructions for the same 32 bytes. */
+    /* Eight bytes first. The global mean LCP is ~97, but that is not how far
+     * a merge comparison walks: the caller already skipped the shared key, and
+     * most pairs then separate in the next word. A 32-byte vector as the first
+     * step pulls two cache lines per suffix on every call to help the long tail;
+     * at 15 threads those extra lines contend in L3. Eight bytes settles the
+     * common case; the vector loop below still covers the tail. */
+    if (i + 8 <= m) {
+        uint64_t x, y;
+        memcpy(&x, t + a + i, 8);
+        memcpy(&y, t + b + i, 8);
+        if (x != y) return DSA_BSWAP64(x) < DSA_BSWAP64(y);
+        i += 8;
+    }
+
+#if (defined(__AVX512BW__) || defined(DSA_AVX512)) && !defined(DSA_NO_WIDE_CMP)
+    for (; i + 64 <= m; i += 64) {
+        const __m512i x = _mm512_loadu_si512((const void*)(t + a + i));
+        const __m512i y = _mm512_loadu_si512((const void*)(t + b + i));
+        const __mmask64 eq = _mm512_cmpeq_epi8_mask(x, y);
+        if (eq != ~(__mmask64)0) {
+            const uint32_t tz = (uint32_t)DSA_CTZ64((unsigned long long)~eq);
+            return t[a + i + tz] < t[b + i + tz];
+        }
+    }
+#endif
+
+#if defined(DSA_AVX2) && !defined(DSA_NO_WIDE_CMP)
+    /* 32 bytes at a time for the pairs that shared the first word. */
     for (; i + 32 <= m; i += 32) {
         const __m256i x = _mm256_loadu_si256((const __m256i*)(t + a + i));
         const __m256i y = _mm256_loadu_si256((const __m256i*)(t + b + i));
@@ -494,7 +519,7 @@ static inline int suffix_less(const uint8_t* t, size_t n, uint32_t a, uint32_t b
  * pre-ordered groups, which is what the global merge actually wants.
  */
 #ifndef DSA_COUNT_MIN
-#define DSA_COUNT_MIN 48
+#define DSA_COUNT_MIN 40
 #endif
 
 /* Above this many blocks in a run, the rank sort below stops being the cheapest
@@ -680,6 +705,36 @@ static inline void column_step_keys(uint32_t* order, uint32_t* keys, uint32_t* t
  * order[] is maintained as described at the top of the file: on entry to each
  * column the suffixes at order[i] + rel are in ascending order.
  */
+/* order[x] + column, written into the arena. Typical run length is ~4, so the
+ * 4-wide path is the one that matters; 8-wide covers the long-run tail. */
+static inline void emit_ord_plus(uint32_t* dst, const uint32_t* order,
+                                 uint32_t n, uint32_t r)
+{
+#if defined(DSA_AVX2)
+    const __m256i add8 = _mm256_set1_epi32((int32_t)r);
+    const __m128i add4 = _mm_set1_epi32((int32_t)r);
+    uint32_t x = 0;
+    for (; x + 8 <= n; x += 8) {
+        const __m256i v = _mm256_loadu_si256((const __m256i*)(order + x));
+        _mm256_storeu_si256((__m256i*)(dst + x), _mm256_add_epi32(v, add8));
+    }
+    for (; x + 4 <= n; x += 4) {
+        const __m128i v = _mm_loadu_si128((const __m128i*)(order + x));
+        _mm_storeu_si128((__m128i*)(dst + x), _mm_add_epi32(v, add4));
+    }
+    for (; x < n; x++) dst[x] = order[x] + r;
+#elif defined(DSA_NEON)
+    const uint32x4_t add4 = vdupq_n_u32(r);
+    uint32_t x = 0;
+    for (; x + 4 <= n; x += 4) {
+        vst1q_u32(dst + x, vaddq_u32(vld1q_u32(order + x), add4));
+    }
+    for (; x < n; x++) dst[x] = order[x] + r;
+#else
+    for (uint32_t x = 0; x < n; x++) dst[x] = order[x] + r;
+#endif
+}
+
 static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
                     uint32_t blocks, Scratch* s,
                     size_t* arena_len, size_t* desc_len)
@@ -814,7 +869,8 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
             Desc* d = &s->desc[*desc_len];
             d->key = keys[0];
             d->packed = desc_pack((uint32_t)*arena_len, blocks);
-            for (uint32_t x = 0; x < blocks; x++) s->arena[(*arena_len)++] = order[x] + r;
+            emit_ord_plus(s->arena + *arena_len, order, blocks, r);
+            *arena_len += blocks;
             (*desc_len)++;
         } else
 #endif
@@ -828,7 +884,8 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
                 Desc* d = &s->desc[*desc_len];
                 d->key = k;
                 d->packed = desc_pack((uint32_t)*arena_len, j - i);
-                for (uint32_t x = i; x < j; x++) s->arena[(*arena_len)++] = order[x] + r;
+                emit_ord_plus(s->arena + *arena_len, order + i, j - i, r);
+                *arena_len += (j - i);
                 (*desc_len)++;
                 i = j;
             }
@@ -840,7 +897,33 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
          * A constant column prepends the same byte to every suffix, so the
          * order is unchanged and there is nothing further to do. */
         const uint32_t col = r - 1;
-        for (uint32_t x = 0; x < blocks; x++) {
+        uint32_t x = 0;
+#if defined(DSA_AVX2)
+        for (; x + 4 <= blocks; x += 4) {
+            const uint32_t c0 = t[order[x] + col];
+            const uint32_t c1 = t[order[x + 1] + col];
+            const uint32_t c2 = t[order[x + 2] + col];
+            const uint32_t c3 = t[order[x + 3] + col];
+            const __m128i k = _mm_loadu_si128((const __m128i*)(keys + x));
+            const __m128i b = _mm_set_epi32((int)c3, (int)c2, (int)c1, (int)c0);
+            _mm_storeu_si128((__m128i*)(keys + x),
+                _mm_or_si128(_mm_srli_epi32(k, 8),
+                             _mm_slli_epi32(b, 8 * (DSA_KEY_BYTES - 1))));
+        }
+#elif defined(DSA_NEON)
+        for (; x + 4 <= blocks; x += 4) {
+            const uint32_t c[4] = {
+                t[order[x] + col], t[order[x + 1] + col],
+                t[order[x + 2] + col], t[order[x + 3] + col],
+            };
+            const uint32x4_t k = vld1q_u32(keys + x);
+            const uint32x4_t b = vld1q_u32(c);
+            vst1q_u32(keys + x,
+                vorrq_u32(vshrq_n_u32(k, 8),
+                            vshlq_n_u32(b, 8 * (DSA_KEY_BYTES - 1))));
+        }
+#endif
+        for (; x < blocks; x++) {
             const uint8_t c = t[order[x] + col];
             keys[x] = ((uint32_t)c << key_shift) | (keys[x] >> 8);
         }
@@ -907,10 +990,24 @@ static Desc* sort_desc(Desc* a, Desc* b, size_t count)
 
     uint32_t hist[DSA_RPASS][DSA_RBINS];
     memset(hist, 0, sizeof(hist));
-    for (size_t i = 0; i < count; i++) {
-        const uint32_t k = a[i].key;
-        for (int p = 0; p < DSA_RPASS; p++) {
-            hist[p][(k >> shift[p]) & DSA_RMASK]++;
+    {
+        size_t i = 0;
+        for (; i + 4 <= count; i += 4) {
+            const uint32_t k0 = a[i].key, k1 = a[i + 1].key;
+            const uint32_t k2 = a[i + 2].key, k3 = a[i + 3].key;
+            for (int p = 0; p < DSA_RPASS; p++) {
+                const int sh = shift[p];
+                hist[p][(k0 >> sh) & DSA_RMASK]++;
+                hist[p][(k1 >> sh) & DSA_RMASK]++;
+                hist[p][(k2 >> sh) & DSA_RMASK]++;
+                hist[p][(k3 >> sh) & DSA_RMASK]++;
+            }
+        }
+        for (; i < count; i++) {
+            const uint32_t k = a[i].key;
+            for (int p = 0; p < DSA_RPASS; p++) {
+                hist[p][(k >> shift[p]) & DSA_RMASK]++;
+            }
         }
     }
     for (int p = 0; p < DSA_RPASS; p++) {
@@ -923,7 +1020,15 @@ static Desc* sort_desc(Desc* a, Desc* b, size_t count)
     }
     for (int p = 0; p < DSA_RPASS; p++) {
         const int sh = shift[p];
-        for (size_t i = 0; i < count; i++) {
+        size_t i = 0;
+        for (; i + 4 <= count; i += 4) {
+            const Desc r0 = a[i], r1 = a[i + 1], r2 = a[i + 2], r3 = a[i + 3];
+            b[hist[p][(r0.key >> sh) & DSA_RMASK]++] = r0;
+            b[hist[p][(r1.key >> sh) & DSA_RMASK]++] = r1;
+            b[hist[p][(r2.key >> sh) & DSA_RMASK]++] = r2;
+            b[hist[p][(r3.key >> sh) & DSA_RMASK]++] = r3;
+        }
+        for (; i < count; i++) {
             b[hist[p][(a[i].key >> sh) & DSA_RMASK]++] = a[i];
         }
         Desc* tmp = a; a = b; b = tmp;
@@ -990,11 +1095,8 @@ retry:
         PROF_LAP(PH_RUNS);
         PROF_STAT(ST_RUNS, 1);
         if (!emit_run(t, n, g, len, s, &arena_len, &desc_len)) {
-            /* Out of descriptor room. Grow to the bound nothing can exceed and
-             * do the text again; one wasted walk, and it did not happen on any
-             * of the 512 measured texts. */
             const size_t full = desc_bound(n);
-            if (s->desc_cap >= full) return -3;   /* already at the bound */
+            if (s->desc_cap >= full) return -3;
             s = scratch_get(n, full);
             if (!s) return -2;
             goto retry;

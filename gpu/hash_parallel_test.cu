@@ -41,7 +41,15 @@
 // Shared tile for stage 1: step_3 and the RC4 permutation, 256 bytes each per
 // thread, plus 4 bytes of padding so lanes land on different banks.
 #define S1_STRIDE 516
+#ifndef S1_BLOCK
 #define S1_BLOCK  64
+#endif
+#ifndef SHA_BLOCK
+#define SHA_BLOCK 64
+#endif
+#ifndef DESC_PREFER_SHARED
+#define DESC_PREFER_SHARED 1
+#endif
 
 struct Pool {
     int32_t*  words;      // 8 int32 arrays per block, back to back
@@ -109,6 +117,23 @@ __global__ __launch_bounds__(BR_BLOCK) void suffix_kernel(
         const int n = lens[h];
         const uint8_t* text = texts + (size_t)h * ASTRO_MAX_TEXT;
         int32_t* out = saOut + (size_t)h * saStride;
+
+#if DESC_PREFETCH_TEXT
+#if DESC_PREFETCH_L1
+        for (int i = (int)threadIdx.x * DESC_PREFETCH_STRIDE; i < n; i += BR_BLOCK * DESC_PREFETCH_STRIDE) {
+            asm volatile("prefetch.global.L1 [%0];" :: "l"(text + i));
+        }
+#elif DESC_PREFETCH_L2
+        for (int i = (int)threadIdx.x * DESC_PREFETCH_STRIDE; i < n; i += BR_BLOCK * DESC_PREFETCH_STRIDE) {
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(text + i));
+        }
+#else
+        for (int i = threadIdx.x; i < n; i += BR_BLOCK) {
+            (void)*(((const volatile uint8_t*)text) + i);
+        }
+#endif
+        __syncthreads();
+#endif
 
         // The same two sorts the miner uses, in the same order: the descriptor
         // sort, and prefix doubling as its fallback. Kept in step with
@@ -185,7 +210,12 @@ int main(int argc, char** argv)
 
     printf("  shared     %.1f KB per block for the radix sort\n\n", BR_SHARED_BYTES / 1024.0);
     CK(cudaFuncSetAttribute(suffix_kernel,
-                            cudaFuncAttributeMaxDynamicSharedMemorySize, BR_SHARED_BYTES));
+                            cudaFuncAttributeMaxDynamicSharedMemorySize, DESC_LAUNCH_SHARED));
+#if DESC_PREFER_L1
+    CK(cudaFuncSetCacheConfig(suffix_kernel, cudaFuncCachePreferL1));
+#elif DESC_PREFER_SHARED
+    CK(cudaFuncSetCacheConfig(suffix_kernel, cudaFuncCachePreferShared));
+#endif
 
     size_t freeB, totB; CK(cudaMemGetInfo(&freeB, &totB));
     size_t budget = freeB > (size_t)1500e6 ? freeB - (size_t)1500e6 : 0;
@@ -223,8 +253,8 @@ int main(int argc, char** argv)
     auto runAll = [&](int b) {
         stage1_kernel<<<(b + S1_BLOCK - 1) / S1_BLOCK, S1_BLOCK, S1_BLOCK * S1_STRIDE>>>(
             dIn, v.count, b, dTexts, dLens);
-        suffix_kernel<<<blocks, BR_BLOCK, BR_SHARED_BYTES>>>(dTexts, dLens, b, pool, dSA, saStride);
-        sha_kernel<<<(b + 63) / 64, 64>>>(dSA, saStride, dLens, b, dHash);
+        suffix_kernel<<<blocks, BR_BLOCK, DESC_LAUNCH_SHARED>>>(dTexts, dLens, b, pool, dSA, saStride);
+        sha_kernel<<<(b + SHA_BLOCK - 1) / SHA_BLOCK, SHA_BLOCK>>>(dSA, saStride, dLens, b, dHash);
     };
 
     // ---- correctness -----------------------------------------------------
@@ -270,9 +300,9 @@ int main(int argc, char** argv)
                 stage1_kernel<<<(batch + S1_BLOCK - 1) / S1_BLOCK, S1_BLOCK, S1_BLOCK * S1_STRIDE>>>(
                     dIn, v.count, batch, dTexts, dLens); });
             float t2 = timeKernel([&]{
-                suffix_kernel<<<b, BR_BLOCK, BR_SHARED_BYTES>>>(dTexts, dLens, batch, pool, dSA, saStride); });
+                suffix_kernel<<<b, BR_BLOCK, DESC_LAUNCH_SHARED>>>(dTexts, dLens, batch, pool, dSA, saStride); });
             float t3 = timeKernel([&]{
-                sha_kernel<<<(batch + 63) / 64, 64>>>(dSA, saStride, dLens, batch, dHash); });
+                sha_kernel<<<(batch + SHA_BLOCK - 1) / SHA_BLOCK, SHA_BLOCK>>>(dSA, saStride, dLens, batch, dHash); });
             if (t1 < bs1) bs1 = t1;
             if (t2 < bsu) bsu = t2;
             if (t3 < bsh) bsh = t3;
@@ -299,9 +329,9 @@ int main(int argc, char** argv)
                     stage1_kernel<<<(n + S1_BLOCK - 1) / S1_BLOCK, S1_BLOCK, S1_BLOCK * S1_STRIDE>>>(
                         dIn, v.count, n, dTexts, dLens); });
                 float t2 = timeKernel([&]{
-                    suffix_kernel<<<bestBlocks, BR_BLOCK, BR_SHARED_BYTES>>>(dTexts, dLens, n, pool, dSA, saStride); });
+                    suffix_kernel<<<bestBlocks, BR_BLOCK, DESC_LAUNCH_SHARED>>>(dTexts, dLens, n, pool, dSA, saStride); });
                 float t3 = timeKernel([&]{
-                    sha_kernel<<<(n + 63) / 64, 64>>>(dSA, saStride, dLens, n, dHash); });
+                    sha_kernel<<<(n + SHA_BLOCK - 1) / SHA_BLOCK, SHA_BLOCK>>>(dSA, saStride, dLens, n, dHash); });
                 if (t1 < bs1) bs1 = t1;
                 if (t2 < bsu) bsu = t2;
                 if (t3 < bsh) bsh = t3;

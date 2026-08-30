@@ -11,7 +11,7 @@ and `astrobwt/difftest` compares the two on every build.
 ```
       ░▒▒▒▒▒░        ██████  ███████ ██████   ██████  ███████ ████████  ██████  ██████  ███    ███
     ░▒▓█████▓▒░      ██   ██ ██      ██   ██ ██    ██ ██         ██    ██    ██ ██   ██ ████  ████  ┌────────┐
-   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.5.2 │
+   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.5.5 │
    ▒███████████▒     ██   ██ ██      ██   ██ ██    ██      ██    ██    ██    ██ ██   ██ ██  ██  ██  └────────┘
     ░▒▓▓█▟▙█▓▒░      ██████  ███████ ██   ██  ██████  ███████    ██     ██████  ██   ██ ██      ██
         ▝█▛                                    ASTROBWTv3 MINER FOR DERO
@@ -48,7 +48,7 @@ and `astrobwt/difftest` compares the two on every build.
  │ T04 ███████████████▌░  91%  ││     ⠈⠑⠐⠂⠤⠄⠤⠠⠤⠠⠤⠒⠊⠁   ⣀⠴⠃      ││ REJECTED             12 ││ LATENCY   42 ms │
  │ +11 more                    ││              ⠄⠠⠠⠠⠐⠐⠂⠉         ││ STALE                -- ││      GOOD       │
  └─────────────────────────────┘└───────────────────────────────┘└─────────────────────────┘└─────────────────┘
- [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.5.2
+ [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.5.5
 ```
 
 Eight screens, one key each. The **dashboard** above is the one you leave up;
@@ -559,20 +559,26 @@ otherwise. Everything in this section except the *Before* columns and the
 *What does not help* experiments comes from `derostorm --bench`, which needs no
 node and no wallet, so you can reproduce it on your own machine in a minute.
 
-Headline, all of it at once, re-measured on 2026-08-30 at 1.5.0:
+Headline, all of it at once, re-measured on 2026-08-30 at 1.5.5:
 
-| | H/s | at 1.4.0 | at 1.3.0 | at 1.1.0 |
+| | H/s | at 1.5.0 | at 1.4.0 | at 1.3.0 |
 |---|---:|---:|---:|---:|
-| CPU, 15 threads | 34,293 | 33,700 – 34,500 | 33,600 | 33,506 |
-| RTX 5080 | **100,640** | 91,870 | 71,650 | 63,400 |
-| **together, real mining path** | **130,400 – 131,800** | 124,700 – 125,400 | ~103,300 | — |
+| CPU, 15 threads | 32,640 | 34,293 | 33,700 – 34,500 | 33,600 |
+| RTX 5080 | **119,463** | 100,640 | 91,870 | 71,650 |
+| **together, real mining path** | **153,900 – 154,700** | 130,400 – 131,800 | 124,700 – 125,400 | ~103,300 |
 
-The combined figure is `--run-for=55 --gpu=all --gpu-blocks=1252`, not the sum of
-the two above: on the real path the two share a memory system and a job feed, so
-the sum overstates it slightly. Three runs, and the block count is pinned so the
-figure is not diluted by the tuning sweep the miner otherwise ran in its first
-twelve seconds. 1.5.2 no longer sweeps: it sits at four blocks per SM (336 on a
-5080). Pin that if you want the same number in the logs.
+The combined figure is `--run-for=55 --gpu=all`, not the sum of the two above:
+on the real path the two share a memory system and a job feed, so the sum
+overstates it slightly. Three runs, and 1.5.2 onwards no longer sweeps the block
+count — it sits at four blocks per SM (336 on a 5080), so the figure is not
+diluted by a tuning sweep in the first twelve seconds.
+
+The CPU row is 1.6k lower than at 1.5.0 and the CPU did not get slower: nothing
+on that path changed except the descriptor compare at 1.5.3, which measured
+faster. Two `--bench` runs back to back read 32,637 and 32,606, so it is not
+scatter either — it is this machine on this day, and it is left as measured
+rather than quietly carried forward from a better one. The GPU and combined rows
+were taken in the same session, so the comparison between them holds.
 
 The GPU is where the gain keeps coming from. 1.4.0 was +28% on it in one
 session, all of it the same mistake in different files — see [The GPU was
@@ -610,6 +616,92 @@ each 256-byte append as sixteen-byte stores. Mining defaults to four suffix
 blocks per SM (the occupancy this kernel actually reaches) instead of sweeping
 from a few KH/s up through 1,252, which measured slower under a display.
 
+**1.5.5 turns the scatter inside out.** Placing the sorted positions gave a
+whole descriptor -- a run of ~5.7 positions -- to one thread, which copied it a
+word at a time. Neighbouring threads therefore wrote addresses ~23 bytes apart
+and read arena slots with no relation to each other, so a warp's 32 words cost
+~28 memory transactions where 4 would do. It was **26.5% of the suffix kernel**,
+the largest single phase in it.
+
+Driving the loop by output position instead fixes the writes completely: output
+position q always lands at `sa[q]`, so a warp writes 32 consecutive words. What
+it costs is finding which descriptor owns q, and the answer is to walk
+descriptors rather than output tiles — a window of 256 descriptors is read once,
+coalesced, into shared memory, and the ~1,460 output positions it covers are
+written from it with an eight-step binary search in shared memory each. Driving
+by output would reread the offset array once per tile of 256 outputs, 5.7 times
+the loads for the same answer and 5.6 times the barriers to do it.
+
+| | suffix ms |
+|---|---:|
+| before | 140.9 |
+| one thread per output position | 136.7 |
+| the same, two barriers a tile not three | 135.1 |
+| by descriptor window, not output tile | **129.9** |
+
+Both merges lose their gather loop as well — the positions are already where
+they want them, so all either one still needs is where each list starts. End to
+end on a 5080 with every core busy: **123,148 H/s against 114,614**, +7.4%, and
+the run-to-run spread fell from ±5% to ±0.3%. `--bench --gpu=all` reads
+119,463 H/s against 1.5.2's 100,640, and the real mining path with the CPU
+beside it reads 153.9 – 154.7 KH/s against 130.4 – 131.8. `suffix_kernel` is 226.4 → 207.2 ms
+a batch. Hashes stay bit-identical to the CPU — `gpu/hash_parallel_test.exe`
+matches all 512 vectors.
+
+`BR_BITS`, `DESC_CHUNKS` and `DESC_MERGE_WIDE` were re-swept afterwards in case
+the rewrite had moved their peaks. It had not: 7, 4 and 64 stand, and 8 bits or
+8 chunks both cost enough shared memory to lose a block per SM.
+
+**What is left, and what did not work.** With the scatter fixed, the column walk
+is the largest phase again — and most of it is threads doing nothing.
+`gpu/prof/prof.exe` now times each thread's own tasks and reports the block's
+wait: **the slowest thread takes 1.98× the average**, so a perfectly balanced
+walk would cost half of what this one does. The walk is ~32% of the kernel, so
+that is ~16% of it and ~12% of hashrate sitting there.
+
+Two ways to collect it were built and measured, and neither is in the tree.
+
+*Cutting the runs shorter* — `DESC_RUN_MAX`, a knob that already existed — buys
+threads and is **four times slower at every cap**: 130 ms uncapped against 188
+at 64 blocks, 338 at 16 and 797 at 4. A run split in two emits its descriptors
+twice, and the radix sort and the merge carry every one of them.
+
+*Splitting the columns unevenly* avoids that completely, because chunking a run
+changes no descriptor at all, and it was built in full: a chunk count per run,
+scans for the task and storage offsets, a binary search from task back to run,
+and the order table packed to a block index — two bytes instead of four — to pay
+for the extra entries. It is exact and it is not faster. Swept over five
+threshold pairs, from boosting runs past 4 blocks to past 16, every one landed
+within noise of the flat split, and the imbalance barely moved: 1.98× → 1.92×.
+The reason is that every chunk of a run repeats that run's seed insertion sort
+and its full key read, and the seed is quadratic in the run's length — so the
+chunks a long run needs in order to come down to average cost add back about
+what the balance saves. Mean per-thread cost rose 9% to improve balance by 3%.
+
+What the walk needs is a cheaper per-chunk seed, not another way to divide the
+columns. `DESC_CMP_WORDS` and `DESC_SPLIT` were swept in the same session and
+are both already at their best.
+
+**1.5.4 stops the card waiting for a CPU.** The GPU worker enqueued a batch and
+then blocked until it came back, so between batches the card was idle for as
+long as the one host thread took to wake up — and on a machine mining on every
+core, that is a scheduler quantum, not microseconds. It now keeps a second batch
+queued behind the running one (`dsg_submit` / `dsg_collect`), so the card starts
+the next the instant the current one ends. On a 5080 with all sixteen threads
+busy: **112,548 H/s against 106,429**, +5.7%, and the GPU rate no longer moves
+when the CPU load does. Batches shorter than the default gain far more — +31% at
+4,096 nonces, +78% at 1,024 — because the gap is a fixed cost per batch. Kernels
+are unchanged and hashes stay bit-identical to the CPU.
+
+**1.5.3 is the next sort step on that 1.5.2 shape.** The CPU descriptor compare
+starts with an eight-byte word, then an AVX2 32-byte tail; radix histogram and
+scatter are four-way. On this 5080 + 9800X3D that is about **+2.3%** on the
+sort at 15 threads (~37.8k texts/s against 1.5.2's ~37,005). The GPU does the
+same eight-byte-first compare, 64-bit text loads, a 32-byte wide tail,
+`DESC_MERGE_WIDE` 64, and an L2 prefetch of the text at stride 64: about
+**+4–5%** in the suffix harness at 336 blocks (~81.5–82.5 KH/s against
+1.5.2's ~78.5). Hashes stay bit-identical to the CPU.
+
 **1.4.1 exists for one reason.** The 1.4.0 Linux archives shipped the *previous*
 CUDA kernels: `libderostorm_gpu.so` is built by `nvcc` under Linux, which was
 not available on the machine that cut the release, so Linux GPU mining ran at
@@ -624,12 +716,12 @@ and CPU mining is untouched on every platform.
 
 | | Before | Now | |
 |---|---:|---:|---:|
-| 1 thread | 700 H/s | 3,402 H/s | +386% |
-| 15 threads | 8.09 KH/s | 33,506 H/s | +314% |
+| 1 thread | 700 H/s | 3,280 H/s | +369% |
+| 15 threads | 8.09 KH/s | 32,640 H/s | +303% |
 
 *Before* is stock derohe, measured once on this machine at the start and not
 re-run since — it is upstream code and does not move. *Now* is `--bench` on
-1.1.0. The intermediate figures this table used to carry (1,875 H/s and
+1.5.5. The intermediate figures this table used to carry (1,875 H/s and
 18.03 KH/s) were the state before the descriptor suffix sort landed.
 
 Three changes.
@@ -766,7 +858,7 @@ profile-guided optimisation (+1.2%).
 
 | | Before | Now | |
 |---|---:|---:|---:|
-| RTX 5080 | 7.45 KH/s | 100,640 H/s | +1251% |
+| RTX 5080 | 7.45 KH/s | 119,463 H/s | +1504% |
 
 *Before* is the GPU on its own on the real mining path
 (`--mining-threads=1 --gpu=0 --run-for=90`), measured when GPU support first
@@ -774,7 +866,52 @@ worked. *Now* is `--bench --gpu=all`, which runs the same kernels over the same
 batch size without needing a node. The intermediate 12.28 KH/s this table used
 to carry was the gain from the packed-key change described below; the rest came
 from the block-count sweep, the stage-1 work after it, the byte-load session at
-1.4.0, and the merge described next.
+1.4.0, the merge described next, and the batch pipeline and coalesced scatter at
+1.5.4 and 1.5.5.
+
+**The card was waiting for a CPU.** Taking two CPU mining threads away made the
+GPU faster, which should not happen: the CPU threads and the card share nothing
+but a job. Measured on a 5080 with every logical CPU busy, the GPU ran at
+**106,429 H/s against 111,247 with the CPU idle** — a 4.3% tax for mining on the
+processor at the same time — and the run-to-run spread went from 1% to 4.5%.
+
+Two guesses were wrong before the measurement was right. It is not the clocks:
+`nvidia-smi` reports 2,865 MHz either way, at the same temperature. It is not
+the kernels: profiled with `nsys`, `suffix_kernel` takes 227 ms a batch whether
+the CPU is idle or saturated. `gpu/gapbench.cu` records CUDA events either side
+of each batch, so the GPU's own timeline can be compared with the wall clock,
+and that is what found it — the card was idle between batches, waiting for the
+one host thread that enqueues the next one to get a scheduler slot behind
+sixteen pinned mining threads that never yield.
+
+The fix is not to make that thread faster. It is to make the card not care how
+slow it is: `dsg_submit` and `dsg_collect` replace the blocking `dsg_search` on
+the mining path, and the miner keeps a second batch queued behind the running
+one. The card starts it the instant the first ends, and the host's wake-up
+happens with a whole batch of slack in hand. Two batches share the same scratch
+— they are on one stream, so batch N's last kernel is done before batch N+1's
+first one starts — and all the second slot costs is a few hundred bytes for its
+own work, target and result buffers.
+
+| nonces per batch | before | after | |
+|---|---:|---:|---:|
+| 32,768 (default) | 106,429 H/s | 112,548 H/s | +5.7% |
+| 4,096 | 55,504 H/s | 72,728 H/s | +31% |
+| 1,024 | 17,740 H/s | 31,604 H/s | +78% |
+
+All with sixteen busy CPU threads, which is the case that was broken. The gap is
+a fixed cost per batch, so it is a rounding error against a batch that takes
+290 ms and it is most of the time against one that takes 30 — which is why
+`--gpu-batch`, sold as a job-latency knob, was quietly also a throughput one.
+It is not any more. With the pipeline the GPU rate no longer depends on what the
+CPU is doing at all: 112,548 H/s with the machine saturated against 109,992 with
+it idle, the difference being noise.
+
+Raising the feeder thread's priority was the obvious other half and is
+deliberately not there. It is not one trade but two opposite ones: +4.8% at
+1,024 nonces a batch, where the wake-up is a real share of the batch, and -4.0%
+at the default 32,768, where it is not and the preemption costs more than it
+buys. The default is the case that matters.
 
 **One thread was the phase.** The merge that resolves colliding descriptor
 groups gave each group to one thread. The average group holds seven positions,
@@ -1390,6 +1527,21 @@ ncu --section SpeedOfLight --section WarpStateStats ^
 
 The note at the top of `gpu/blockradix.cuh` carries the full record: what the
 phase shares were, what was changed, and what was tried and thrown away.
+
+A different question — is the card *working*, or waiting for the host? — needs a
+different tool, because throughput on this GPU swings 10% run to run and will
+not settle an argument about a few percent. `gpu/gapbench.cu` records CUDA
+events either side of every batch, so the GPU's own timeline can be held against
+the wall clock, and it loads the CPU the way mining does so the answer is for
+the machine as it is actually run:
+
+```
+gpu\gapbench.bat
+gpu\gapbench.exe serial   16 25
+gpu\gapbench.exe pipeline 16 25
+```
+
+That is what found the idle gap the batch pipeline removes, described above.
 
 ## Layout
 

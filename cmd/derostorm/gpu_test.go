@@ -12,6 +12,7 @@ package main
 import (
 	"encoding/binary"
 	"math/big"
+	"sort"
 	"testing"
 
 	"github.com/deroproject/derohe/astrobwt/astrobwtv3"
@@ -127,4 +128,97 @@ func TestGPUSearchAgreesWithCPU(t *testing.T) {
 	}
 	t.Logf("%d of %d nonces met difficulty 64, and both sides agreed on every one",
 		nCPU, g.Batch())
+}
+
+// sortedCopy takes the winners out of the GPU's buffer in a defined order. The
+// kernel claims its slot with an atomicAdd, so which winner lands where depends
+// on which block got there first and is not the same twice; only the set is.
+func sortedCopy(hits []uint32) []uint32 {
+	out := append([]uint32(nil), hits...)
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// TestGPUPipelineMatchesSearch checks the two-batch path the miner runs against
+// the one-batch path everything else runs.
+//
+// The pipeline is the whole reason the GPU keeps its rate on a busy machine, and
+// what could go wrong with it is silent: two batches share the scratch the
+// kernels sort in, so a slot that was not really private would return one
+// batch's winners for the other's nonces and nobody would notice until a pool
+// rejected the share. So the test asks for the same nonce ranges both ways and
+// requires the same answers.
+func TestGPUPipelineMatchesSearch(t *testing.T) {
+	g := gpuTestContext(t)
+	defer g.Close()
+
+	target := NewTarget(big.NewInt(64))
+	work := testWork()
+
+	const rounds = 3
+	starts := make([]uint32, rounds)
+	for i := range starts {
+		starts[i] = 70000 + uint32(i*g.Batch())
+	}
+
+	// One at a time, the old way.
+	want := make([][]uint32, rounds)
+	for i, s := range starts {
+		hits, err := g.Search(work, s, &target)
+		if err != nil {
+			t.Fatalf("search: %v", err)
+		}
+		want[i] = sortedCopy(hits)
+	}
+	if g.InFlight() != 0 {
+		t.Fatalf("Search left %d batches in flight", g.InFlight())
+	}
+
+	// Now with a batch always queued behind the running one.
+	got := make([][]uint32, 0, rounds)
+	next := 0
+	for len(got) < rounds {
+		for next < rounds && g.InFlight() < gpuPipelineDepth {
+			if err := g.Submit(work, starts[next], &target); err != nil {
+				t.Fatalf("submit %d: %v", next, err)
+			}
+			next++
+		}
+		// A third batch must be refused rather than overwriting a live slot.
+		if g.InFlight() == gpuPipelineDepth && next < rounds {
+			if err := g.Submit(work, starts[next], &target); err == nil {
+				t.Fatal("a third Submit was accepted with the pipeline full")
+			}
+		}
+		hits, err := g.Collect()
+		if err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+		got = append(got, sortedCopy(hits))
+	}
+	if g.InFlight() != 0 {
+		t.Fatalf("%d batches left in flight after draining", g.InFlight())
+	}
+	if _, err := g.Collect(); err == nil {
+		t.Fatal("Collect succeeded with nothing in flight")
+	}
+
+	total := 0
+	for i := range want {
+		total += len(want[i])
+		if len(got[i]) != len(want[i]) {
+			t.Fatalf("batch %d: pipeline found %d nonces, Search found %d",
+				i, len(got[i]), len(want[i]))
+		}
+		for j := range want[i] {
+			if got[i][j] != want[i][j] {
+				t.Fatalf("batch %d, hit %d: pipeline says %d, Search says %d",
+					i, j, got[i][j], want[i][j])
+			}
+		}
+	}
+	if total == 0 {
+		t.Fatal("no nonce met difficulty 64 in any batch, so nothing was compared")
+	}
+	t.Logf("%d winning nonces over %d batches, identical both ways", total, rounds)
 }
