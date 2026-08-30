@@ -114,9 +114,9 @@ int main(int argc, char** argv)
         int next = 0, taken = 0;
         while (taken < batches) {
             while (next < batches && dsg_inflight(ctx) < DSG_SLOTS) {
-                cudaEventRecord(evA[next], ctx->stream);
+                cudaEventRecord(evA[next], ctx->bank[0].stream);
                 dsg_submit(ctx, work, nonce, target, 0);
-                cudaEventRecord(evB[next], ctx->stream);
+                cudaEventRecord(evB[next], ctx->bank[0].stream);
                 nonce += (uint32_t)gotBatch;
                 next++;
             }
@@ -125,14 +125,14 @@ int main(int argc, char** argv)
         }
     } else {
         for (int i = 0; i < batches; i++) {
-            cudaEventRecord(evA[i], ctx->stream);
+            cudaEventRecord(evA[i], ctx->bank[0].stream);
             dsg_submit(ctx, work, nonce, target, 0);
-            cudaEventRecord(evB[i], ctx->stream);
+            cudaEventRecord(evB[i], ctx->bank[0].stream);
             dsg_collect(ctx, hits, 64, &found);
             nonce += (uint32_t)gotBatch;
         }
     }
-    cudaStreamSynchronize(ctx->stream);
+    cudaDeviceSynchronize();
     double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
     g_stop = 1;

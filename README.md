@@ -11,7 +11,7 @@ and `astrobwt/difftest` compares the two on every build.
 ```
       ░▒▒▒▒▒░        ██████  ███████ ██████   ██████  ███████ ████████  ██████  ██████  ███    ███
     ░▒▓█████▓▒░      ██   ██ ██      ██   ██ ██    ██ ██         ██    ██    ██ ██   ██ ████  ████  ┌────────┐
-   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.5.5 │
+   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.5.6 │
    ▒███████████▒     ██   ██ ██      ██   ██ ██    ██      ██    ██    ██    ██ ██   ██ ██  ██  ██  └────────┘
     ░▒▓▓█▟▙█▓▒░      ██████  ███████ ██   ██  ██████  ███████    ██     ██████  ██   ██ ██      ██
         ▝█▛                                    ASTROBWTv3 MINER FOR DERO
@@ -48,7 +48,7 @@ and `astrobwt/difftest` compares the two on every build.
  │ T04 ███████████████▌░  91%  ││     ⠈⠑⠐⠂⠤⠄⠤⠠⠤⠠⠤⠒⠊⠁   ⣀⠴⠃      ││ REJECTED             12 ││ LATENCY   42 ms │
  │ +11 more                    ││              ⠄⠠⠠⠠⠐⠐⠂⠉         ││ STALE                -- ││      GOOD       │
  └─────────────────────────────┘└───────────────────────────────┘└─────────────────────────┘└─────────────────┘
- [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.5.5
+ [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.5.6
 ```
 
 Eight screens, one key each. The **dashboard** above is the one you leave up;
@@ -559,13 +559,13 @@ otherwise. Everything in this section except the *Before* columns and the
 *What does not help* experiments comes from `derostorm --bench`, which needs no
 node and no wallet, so you can reproduce it on your own machine in a minute.
 
-Headline, all of it at once, re-measured on 2026-08-30 at 1.5.5:
+Headline, all of it at once, re-measured on 2026-08-30 at 1.5.6:
 
-| | H/s | at 1.5.0 | at 1.4.0 | at 1.3.0 |
+| | H/s | at 1.5.5 | at 1.5.0 | at 1.4.0 |
 |---|---:|---:|---:|---:|
-| CPU, 15 threads | 32,640 | 34,293 | 33,700 – 34,500 | 33,600 |
-| RTX 5080 | **119,463** | 100,640 | 91,870 | 71,650 |
-| **together, real mining path** | **153,900 – 154,700** | 130,400 – 131,800 | 124,700 – 125,400 | ~103,300 |
+| CPU, 15 threads | 31,150 | 32,640 | 34,293 | 33,700 – 34,500 |
+| RTX 5080 | **127,930** | 119,463 | 100,640 | 91,870 |
+| **together, real mining path** | **159,000 – 159,500** | 153,900 – 154,700 | 130,400 – 131,800 | 124,700 – 125,400 |
 
 The combined figure is `--run-for=55 --gpu=all`, not the sum of the two above:
 on the real path the two share a memory system and a job feed, so the sum
@@ -615,6 +615,50 @@ and **85.87 KH/s at 336 suffix blocks** against 74.9k at 8,192. Stage 1 writes
 each 256-byte append as sixteen-byte stores. Mining defaults to four suffix
 blocks per SM (the occupancy this kernel actually reaches) instead of sweeping
 from a few KH/s up through 1,252, which measured slower under a display.
+
+**1.5.6 runs stage 1 underneath the suffix sort.** The three kernels ran one
+after another because they shared one set of texts and suffix arrays, so the
+card did one thing at a time. Stage 1 is 14.7% of GPU time and the SHA check
+7.5%, and both of those were the sort standing still.
+
+They need not be. `gpu/overlap.cu` puts two of them on two streams over separate
+storage and times the pair: **80% of stage 1 disappears into the sort**, and 80%
+of the SHA check with it. They are short of different things — stage 1 of shared
+memory (516 bytes a thread caps it at ~193 threads an SM, and no block size
+changes that), the sort of memory latency, the SHA check of bandwidth — so an SM
+hosting two of them is not paying twice.
+
+So the storage is now two banks, a chunk each, with a stream apiece. A chunk owns
+its bank from stage 1 through to the SHA check, and the bank's own stream orders
+everything that reuses it; the only thing needing an event is the sort itself,
+whose scratch pool is shared by every block and must never host two kernels at
+once. The banks together hold what one bank held, so the overlap is paid for in
+chunk size, not VRAM.
+
+Half of it does not pay, and that is the interesting half. Letting the SHA check
+run under the *next* chunk's sort makes both slower — it reads back the suffix
+arrays the sort has just written, so it fights the sort for exactly what the sort
+is short of, and its own elapsed time nearly trebles:
+
+| | H/s |
+|---|---:|
+| one bank | 123,265 |
+| two banks, SHA overlapping too | 116,116 |
+| two banks, SHA kept out of the way | **127,532** |
+
+So the sort's turn is released after the SHA check rather than before it.
+`--bench --gpu=all` reads **127,930 H/s against 119,463**, and the real mining
+path with the CPU beside it **159.0 – 159.5 KH/s against 153.9 – 154.7**.
+Hashes are unchanged and still bit-identical to the CPU.
+
+Two things measured and not kept. Stage 1's probabilistic hashes read shared
+memory through `ld32le`, which builds a word out of four byte loads — the same
+mistake the suffix kernel's `descKey32` had. Fixing it is exactly neutral: stage
+1 is not short of load slots, it is short of threads. And ablating stage 1 to
+find where its time goes does not work at all, because every part of it feeds
+`lhash`, which picks the next operation — remove any of it and the loop takes a
+different path through a different number of iterations. The numbers that come
+back are real and mean nothing.
 
 **1.5.5 turns the scatter inside out.** Placing the sorted positions gave a
 whole descriptor -- a run of ~5.7 positions -- to one thread, which copied it a
@@ -858,7 +902,7 @@ profile-guided optimisation (+1.2%).
 
 | | Before | Now | |
 |---|---:|---:|---:|
-| RTX 5080 | 7.45 KH/s | 119,463 H/s | +1504% |
+| RTX 5080 | 7.45 KH/s | 127,930 H/s | +1617% |
 
 *Before* is the GPU on its own on the real mining path
 (`--mining-threads=1 --gpu=0 --run-for=90`), measured when GPU support first
@@ -866,8 +910,8 @@ worked. *Now* is `--bench --gpu=all`, which runs the same kernels over the same
 batch size without needing a node. The intermediate 12.28 KH/s this table used
 to carry was the gain from the packed-key change described below; the rest came
 from the block-count sweep, the stage-1 work after it, the byte-load session at
-1.4.0, the merge described next, and the batch pipeline and coalesced scatter at
-1.5.4 and 1.5.5.
+1.4.0, the merge described next, the batch pipeline and coalesced scatter at
+1.5.4 and 1.5.5, and the overlapped stage 1 at 1.5.6.
 
 **The card was waiting for a CPU.** Taking two CPU mining threads away made the
 GPU faster, which should not happen: the CPU threads and the card share nothing

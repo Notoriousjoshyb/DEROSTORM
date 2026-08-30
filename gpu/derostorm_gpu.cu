@@ -67,7 +67,13 @@
 // bank is picked by (byte address / 4) % 32, so a flat 512-byte stride would
 // put every lane of a warp on one bank and serialise it 32 ways.
 #define S1_STRIDE 516
+// Threads a stage-1 block carries. It does not change how many stage-1 threads
+// an SM can hold -- 516 bytes of shared memory a thread pins that at ~193
+// whatever the block size -- but it does change the granularity the scheduler
+// has to work with when stage 1 is sharing an SM with the sort.
+#ifndef S1_BLOCK
 #define S1_BLOCK  64
+#endif
 
 // Nonces per dsg_search call when the caller does not say. This is the job
 // latency knob: the miner cannot notice a new job until a batch returns, and a
@@ -84,6 +90,52 @@
 // Batches that may be in flight at once. Two is the whole point: one running on
 // the card, one queued behind it. See dsg_slot.
 #define DSG_SLOTS 2
+
+// Sets of inter-kernel storage, and with them how much of the batch can be in
+// the air at once.
+//
+// One bank is the obvious arrangement and it leaves the card doing one thing at
+// a time: stage 1, then the suffix sort, then the SHA check, each waiting for
+// the last because they all share one set of texts and suffix arrays. Measured
+// on a 5080 that is 14.7% of GPU time in stage 1 and 7.5% in the SHA check, both
+// of which the suffix sort could have been running underneath.
+//
+// It can. gpu/overlap.cu puts stage 1 and the suffix sort on two streams over
+// separate storage and times them: 80% of stage 1 disappears into the sort, and
+// 80% of the SHA check with it. They are limited by different things -- stage 1
+// by 516 bytes of shared memory a thread, the sort by memory latency, the SHA
+// check by bandwidth -- so an SM hosting two of them is not paying twice.
+//
+// Two banks cost a chunk half the size, because the storage is the whole VRAM
+// budget either way, and they cost the sort ~6.5% of its own elapsed time for
+// hosting stage 1. What is left after both is real: 123,265 -> 127,532 H/s on a
+// 5080, +3.5%, and +2.1% on the real mining path with the CPU beside it. See
+// DSG_OVERLAP_SHA for the half of this that does not pay.
+//
+// Build with -DDSG_BANKS=1 for the old one-thing-at-a-time shape.
+#ifndef DSG_BANKS
+#define DSG_BANKS 2
+#endif
+
+// Whether the SHA check is allowed to run under the next chunk's sort as well.
+//
+// Stage 1 and the SHA check look alike from a distance -- both are short kernels
+// sitting either side of the sort -- and they behave nothing alike underneath
+// it. Stage 1 waits on shared memory and hides almost for free. The SHA check
+// reads back the suffix arrays the sort has just written, so it fights the sort
+// for the one thing the sort is short of, and both lose: measured with it
+// allowed, its own elapsed time nearly trebled and the batch came out slower
+// than with one bank at all.
+//
+//   one bank                              123,265 H/s
+//   two banks, SHA overlapping too        116,116
+//   two banks, SHA kept out of the way    127,532
+//
+// So the sort's turn is released after the SHA check rather than before it.
+// Stage 1 still overlaps; the SHA check no longer does.
+#ifndef DSG_OVERLAP_SHA
+#define DSG_OVERLAP_SHA 0
+#endif
 
 // Winning nonces one batch can report. A share is rare enough that this is
 // never approached; it only bounds the buffer.
@@ -128,14 +180,31 @@ struct dsg_context {
     int32_t*  words;    // suffix scratch: 8 int32 arrays per block
     uint64_t* keys;     // suffix scratch: 2 uint64 arrays per block
 
-    uint8_t*  texts;    // chunk * ASTRO_MAX_TEXT
-    int32_t*  lens;     // chunk
-    int32_t*  sa;       // chunk * ASTRO_MAX_TEXT
-    int32_t*  next;     // the suffix kernel's work counter, one int
+    // One bank per set of inter-kernel storage. A chunk owns a bank for its
+    // whole life -- stage 1 writes its texts, the sort reads them and writes its
+    // suffix arrays, the SHA check reads those -- so consecutive chunks on
+    // different banks do not have to wait for each other.
+    struct {
+        uint8_t*  texts;   // chunk * ASTRO_MAX_TEXT
+        int32_t*  lens;    // chunk
+        int32_t*  sa;      // chunk * ASTRO_MAX_TEXT
+        int32_t*  next;    // the suffix kernel's work counter, one int
 
-    // One stream, not the legacy default one, so the uploads and the kernels
-    // are ordered against each other and against nothing else.
-    cudaStream_t stream;
+        // Not the legacy default stream, so the uploads and the kernels are
+        // ordered against each other and against nothing else. One per bank is
+        // what lets two chunks be in the air; the ordering a chunk needs
+        // against its own bank's previous chunk is the stream's own.
+        cudaStream_t stream;
+
+        // Recorded after this bank's suffix launch. The other bank waits on it
+        // before its own: the sort's scratch pool is indexed by blockIdx and
+        // shared by every block, so two suffix kernels must never overlap even
+        // though everything around them may.
+        cudaEvent_t  sorted;
+        cudaEvent_t  drained;   // after this bank's last kernel of a batch
+    } bank[DSG_BANKS];
+
+    int nextBank;       // bank the next chunk takes
 
     uint8_t*  dHashOne;
 
@@ -520,11 +589,17 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     if (batch < S1_BLOCK) batch = S1_BLOCK;
     c->batch = batch;
 
-    // One chunk per batch when it fits, halving until it does. A card too small
-    // for the whole batch at once simply runs more launches, and the work queue
-    // in the suffix kernel is what keeps that from costing much.
-    c->chunk = c->batch;
-    while (c->chunk > S1_BLOCK && (size_t)c->chunk * perChunkHash > forChunk)
+    // The batch split across the banks, halving until the whole set fits. A
+    // card too small for that simply runs more chunks, and the work queue in
+    // the suffix kernel is what keeps that from costing much.
+    //
+    // Note what this does not cost: the banks together hold what one bank held
+    // before, because the chunk is divided by the same number. The overlap is
+    // paid for in chunk size, not in VRAM.
+    c->chunk = c->batch / DSG_BANKS;
+    if (c->chunk < S1_BLOCK) c->chunk = S1_BLOCK;
+    while (c->chunk > S1_BLOCK &&
+           (size_t)DSG_BANKS * c->chunk * perChunkHash > forChunk)
         c->chunk /= 2;
 
 #define ALLOC(p, bytes) do { \
@@ -538,10 +613,12 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     // straddle a text offset, so the last few positions of the last text in the
     // chunk reach up to four bytes past it. They are fetched and never used,
     // but an unmapped fetch is still a fault.
-    ALLOC(c->texts, (size_t)c->chunk * ASTRO_MAX_TEXT + 8);
-    ALLOC(c->lens,  (size_t)c->chunk * 4);
-    ALLOC(c->sa,    (size_t)c->chunk * ASTRO_MAX_TEXT * 4);
-    ALLOC(c->next,  sizeof(int32_t));
+    for (int b = 0; b < DSG_BANKS; b++) {
+        ALLOC(c->bank[b].texts, (size_t)c->chunk * ASTRO_MAX_TEXT + 8);
+        ALLOC(c->bank[b].lens,  (size_t)c->chunk * 4);
+        ALLOC(c->bank[b].sa,    (size_t)c->chunk * ASTRO_MAX_TEXT * 4);
+        ALLOC(c->bank[b].next,  sizeof(int32_t));
+    }
     ALLOC(c->dHashOne, 32);
 
     // A few hundred bytes a slot. The second slot is what lets the miner keep
@@ -565,10 +642,21 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     }
 #undef HALLOC
 
-    // cudaStreamNonBlocking: this must not be serialised against the legacy
+    // cudaStreamNonBlocking: these must not be serialised against the legacy
     // default stream, which is where the plain cudaMemcpy calls elsewhere run.
-    if ((e = cudaStreamCreateWithFlags(&c->stream, cudaStreamNonBlocking)) != cudaSuccess) {
-        setErr("cudaStreamCreate", e); dsg_free(c); return DSG_ERR_ALLOC;
+    for (int b = 0; b < DSG_BANKS; b++) {
+        if ((e = cudaStreamCreateWithFlags(&c->bank[b].stream,
+                                           cudaStreamNonBlocking)) != cudaSuccess) {
+            setErr("cudaStreamCreate", e); dsg_free(c); return DSG_ERR_ALLOC;
+        }
+        if ((e = cudaEventCreateWithFlags(&c->bank[b].sorted,
+                                          cudaEventDisableTiming)) != cudaSuccess) {
+            setErr("cudaEventCreate", e); dsg_free(c); return DSG_ERR_ALLOC;
+        }
+        if ((e = cudaEventCreateWithFlags(&c->bank[b].drained,
+                                          cudaEventDisableTiming)) != cudaSuccess) {
+            setErr("cudaEventCreate", e); dsg_free(c); return DSG_ERR_ALLOC;
+        }
     }
 
     // cudaEventDisableTiming: these events only ever gate a wait. Timing
@@ -619,14 +707,18 @@ extern "C" DSG_API void dsg_free(dsg_context* ctx)
     cudaSetDevice(ctx->device);
     // Anything still in flight is reading this memory. Wait for it before any
     // of it is freed.
-    if (ctx->stream) {
-        cudaStreamSynchronize(ctx->stream);
-        cudaStreamDestroy(ctx->stream);
+    for (int b = 0; b < DSG_BANKS; b++) {
+        if (ctx->bank[b].stream) {
+            cudaStreamSynchronize(ctx->bank[b].stream);
+            cudaStreamDestroy(ctx->bank[b].stream);
+        }
+        if (ctx->bank[b].sorted)  cudaEventDestroy(ctx->bank[b].sorted);
+        if (ctx->bank[b].drained) cudaEventDestroy(ctx->bank[b].drained);
+        cudaFree(ctx->bank[b].texts);
+        cudaFree(ctx->bank[b].lens);
+        cudaFree(ctx->bank[b].sa);
+        cudaFree(ctx->bank[b].next);
     }
-    cudaFree(ctx->texts);
-    cudaFree(ctx->lens);
-    cudaFree(ctx->sa);
-    cudaFree(ctx->next);
     cudaFree(ctx->words);
     cudaFree(ctx->keys);
     cudaFree(ctx->dHashOne);
@@ -644,31 +736,66 @@ extern "C" DSG_API void dsg_free(dsg_context* ctx)
     free(ctx);
 }
 
-// Queues the three kernels for `count` consecutive nonces from base. Returns as
-// soon as they are enqueued; the caller synchronises at the end of the batch.
+// Queues the three kernels for `count` consecutive nonces from base on the next
+// bank. Returns as soon as they are enqueued; the caller synchronises at the end
+// of the batch.
 //
-// Everything goes on the context's one stream, which is what orders the work
-// counter's reset against the kernel that reads it and each chunk against the
-// last.
+// A bank's own stream orders everything that reuses its storage: this chunk's
+// stage 1 cannot start writing the texts until the chunk two back has finished
+// reading them, because both are on this stream and there is one chunk between
+// them. That is the whole of the same-bank hazard, and it costs no events.
+//
+// What does need an event is the sort. Its scratch pool is indexed by blockIdx
+// and shared by every block, so two suffix kernels must not overlap however
+// independent their data is; each bank waits for the other's `sorted` before
+// launching its own. Everything else -- this chunk's stage 1 against the last
+// chunk's sort, this chunk's SHA check against the next chunk's sort -- is left
+// free to run at the same time, and that is where the time comes from.
 static cudaError_t runChunk(dsg_context* c, const dsg_slot* sl,
                             uint32_t base, int count, int targetAll, int cap)
 {
     Pool pool; pool.words = c->words; pool.keys = c->keys;
-    cudaStream_t st = c->stream;
+    const int b = c->nextBank;
+    c->nextBank = (b + 1) % DSG_BANKS;
+
+    cudaStream_t st = c->bank[b].stream;
     cudaError_t e;
 
     stage1_kernel<<<(count + S1_BLOCK - 1) / S1_BLOCK, S1_BLOCK,
                     S1_BLOCK * S1_STRIDE, st>>>(
-        sl->dWork, base, count, c->texts, c->lens);
+        sl->dWork, base, count, c->bank[b].texts, c->bank[b].lens);
 
-    if ((e = cudaMemsetAsync(c->next, 0, sizeof(int32_t), st)) != cudaSuccess) return e;
+    if ((e = cudaMemsetAsync(c->bank[b].next, 0, sizeof(int32_t), st)) != cudaSuccess) return e;
+
+#if DSG_BANKS > 1
+    // Wait for whichever bank sorted last. An event that has never been
+    // recorded is not a wait, so the first chunk of the run falls straight
+    // through.
+    for (int o = 0; o < DSG_BANKS; o++) {
+        if (o == b) continue;
+        if ((e = cudaStreamWaitEvent(st, c->bank[o].sorted, 0)) != cudaSuccess) return e;
+    }
+#endif
 
     suffix_kernel<<<c->blocks, BR_BLOCK, BR_SHARED_BYTES, st>>>(
-        c->texts, c->lens, count, pool, c->sa, c->next);
+        c->bank[b].texts, c->bank[b].lens, count, pool,
+        c->bank[b].sa, c->bank[b].next);
+
+#if DSG_BANKS > 1 && DSG_OVERLAP_SHA
+    // Released as soon as the sort is done, so the next bank's sort may start
+    // while this one's SHA check is still running.
+    if ((e = cudaEventRecord(c->bank[b].sorted, st)) != cudaSuccess) return e;
+#endif
 
     sha_check_kernel<<<(count + 63) / 64, 64, 0, st>>>(
-        c->sa, c->lens, count, base,
+        c->bank[b].sa, c->bank[b].lens, count, base,
         sl->dTarget, targetAll, sl->dNonces, cap, sl->dFound);
+
+#if DSG_BANKS > 1 && !DSG_OVERLAP_SHA
+    // Released only after the SHA check, which keeps it out of the next sort's
+    // way. Stage 1 still overlaps; the SHA check no longer does.
+    if ((e = cudaEventRecord(c->bank[b].sorted, st)) != cudaSuccess) return e;
+#endif
 
     return cudaSuccess;
 }
@@ -705,6 +832,11 @@ extern "C" DSG_API int dsg_submit(dsg_context* ctx,
 
     dsg_slot* sl = &ctx->slot[ctx->head];
 
+    // The batch's own scalars go up on bank 0's stream and the other banks wait
+    // for them, so every chunk sees the work and target this batch was given
+    // whichever bank it lands on.
+    cudaStream_t lead = ctx->bank[0].stream;
+
     // Staged through this slot's page-locked buffers. The slot is not in
     // flight -- inflight was checked above -- so nothing on the card is reading
     // them, and a page-locked source is what keeps the upload from bouncing
@@ -713,16 +845,29 @@ extern "C" DSG_API int dsg_submit(dsg_context* ctx,
     memcpy(sl->hTarget, target, 4 * sizeof(uint64_t));
 
     if ((e = cudaMemcpyAsync(sl->dWork, sl->hWork, DSG_WORK_SIZE,
-                             cudaMemcpyHostToDevice, ctx->stream)) != cudaSuccess) {
+                             cudaMemcpyHostToDevice, lead)) != cudaSuccess) {
         setErr("upload work", e); return DSG_ERR_LAUNCH;
     }
     if ((e = cudaMemcpyAsync(sl->dTarget, sl->hTarget, 4 * sizeof(uint64_t),
-                             cudaMemcpyHostToDevice, ctx->stream)) != cudaSuccess) {
+                             cudaMemcpyHostToDevice, lead)) != cudaSuccess) {
         setErr("upload target", e); return DSG_ERR_LAUNCH;
     }
-    if ((e = cudaMemsetAsync(sl->dFound, 0, sizeof(int32_t), ctx->stream)) != cudaSuccess) {
+    if ((e = cudaMemsetAsync(sl->dFound, 0, sizeof(int32_t), lead)) != cudaSuccess) {
         setErr("reset counter", e); return DSG_ERR_LAUNCH;
     }
+#if DSG_BANKS > 1
+    // bank 0's `drained` does double duty here: recorded now, it is what the
+    // other banks wait on before touching this batch's work and target.
+    if ((e = cudaEventRecord(ctx->bank[0].drained, lead)) != cudaSuccess) {
+        setErr("record upload", e); return DSG_ERR_LAUNCH;
+    }
+    for (int b = 1; b < DSG_BANKS; b++) {
+        if ((e = cudaStreamWaitEvent(ctx->bank[b].stream,
+                                     ctx->bank[0].drained, 0)) != cudaSuccess) {
+            setErr("order upload", e); return DSG_ERR_LAUNCH;
+        }
+    }
+#endif
 
     for (int done = 0; done < ctx->batch; done += ctx->chunk) {
         const int count = (ctx->batch - done) < ctx->chunk ? (ctx->batch - done) : ctx->chunk;
@@ -733,22 +878,44 @@ extern "C" DSG_API int dsg_submit(dsg_context* ctx,
         if ((e = cudaGetLastError()) != cudaSuccess) { setErr("kernel", e); return DSG_ERR_LAUNCH; }
     }
 
+#if DSG_BANKS > 1
+    // Every bank's SHA check adds to this batch's counter, so the readback has
+    // to follow all of them, not just the lead bank's.
+    for (int b = 1; b < DSG_BANKS; b++) {
+        if ((e = cudaEventRecord(ctx->bank[b].drained,
+                                 ctx->bank[b].stream)) != cudaSuccess) {
+            setErr("record drain", e); return DSG_ERR_LAUNCH;
+        }
+        if ((e = cudaStreamWaitEvent(lead, ctx->bank[b].drained, 0)) != cudaSuccess) {
+            setErr("order drain", e); return DSG_ERR_LAUNCH;
+        }
+    }
+#endif
+
     // The readback rides the stream too, so by the time the event fires the
     // results are already in host memory and collect only has to read them.
     // The whole nonce buffer comes back rather than just the winners, because
     // the count is not known on the host until it arrives; 256 bytes is
     // cheaper than the extra round trip it would take to find out first.
     if ((e = cudaMemcpyAsync(sl->hFound, sl->dFound, sizeof(int32_t),
-                             cudaMemcpyDeviceToHost, ctx->stream)) != cudaSuccess) {
+                             cudaMemcpyDeviceToHost, lead)) != cudaSuccess) {
         setErr("read counter", e); return DSG_ERR_LAUNCH;
     }
     if ((e = cudaMemcpyAsync(sl->hNonces, sl->dNonces, DSG_MAX_HITS * sizeof(uint32_t),
-                             cudaMemcpyDeviceToHost, ctx->stream)) != cudaSuccess) {
+                             cudaMemcpyDeviceToHost, lead)) != cudaSuccess) {
         setErr("read nonces", e); return DSG_ERR_LAUNCH;
     }
-    if ((e = cudaEventRecord(sl->done, ctx->stream)) != cudaSuccess) {
+    if ((e = cudaEventRecord(sl->done, lead)) != cudaSuccess) {
         setErr("record event", e); return DSG_ERR_LAUNCH;
     }
+    // Deliberately no barrier here. Making the other banks wait for this
+    // batch's readback was the obvious safety and it is both unnecessary and
+    // expensive: the result buffers belong to the slot, not the bank, and a
+    // third batch cannot be submitted until the host has collected the first,
+    // so a slot's buffers are always free by the time they come round again.
+    // With the barrier in, a bank could not start the next batch until this one
+    // had drained completely, which is exactly the serialisation the banks are
+    // there to avoid -- measured, it gave the whole change back.
 
     ctx->head = (ctx->head + 1) % DSG_SLOTS;
     ctx->inflight++;
@@ -828,14 +995,14 @@ extern "C" DSG_API int dsg_hash_one(dsg_context* ctx,
 
     Pool pool; pool.words = ctx->words; pool.keys = ctx->keys;
 
-    if ((e = cudaMemset(ctx->next, 0, sizeof(int32_t))) != cudaSuccess) {
+    if ((e = cudaMemset(ctx->bank[0].next, 0, sizeof(int32_t))) != cudaSuccess) {
         setErr("reset work counter", e); return DSG_ERR_LAUNCH;
     }
     stage1_kernel<<<1, S1_BLOCK, S1_BLOCK * S1_STRIDE>>>(ctx->slot[0].dWork, nonce, 1,
-                                                         ctx->texts, ctx->lens);
-    suffix_kernel<<<1, BR_BLOCK, BR_SHARED_BYTES>>>(ctx->texts, ctx->lens,
-                                                    1, pool, ctx->sa, ctx->next);
-    sha_one_kernel<<<1, 1>>>(ctx->sa, ctx->lens, ctx->dHashOne);
+                                                         ctx->bank[0].texts, ctx->bank[0].lens);
+    suffix_kernel<<<1, BR_BLOCK, BR_SHARED_BYTES>>>(ctx->bank[0].texts, ctx->bank[0].lens,
+                                                    1, pool, ctx->bank[0].sa, ctx->bank[0].next);
+    sha_one_kernel<<<1, 1>>>(ctx->bank[0].sa, ctx->bank[0].lens, ctx->dHashOne);
 
     if ((e = cudaDeviceSynchronize()) != cudaSuccess) { setErr("kernel", e); return DSG_ERR_LAUNCH; }
     if ((e = cudaGetLastError()) != cudaSuccess) { setErr("kernel", e); return DSG_ERR_LAUNCH; }
