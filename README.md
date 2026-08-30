@@ -11,7 +11,7 @@ and `astrobwt/difftest` compares the two on every build.
 ```
       ░▒▒▒▒▒░        ██████  ███████ ██████   ██████  ███████ ████████  ██████  ██████  ███    ███
     ░▒▓█████▓▒░      ██   ██ ██      ██   ██ ██    ██ ██         ██    ██    ██ ██   ██ ████  ████  ┌────────┐
-   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.5.1 │
+   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.5.2 │
    ▒███████████▒     ██   ██ ██      ██   ██ ██    ██      ██    ██    ██    ██ ██   ██ ██  ██  ██  └────────┘
     ░▒▓▓█▟▙█▓▒░      ██████  ███████ ██   ██  ██████  ███████    ██     ██████  ██   ██ ██      ██
         ▝█▛                                    ASTROBWTv3 MINER FOR DERO
@@ -48,7 +48,7 @@ and `astrobwt/difftest` compares the two on every build.
  │ T04 ███████████████▌░  91%  ││     ⠈⠑⠐⠂⠤⠄⠤⠠⠤⠠⠤⠒⠊⠁   ⣀⠴⠃      ││ REJECTED             12 ││ LATENCY   42 ms │
  │ +11 more                    ││              ⠄⠠⠠⠠⠐⠐⠂⠉         ││ STALE                -- ││      GOOD       │
  └─────────────────────────────┘└───────────────────────────────┘└─────────────────────────┘└─────────────────┘
- [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.5.1
+ [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.5.2
 ```
 
 Eight screens, one key each. The **dashboard** above is the one you leave up;
@@ -570,8 +570,9 @@ Headline, all of it at once, re-measured on 2026-08-30 at 1.5.0:
 The combined figure is `--run-for=55 --gpu=all --gpu-blocks=1252`, not the sum of
 the two above: on the real path the two share a memory system and a job feed, so
 the sum overstates it slightly. Three runs, and the block count is pinned so the
-figure is not diluted by the tuning sweep the miner otherwise runs in its first
-twelve seconds.
+figure is not diluted by the tuning sweep the miner otherwise ran in its first
+twelve seconds. 1.5.2 no longer sweeps: it sits at four blocks per SM (336 on a
+5080). Pin that if you want the same number in the logs.
 
 The GPU is where the gain keeps coming from. 1.4.0 was +28% on it in one
 session, all of it the same mistake in different files — see [The GPU was
@@ -599,6 +600,15 @@ the eighteen-second block target and showing the network eighteen times slower
 than it was.
 
 GPU kernels are unchanged from 1.5.0.
+
+**1.5.2 fills the GPU.** `--gpu-batch=0` already claimed to size the launch from
+free VRAM; the library still launched 8,192 hashes, which left stage 1 and SHA
+on half-empty SMs. It now fills the card, capped at 32,768 so job latency stays
+under about half a second. On a 5080 that is 30,016 hashes a batch, ~350 ms,
+and **85.87 KH/s at 336 suffix blocks** against 74.9k at 8,192. Stage 1 writes
+each 256-byte append as sixteen-byte stores. Mining defaults to four suffix
+blocks per SM (the occupancy this kernel actually reaches) instead of sweeping
+from a few KH/s up through 1,252, which measured slower under a display.
 
 **1.4.1 exists for one reason.** The 1.4.0 Linux archives shipped the *previous*
 CUDA kernels: `libderostorm_gpu.so` is built by `nvcc` under Linux, which was
@@ -1351,8 +1361,9 @@ consensus-critical path. Left alone.
   mining has the getwork socket, the console, and the thread that feeds a GPU.
   Ask for the last one with `--mining-threads=16` if the machine is doing
   nothing else.
-- **Let the GPU tune itself once**, then pin the result with `--gpu-blocks=<n>`
-  so later starts skip the sweep. The console prints the value it chose.
+- **Four GPU suffix blocks per SM** is the default (336 on a 5080). Pin it with
+  `--gpu-blocks=<n>` if you would rather a different count; past that the curve
+  is flat or down.
 - Threads are pinned to CPUs automatically, spreading over physical cores before
   using SMT siblings.
 - **Faster RAM is not worth buying for this.** See *What does not help* above:

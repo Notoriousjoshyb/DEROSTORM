@@ -199,7 +199,7 @@ int main(int argc, char** argv)
         if (blocks > cap) blocks = cap;
     }
     int batch = (int)(budget / 2 / perHash);
-    if (batch > 8192) batch = 8192;
+    if (batch > 32768) batch = 32768;
     batch -= batch % S1_BLOCK;
     if (blocks < 1 || batch < S1_BLOCK) { printf("  not enough VRAM\n"); return 1; }
     printf("  VRAM allows %d resident blocks and a batch of %d\n\n", blocks, batch);
@@ -286,7 +286,32 @@ int main(int argc, char** argv)
         blocks = saveBlocks;
     }
 
-    printf("\n  best %.0f H/s at %d blocks\n", best, bestBlocks);
+    printf("\n  best %.0f H/s at %d blocks, batch %d\n", best, bestBlocks, batch);
+
+    printf("\n  %-9s %10s %10s %10s %12s\n", "batch", "stage1 ms", "suffix ms", "sha ms", "H/s");
+    {
+        const int sizes[] = {4096, 8192, 16384, 24576, 32768};
+        for (int n : sizes) {
+            if (n > batch) continue;
+            double bs1 = 1e30, bsu = 1e30, bsh = 1e30;
+            for (int rep = 0; rep < 3; rep++) {
+                float t1 = timeKernel([&]{
+                    stage1_kernel<<<(n + S1_BLOCK - 1) / S1_BLOCK, S1_BLOCK, S1_BLOCK * S1_STRIDE>>>(
+                        dIn, v.count, n, dTexts, dLens); });
+                float t2 = timeKernel([&]{
+                    suffix_kernel<<<bestBlocks, BR_BLOCK, BR_SHARED_BYTES>>>(dTexts, dLens, n, pool, dSA, saStride); });
+                float t3 = timeKernel([&]{
+                    sha_kernel<<<(n + 63) / 64, 64>>>(dSA, saStride, dLens, n, dHash); });
+                if (t1 < bs1) bs1 = t1;
+                if (t2 < bsu) bsu = t2;
+                if (t3 < bsh) bsh = t3;
+            }
+            const double hps = n / ((bs1 + bsu + bsh) / 1000.0);
+            printf("  %-9d %10.1f %10.1f %10.1f %12.0f\n", n, bs1, bsu, bsh, hps);
+            fflush(stdout);
+        }
+    }
+
     printf("  option A whole hash, same card: 3961 H/s -> %.2fx\n", best / 3961.0);
     printf("  CPU reference (9800X3D, 14 threads): 4622 H/s -> %.2fx\n", best / 4622.0);
     printf("  combined CPU+GPU would be %.0f H/s (%.2fx)\n\n",

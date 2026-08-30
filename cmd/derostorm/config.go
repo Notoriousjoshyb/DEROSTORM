@@ -28,13 +28,8 @@ type Config struct {
 	GPUs     []int `json:"gpus,omitempty"`
 	GPUBatch int   `json:"gpu_batch,omitempty"`
 
-	// GPUBlocks pins the suffix kernel's resident block count. 0 means measure
-	// it: the miner sweeps a few multiples of the SM count over its first
-	// batches and keeps the fastest. Those batches are real mining work, so the
-	// sweep costs nothing but the difference between the settings it tries.
-	//
-	// Worth pinning once a machine is known: it saves the sweep on every start,
-	// and the console prints the value the sweep chose so it can be copied here.
+	// GPUBlocks pins the suffix kernel's resident block count. 0 means four
+	// blocks per SM, which is where this kernel plateaus (336 on a 5080).
 	GPUBlocks int `json:"gpu_blocks,omitempty"`
 }
 

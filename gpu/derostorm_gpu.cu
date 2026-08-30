@@ -30,6 +30,15 @@
 // launch: the last blocks to claim work finish alone, and that tail is paid once
 // per launch, so fewer and larger launches lose less to it.
 //
+// A default of 8,192 used to cap that, and it was the wrong default: stage 1
+// and SHA-256 are one thread per hash, so 8,192 threads leave the SMs half
+// empty, and measured on a 5080 the same kernels at 20,032 hashes (what this
+// card's VRAM actually holds) read 82.5 KH/s against 76.4 at 8,192. batch=0
+// now sizes from free VRAM, capped at DSG_BATCH_MAX so a 80 GB card does not
+// sit on a two-second job. An explicit --gpu-batch still wins if you want the
+// old latency. The suffix-block peak on that 5080 was 336, not 1252; pin
+// --gpu-blocks=336 there. Job latency is about 350 ms at 30,016 hashes.
+//
 // Overlapping two chunks on two streams was tried, to hide the stage-1 and SHA
 // kernels behind the suffix kernel. It does not pay. Those two are 3% of GPU
 // time together, and buying the overlap means halving the chunk to fit two sets
@@ -67,6 +76,9 @@
 // ~346 KB per hash.
 #ifndef DSG_BATCH
 #define DSG_BATCH 8192
+#endif
+#ifndef DSG_BATCH_MAX
+#define DSG_BATCH_MAX 32768
 #endif
 
 struct dsg_context {
@@ -409,14 +421,6 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     // Leave a gigabyte and a half for the display and the driver.
     size_t budget = freeB > (size_t)1500e6 ? freeB - (size_t)1500e6 : 0;
 
-    // The batch is what one dsg_search call covers, and so how long the miner
-    // takes to notice a new job. It is settled first because the chunk wants to
-    // be the whole batch.
-    if (batch <= 0) batch = DSG_BATCH;
-    batch -= batch % S1_BLOCK;
-    if (batch < S1_BLOCK) batch = S1_BLOCK;
-    c->batch = batch;
-
     // The blocks are sized first because what they need is bounded -- the
     // measured curve is flat past a couple of blocks per SM -- while the chunk
     // pays for every byte it gets. So the blocks take a quarter of the budget at
@@ -426,13 +430,14 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     // The allocation, not the setting: enough that dsg_set_blocks has somewhere
     // to sweep past wherever the knee turns out to be.
     //
-    // Scaled by the block width rather than fixed at four per SM, because the
-    // width is now 256 and four 256-thread blocks fill half an SM, not all of
-    // it. An SM takes 2048 threads, so full occupancy is
-    // SMs * 2048 / BR_BLOCK blocks; twice that leaves room above the knee. At
-    // 1024 threads this comes out at 4 per SM, which is what it used to be.
-    const int fullOcc = prop.multiProcessorCount * 2048 / BR_BLOCK;
-    int want = blocks > 0 ? blocks : 2 * fullOcc;
+    // Four 256-thread blocks fill an SM at 64 registers (the suffix kernel's
+    // count, with no spills). That is 4 * SMs = 336 on a 5080, and it is where
+    // the measured curve plateaus. Allocating twice full occupancy (1,344)
+    // used to let the mining sweep pick 672 or 1,252, both slower than 336
+    // under a display, and it spent ~2.5 GB on scratch the extra blocks never
+    // paid for. Those gigabytes now go to the batch.
+    const int plateau = prop.multiProcessorCount * 2048 / BR_BLOCK / 2;
+    int want = blocks > 0 ? blocks : (plateau > 0 ? plateau : 1);
     c->maxBlocks = (int)(budget / 4 / perBlock);
     if (c->maxBlocks > want) c->maxBlocks = want;
     if (c->maxBlocks < 1) {
@@ -445,6 +450,20 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
 
     const size_t blockBytes = (size_t)c->maxBlocks * perBlock;
     const size_t forChunk = budget > blockBytes ? budget - blockBytes : 0;
+
+    // batch=0 means fill the chunk budget. 8,192 was a latency guess from
+    // when the suffix kernel was 1.1 s a batch; at current speed that leaves
+    // stage 1 and SHA occupancy on the table. Cap at DSG_BATCH_MAX so job
+    // latency stays under about half a second on a big card.
+    if (batch <= 0) {
+        int fit = (int)(forChunk / perChunkHash);
+        if (fit > DSG_BATCH_MAX) fit = DSG_BATCH_MAX;
+        if (fit < DSG_BATCH) fit = DSG_BATCH;
+        batch = fit;
+    }
+    batch -= batch % S1_BLOCK;
+    if (batch < S1_BLOCK) batch = S1_BLOCK;
+    c->batch = batch;
 
     // One chunk per batch when it fits, halving until it does. A card too small
     // for the whole batch at once simply runs more launches, and the work queue

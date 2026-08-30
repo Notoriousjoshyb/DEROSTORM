@@ -2,10 +2,11 @@ package main
 
 // The GPU benchmark, behind --bench.
 //
-// It exists because the GPU's throughput depends on a setting the miner picks
-// by measurement (see gpu_tune.go), and someone tuning a machine wants to see
-// that curve rather than trust it. It also gives a way to check a change to the
-// kernels without connecting to a node.
+// It exists because the GPU's throughput depends on how many suffix blocks
+// are resident (see gpu_tune.go), and someone tuning a machine wants to see
+// that curve. Mining sits at four per SM; this still sweeps, so a new kernel
+// can move the peak without anyone guessing. It also checks a kernel change
+// without connecting to a node.
 //
 // Every batch is a real search against a real target, so this drives exactly
 // the path mining drives: the same three kernels, the same difficulty check, the
@@ -39,7 +40,7 @@ const (
 func runGPUBench(t *Theme, device int, batch int) float64 {
 	fmt.Printf("\n  %s\n\n", t.C(t.Accent+t.Bold, fmt.Sprintf("GPU %d · %s", device, GPUKind)))
 
-	// A generous block allocation, so the sweep has somewhere to go.
+	// Four blocks per SM is the mining default and the allocation ceiling.
 	g, err := NewGPUContext(device, batch, 0)
 	if err != nil {
 		fmt.Printf("  %s\n\n", t.C(t.Err, err.Error()))

@@ -1,32 +1,17 @@
 package main
 
-// Resident-block tuning for the GPU suffix kernel.
+// Resident-block count for the GPU suffix kernel.
 //
-// The suffix sort is ~97% of GPU hash time, and how many of its blocks are
-// resident decides the throughput: too few and the card is half idle, too many
-// and they compete for the same L2 and memory system. Where that curve peaks is
-// a property of the card and of the kernel, so it is measured rather than fixed.
+// The suffix sort is ~97% of GPU hash time. How many of its blocks are resident
+// decides the throughput: too few and the card is half idle, too many and they
+// compete for L2. This kernel sits at 64 registers and 256 threads, which is four
+// blocks per SM, and that is where the measured curve plateaus (336 on a 5080).
+// Mining uses that default. Sweeping from a few KH/s up through twice full
+// occupancy used to settle on 1,252, which was slower under a display.
 //
-// It is worth knowing how badly a fixed value can age. The miner used to
-// hard-code half a block per SM. On the card it was written for that was the
-// worst of four settings, by 16%. Then the per-tile bookkeeping in
-// blockRadixPass got cheaper, the peak moved, and half a block per SM became the
-// best setting by 8%. The same constant, wrong and then right, without anybody
-// touching it.
-//
-// Two things make the measurement trustworthy on a desktop GPU, which is also
-// driving a display and whatever else is running:
-//
-//   - Settings are interleaved, not measured one after another. A GPU's clocks
-//     sag under sustained load and other processes come and go, both of which
-//     drift by more than the difference being looked for. Cycling through the
-//     candidates repeatedly puts every candidate under the same drift.
-//   - The first batch after each switch is discarded. Changing the grid size
-//     perturbs one batch and no later one.
-//
-// The batches are real mining work. Their nonces are hashed and checked exactly
-// as they would have been anyway, so the sweep costs nothing but the difference
-// between the candidates for the minute or so it lasts.
+// --bench still sweeps, because the peak has moved before. Settings are
+// interleaved and the first batch after each switch is discarded, so a GPU
+// that is also driving a display does not just report the order it ran them in.
 
 import (
 	"fmt"
@@ -90,16 +75,26 @@ func blockCandidates(sms, maxBlocks int) []int {
 	return out
 }
 
-// newBlockTuner returns a tuner, or nil when there is nothing to tune: either
-// the caller pinned a value or the card has room for only one setting.
+// newBlockTuner sets the resident block count and returns nil. Mining does
+// not sweep: unpinned is four per SM, and a pin above that is clamped to the
+// plateau. --bench builds its own curve from blockCandidates.
 func newBlockTuner(g *GPUContext, dev int, pinned int,
 	post func(LogLevel, string, string, ...interface{})) *blockTuner {
 
 	if pinned > 0 {
 		n := pinned
+		plateau := g.SMs() * 4
+		if plateau < 1 {
+			plateau = 1
+		}
+		if n > plateau {
+			post(LogInfo, "gpu", "device %d: %d suffix blocks is past the plateau, using %d (4 per SM)",
+				dev, pinned, plateau)
+			n = plateau
+		}
 		if n > g.MaxBlocks() {
 			post(LogWarn, "gpu", "device %d: %d suffix blocks needs more VRAM than there is, using %d",
-				dev, pinned, g.MaxBlocks())
+				dev, n, g.MaxBlocks())
 			n = g.MaxBlocks()
 		}
 		if err := g.SetBlocks(n); err != nil {
@@ -110,23 +105,25 @@ func newBlockTuner(g *GPUContext, dev int, pinned int,
 		return nil
 	}
 
-	cands := blockCandidates(g.SMs(), g.MaxBlocks())
-	if len(cands) < 2 {
-		return nil
+	// Unpinned: run at four blocks per SM, which is the occupancy the suffix
+	// kernel actually reaches (64 registers, 256 threads). Sweeping from
+	// SMs/4 up through 8×SMs starts the worker at a few KH/s and can settle
+	// on 1,252, which measured slower than 336 on a 5080 that is also driving
+	// a display. --bench still sweeps; this is the mining path.
+	n := g.SMs() * 4
+	if n < 1 {
+		n = 1
 	}
-
-	t := &blockTuner{
-		g: g, post: post, dev: dev, cands: cands,
-		sum: make([]float64, len(cands)),
-		n:   make([]int, len(cands)),
+	if n > g.MaxBlocks() {
+		n = g.MaxBlocks()
 	}
-	if err := g.SetBlocks(cands[0]); err != nil {
+	if err := g.SetBlocks(n); err != nil {
 		post(LogWarn, "gpu", "device %d: %v — leaving the block count alone", dev, err)
-		return nil
+	} else {
+		post(LogInfo, "gpu", "device %d: %d suffix blocks (4 per SM) · pin with --gpu-blocks=%d",
+			dev, n, n)
 	}
-	post(LogInfo, "gpu", "device %d: tuning suffix blocks over %s while mining",
-		dev, joinInts(cands))
-	return t
+	return nil
 }
 
 // observe records one batch and advances the sweep. d is how long the batch
@@ -217,14 +214,3 @@ func (t *blockTuner) curve() string {
 // Tuning reports whether the sweep is still running, so the console can say the
 // hashrate is not settled yet.
 func (t *blockTuner) Tuning() bool { return t != nil && !t.done }
-
-func joinInts(v []int) string {
-	s := ""
-	for i, n := range v {
-		if i > 0 {
-			s += ", "
-		}
-		s += fmt.Sprintf("%d", n)
-	}
-	return s
-}

@@ -260,8 +260,8 @@ type GPUContext struct {
 
 // NewGPUContext opens a device. batch is the number of nonces hashed per call;
 // pass 0 to let the library size it. blocks is the resident block count to
-// reserve suffix-kernel scratch for; pass 0 for the library default, which is
-// deliberately generous so a sweep has room to move.
+// reserve suffix-kernel scratch for; pass 0 for four blocks per SM, which is
+// where this kernel plateaus.
 func NewGPUContext(device, batch, blocks int) (*GPUContext, error) {
 	if err := loadGPU(); err != nil {
 		return nil, err

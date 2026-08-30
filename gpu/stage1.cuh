@@ -188,7 +188,23 @@ __device__ uint32_t astroStage1(const uint8_t* input, int inlen, uint8_t* text,
         // stride it likes. An unaligned caller takes the byte loop and is slow;
         // it is not wrong, and it does not fault.
         uint8_t* dst = text + (tries - 1) * 256;
-        if ((((uintptr_t)s | (uintptr_t)dst) & 3u) == 0) {
+        // Global stores are the cost: ~270 appends, uncoalesced, one thread
+        // per hash. Sixteen-byte stores cut that 4x versus the uint32 loop
+        // the comment used to match. Shared loads stay 4-byte because the
+        // tile stride is 516 (bank-conflict free, not 16-aligned). The
+        // destination is a 256-byte-aligned text slot, so the wide store is
+        // always legal on the mining path.
+        if ((((uintptr_t)dst) & 15u) == 0 && (((uintptr_t)s) & 3u) == 0) {
+            const uint32_t* s32 = (const uint32_t*)s;
+            uint4* d4 = (uint4*)dst;
+#pragma unroll
+            for (int i = 0; i < 16; i++) {
+                uint4 v;
+                v.x = s32[0]; v.y = s32[1]; v.z = s32[2]; v.w = s32[3];
+                s32 += 4;
+                d4[i] = v;
+            }
+        } else if ((((uintptr_t)s | (uintptr_t)dst) & 3u) == 0) {
             const uint32_t* s32 = (const uint32_t*)s;
             uint32_t* d32 = (uint32_t*)dst;
 #pragma unroll

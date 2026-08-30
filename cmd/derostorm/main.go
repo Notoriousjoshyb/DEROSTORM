@@ -31,7 +31,7 @@ import (
 	"github.com/docopt/docopt-go"
 )
 
-const version = "1.5.1"
+const version = "1.5.2"
 
 const usage = `DeroStorm ` + version + `
 AstroBWTv3 miner for DERO. Mines on the CPU, and on NVIDIA GPUs as well when
@@ -65,8 +65,7 @@ Options:
                                   all or off. Overrides the saved setting.
   --gpu-batch=<n>                 Nonces per GPU launch. Default: fill VRAM.
   --gpu-blocks=<n>                Resident blocks in the GPU suffix kernel.
-                                  Default: measure a few settings while mining
-                                  and keep the fastest.
+                                  Default: four per SM (336 on a 5080).
   --theme=<name>                  cyber, default, copper, aurora, ember or
                                   mono.
   --tui                           Force the full-screen console. It is already
