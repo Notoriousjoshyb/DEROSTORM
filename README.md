@@ -344,8 +344,20 @@ Requires **Go 1.22 or newer**. Everything is vendored, so no network access is n
 
 ```bash
 ./build.sh               # build for this machine into ./bin
+./build.sh --native      # build this platform's embedded libraries first
 ./build.sh --all         # cross-compile every supported platform
 ```
+
+**From a fresh clone on Linux, run `--native` once first.** The embedded
+libraries are build products and are not in git, and `linux/amd64` embeds two of
+them, so a plain `./build.sh` stops with the pair it is missing and how to build
+them. Windows is the same story with `.\build.ps1 -Native`; a Mac embeds nothing
+and builds from a clone as it is. See *Building the native libraries* below.
+
+`--all` from either platform needs the *other* platform's libraries too, and no
+toolchain can cross that line: nvcc and the host compiler both target the machine
+they run on. Cutting a release therefore means building on both and copying the
+four files across, which is all they are by the time `go:embed` reaches them.
 
 Targets built by `--all`: `windows/amd64`, `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`.
 

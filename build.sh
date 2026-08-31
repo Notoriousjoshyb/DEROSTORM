@@ -3,6 +3,7 @@
 #
 #   ./build.sh              build for this machine into ./bin
 #   ./build.sh --all        cross-compile every supported platform
+#   ./build.sh --native     build this platform's embedded libraries first
 #   ./build.sh --skip-tests skip the test run (not recommended, see below)
 #   ./build.sh --clean      delete build output and one-off test binaries
 #
@@ -49,9 +50,11 @@ OUTDIR="$(pwd)/bin"
 ALL=0
 SKIP_TESTS=0
 CLEAN=0
+NATIVE=0
 for arg in "$@"; do
   case "$arg" in
     --all)        ALL=1 ;;
+    --native)     NATIVE=1 ;;
     --skip-tests) SKIP_TESTS=1 ;;
     --clean)      CLEAN=1 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
@@ -159,6 +162,45 @@ $entries
 EOF
   [ "$missing" -eq 0 ] || exit 1
 }
+
+# The host's own libraries are checked before the tests, not with the first
+# target, because `go test ./cmd/derostorm/` compiles that package for the host
+# and therefore embeds them too. Checking per target only was enough to give a
+# clear message on a build and no message at all on a clone: the tests ran
+# first and failed with
+#
+#     pattern libderostorm_gpu.so: no matching files found
+#     FAIL github.com/notoriousjoshyb/derostorm/cmd/derostorm [setup failed]
+#
+# which says nothing about what to do. The embedded libraries are gitignored --
+# a 3 MB fat binary in git is 3 MB in git forever -- so a fresh clone never has
+# them and this is the first thing anyone building from one hits.
+# --native builds the embedded libraries this platform can build, which is the
+# Linux pair -- the twin of build.ps1 -Native. It is not the default: the
+# libraries only need rebuilding when their sources change, and a CUDA build
+# across six architectures is minutes against seconds for the Go build.
+#
+# Only Linux has anything to do here. A Mac embeds nothing (gpu_other.go and
+# sa_other.go cover that build), and the Windows DLLs cannot be produced from a
+# Linux toolchain at all -- nvcc and the host compiler both target the machine
+# they run on -- so `--all` from Linux still needs those two copied across from
+# a Windows build. That is not a limitation of this script; it is what a
+# cross-platform fat binary costs.
+if [ "$NATIVE" -eq 1 ]; then
+  case "$(go env GOOS)" in
+    linux)
+      echo "building CUDA kernels (Linux)"
+      sh gpu/buildlib.sh
+      echo "building descriptor suffix sort (Linux)"
+      sh native/buildlib.sh
+      ;;
+    *)
+      echo "--native has nothing to build on $(go env GOOS); skipping"
+      ;;
+  esac
+fi
+
+check_embedded "$(go env GOOS)" "$(go env GOARCH)"
 
 if [ "$SKIP_TESTS" -eq 0 ]; then
   echo "running tests..."
