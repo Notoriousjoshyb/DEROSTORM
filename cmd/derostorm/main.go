@@ -208,8 +208,8 @@ func main() {
 		}
 		if v := optString(opts, "--mining-threads"); v != "" {
 			n, err := strconv.Atoi(v)
-			if err != nil || n < 1 || n > maxThreads {
-				fmt.Fprintf(os.Stderr, "--mining-threads must be between 1 and %d\n", maxThreads)
+			if err != nil || n < 0 || n > maxThreads {
+				fmt.Fprintf(os.Stderr, "--mining-threads must be between 0 and %d\n", maxThreads)
 				os.Exit(2)
 			}
 			threads = n
@@ -278,8 +278,8 @@ func main() {
 	}
 	if v := optString(opts, "--mining-threads"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > maxThreads {
-			fmt.Fprintf(os.Stderr, "--mining-threads must be between 1 and %d\n", maxThreads)
+		if err != nil || n < 0 || n > maxThreads {
+			fmt.Fprintf(os.Stderr, "--mining-threads must be between 0 and %d\n", maxThreads)
 			os.Exit(2)
 		}
 		cfg.Threads = n

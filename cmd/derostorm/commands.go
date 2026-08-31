@@ -163,8 +163,8 @@ func parseThreadArg(s string, current int) (int, error) {
 	if rel != 0 {
 		n = current + rel*n
 	}
-	if n < 1 || n > maxThreads {
-		return 0, fmt.Errorf("threads must be between 1 and %d", maxThreads)
+	if n < 0 || n > maxThreads {
+		return 0, fmt.Errorf("threads must be between 0 and %d", maxThreads)
 	}
 	return n, nil
 }
