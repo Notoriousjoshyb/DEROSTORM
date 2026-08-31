@@ -11,7 +11,7 @@ and `astrobwt/difftest` compares the two on every build.
 ```
       ░▒▒▒▒▒░        ██████  ███████ ██████   ██████  ███████ ████████  ██████  ██████  ███    ███
     ░▒▓█████▓▒░      ██   ██ ██      ██   ██ ██    ██ ██         ██    ██    ██ ██   ██ ████  ████  ┌────────┐
-   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.5.10│
+   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.6.0 │
    ▒███████████▒     ██   ██ ██      ██   ██ ██    ██      ██    ██    ██    ██ ██   ██ ██  ██  ██  └────────┘
     ░▒▓▓█▟▙█▓▒░      ██████  ███████ ██   ██  ██████  ███████    ██     ██████  ██   ██ ██      ██
         ▝█▛                                    ASTROBWTv3 MINER FOR DERO
@@ -48,7 +48,7 @@ and `astrobwt/difftest` compares the two on every build.
  │ T04 ███████████████▌░  91%  ││     ⠈⠑⠐⠂⠤⠄⠤⠠⠤⠠⠤⠒⠊⠁   ⣀⠴⠃      ││ REJECTED             12 ││ LATENCY   42 ms │
  │ +11 more                    ││              ⠄⠠⠠⠠⠐⠐⠂⠉         ││ STALE                -- ││      GOOD       │
  └─────────────────────────────┘└───────────────────────────────┘└─────────────────────────┘└─────────────────┘
- [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.5.10
+ [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.6.0
 ```
 
 Eight screens, one key each. The **dashboard** above is the one you leave up;
@@ -1715,7 +1715,7 @@ zero.
 
 `hiveos/` is a HiveOS custom miner package built on it -- `h-manifest.conf`,
 `h-config.sh`, `h-run.sh`, `h-stats.sh` and a README, packaged as
-`derostorm-1.5.10.tar.gz` and attached to the release. Point a flight sheet's
+`derostorm-1.6.0.tar.gz` and attached to the release. Point a flight sheet's
 *Installation URL* at it, set the miner name to `derostorm`, and put a **derod
 node address in the Pool URL field** -- which is the one thing worth saying
 twice, because this is a solo miner and there is no pool. Accepted counts
@@ -1877,5 +1877,30 @@ miner](https://github.com/Dirtybird99/Dirtybird-C-Miner) by Dirtybird99 (MIT).
 The implementation here is ours; the insight is theirs. `CREDITS.md` has the
 full list.
 
-Mining rewards go to whatever address you configure and to nobody else; there is
-no developer fee.
+## No developer fee
+
+**Every hash this miner finds pays the address you configure, and nobody else.**
+
+There is no developer fee, no fee period, no fee-off switch that quietly turns
+itself back on, and no second address anywhere in the source. The wallet you set
+is read once from your config and handed to the engine, and it is the only
+address the miner has: `grep -rn "dero1" cmd/ internal/` returns the placeholder
+in the setup prompt and nothing else. It is a short read and it is worth doing
+yourself rather than believing a README.
+
+That is not a promise about the future either -- the licence is MIT, so it stays
+checkable in every version.
+
+### Donations
+
+If DeroStorm is earning for you and you would like to send some back, this is
+where:
+
+```
+dero1qypj3sctlt7mefhvdhrvrygj55m40ugl7ml2dukzypxdtd2agpgsjqq2v3n6h
+```
+
+Entirely optional, and it changes nothing about how the miner behaves. Copy the
+address from this file rather than typing it -- DERO addresses carry a checksum,
+so a typo is rejected rather than lost, but the miner will simply refuse to
+start and it is not obvious why.
