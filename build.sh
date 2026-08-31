@@ -40,7 +40,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION=1.5.9
+VERSION=1.5.10
 PKG=./cmd/derostorm
 BOUNDS_PKG=github.com/deroproject/derohe/astrobwt/astrobwtv3
 LDFLAGS="-s -w"

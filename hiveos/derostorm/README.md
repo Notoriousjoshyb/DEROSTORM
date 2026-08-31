@@ -20,7 +20,7 @@ If you want pool mining, this is the wrong miner.
 |---|---|
 | Miner | Custom |
 | Miner name | `derostorm` |
-| Installation URL | wherever you host `derostorm-1.5.9.tar.gz` |
+| Installation URL | wherever you host `derostorm-1.5.10.tar.gz` |
 | Wallet and worker template | your DERO address, e.g. `dero1qy...` |
 | Pool URL | your derod getwork address, e.g. `10.0.0.5:10100` |
 | Extra config arguments | anything below |
@@ -70,9 +70,42 @@ derostorm/
 └── derostorm         the miner, linux/amd64
 ```
 
+## Tuning
+
+**CPU threads are chosen for you.** The miner's own default is "logical CPUs
+minus one", which suits a desktop and is wrong for a rig: every card needs a
+host thread to feed it, and DeroStorm's own measurements show a CPU miner
+competing with that feeder costs more than it earns. `h-config.sh` therefore
+sets `--mining-threads` to *CPUs − cards fed − 1*, never below one. Four threads
+and six cards gets one CPU miner, not three. Put `--mining-threads=N` in the
+extra arguments to override it, and it will honour `--gpu=off` and
+`--gpu=0,1` when working out how many cards are actually being fed.
+
+**Up to 16 cards.** The nonce tagging gives GPUs the byte range 0xf0..0xff, so
+16 is the hard ceiling. Beyond that the extra cards are refused with a log line
+rather than counted and left idle, which is what 1.5.9 and earlier did.
+
+**Block count needs no tuning.** The suffix kernel plateaus at four resident
+blocks per SM and stays flat above it — measured 134,209 H/s at 336 blocks
+against 134,214 at 672 and 133,597 at 1,344 on a 5080. The default is already
+the plateau. `--gpu-blocks=N` is there if you want to pin it.
+
+**What has not been measured, honestly.** Every Linux figure here was taken
+under WSL, which virtualises the GPU. Four runs on the same binary read
+136.4, 122.2, 117.1 and 137.6 KH/s — a 15% spread, against 5% for the same
+binary on Windows. That noise is the virtualisation, not Linux, and it is too
+loud to tune against. HiveOS runs on bare metal and should sit closer to the
+Windows figure; the historical gap when it was last measured properly was about
+2.5%. If you have numbers from a real rig they are worth more than anything in
+this paragraph.
+
+Two things worth checking on the rig itself, neither of which this package can
+do for you: the CPU governor (HiveOS may boot in `powersave`) and persistence
+mode on the cards.
+
 ## Requirements
 
-- linux/amd64. There is no arm64 GPU build; see the main README.
+- linux/amd64, up to 16 NVIDIA cards. There is no arm64 GPU build; see the main README.
 - An NVIDIA driver, for GPU mining. The CUDA runtime is linked in statically, so
   nothing else has to be installed. Cards from Turing (RTX 20xx) up are covered,
   including Blackwell; CUDA 13 dropped Pascal and Volta.

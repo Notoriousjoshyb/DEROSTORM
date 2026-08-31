@@ -38,8 +38,17 @@ import (
 )
 
 // maxGPUs bounds the per-device hash counters. Nonce-space byte 47 gives GPUs
-// the range 0xf0..0xff, so this cannot exceed 16.
-const maxGPUs = 8
+// the range 0xf0..0xff, so this cannot exceed 16, and 16 is what it is: mining
+// rigs routinely carry twelve cards and HiveOS will happily boot more. At 8 a
+// twelve-card rig started twelve workers, four of which returned immediately on
+// the bounds check below while the console went on reporting twelve -- four
+// cards idle and nothing saying so.
+//
+// The ceiling is real and cannot be lifted here: CPU threads tag their nonces
+// with their thread id, so the GPU range has to stay above any plausible thread
+// count, and 0xf0 is where that line was drawn. Past 16 devices the tagging
+// scheme itself has to change.
+const maxGPUs = 16
 
 // gpuWorkSize is the miniblock the GPU library expects, and must equal the
 // DSG_WORK_SIZE the kernels are compiled with.
@@ -308,6 +317,13 @@ func (e *Engine) SetGPUs(devices []int, batch, blocks int) {
 	}
 	for _, d := range devices {
 		if _, running := e.gpuWorkers[d]; running {
+			continue
+		}
+		// Refuse here rather than in the worker. RunGPUMiner also checks, but
+		// by then the device is in gpuWorkers and counted, so the console
+		// reported a card that had already given up.
+		if d < 0 || d >= maxGPUs {
+			e.post(LogError, "gpu", "device %d is past the %d this build supports and is not being mined", d, maxGPUs)
 			continue
 		}
 		stop := make(chan struct{})

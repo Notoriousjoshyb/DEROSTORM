@@ -31,7 +31,7 @@ import (
 	"github.com/docopt/docopt-go"
 )
 
-const version = "1.5.9"
+const version = "1.5.10"
 
 const usage = `DeroStorm ` + version + `
 AstroBWTv3 miner for DERO. Mines on the CPU, and on NVIDIA GPUs as well when
@@ -707,6 +707,13 @@ func parseGPUList(v string) ([]int, error) {
 		n := GPUDeviceCount()
 		if n == 0 {
 			return nil, fmt.Errorf("no CUDA device found")
+		}
+		// Trim to what the nonce tagging can address. "all" used to mean
+		// literally every device the driver reported, which on a rig with more
+		// cards than maxGPUs produced indices that started a worker, failed the
+		// bounds check, and left the console counting them anyway.
+		if n > maxGPUs {
+			n = maxGPUs
 		}
 		devs := make([]int, n)
 		for i := range devs {
