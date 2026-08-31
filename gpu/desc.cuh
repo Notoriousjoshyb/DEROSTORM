@@ -33,7 +33,8 @@
 //
 //   arena     Every column of a run emits every one of its blocks exactly once,
 //             so a run of `len` blocks emits 256*len positions. Summed over
-//             runs that is 256 * total_blocks, which is n. Run starting at
+//             runs that is 256 * total_blocks, which is n.
+//             Run starting at
 //             block g owns arena[256*g .. 256*(g+len)).
 //
 //   order     A run needs `len` entries and the run lengths sum to the block
@@ -193,6 +194,29 @@ static_assert(DESC_CHUNKS * DESC_CHUNK_COLS == 256,
 // Blocks in the longest text, which is what the order and run tables are sized
 // for. ASTRO_MAX_TEXT is ASTRO_MAX_TRIES*256, so this is ASTRO_MAX_TRIES.
 #define DESC_MAX_BLOCKS 278
+
+// How many of the descriptor key's four bytes the sort actually orders by.
+//
+// The walk builds a four-byte key and groups the suffixes that share all four.
+// Nothing requires four. Grouping on three does two things at once: the radix
+// sort orders 24 bits in four passes instead of 32 in five, and it has fewer
+// descriptors to order, because a coarser key merges neighbouring groups into
+// one. What it costs is collisions -- more key groups hold more than one
+// descriptor -- and the merge that resolves them is 1.6% of the kernel against
+// the radix's 20.7%, so there is room for it to grow.
+//
+// The CPU sort settled on three bytes for the same reason and measured the
+// fourth byte a clear loss: it cut colliding groups 329 -> 247 and paid a third
+// radix pass for it, 5,403 -> 5,267 texts/s. This is that trade on the GPU.
+//
+// 4 restores the shipped behaviour exactly. Only 3 and 4 are meaningful; the
+// merge's tail comparison starts at DESC_KEY_BYTES, which is what makes the
+// group's shared bytes free.
+#ifndef DESC_KEY_BYTES
+#define DESC_KEY_BYTES 3
+#endif
+#define DESC_KEY_DROP  (8 * (4 - DESC_KEY_BYTES))
+#define DESC_KEY_OF(k) ((uint32_t)(k) >> DESC_KEY_DROP)
 
 // How a key group that collides on all four bytes is resolved.
 //
@@ -547,6 +571,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
     __shared__ int     s_fail;
     __shared__ int     s_bump;   // bump allocator for the merge's boundaries
     __shared__ int     s_nbig;   // colliding groups handed to the block-wide merge
+    __shared__ int     s_ncol;   // colliding key groups the scatter found
     __shared__ int     s_bbase;  // that merge's boundary allocation, one at a time
 
     PROF_DECL;
@@ -556,7 +581,9 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
 
     // The bump allocator starts past the slot the big-group list occupies; see
     // step 6b, which parks that list in the same dead array.
-    if (tid == 0) { s_ndesc = 0; s_fail = 0; s_bump = 2 * DESC_BIG_MAX; s_nbig = 0; }
+    if (tid == 0) {
+        s_ndesc = 0; s_fail = 0; s_bump = 2 * DESC_BIG_MAX; s_nbig = 0; s_ncol = 0;
+    }
     blockRadixInit(sh);   // zeroes the per-tile matrix the sort relies on
 
 #if DESC_TEXT_SHARED
@@ -670,6 +697,8 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
 
     PROF_WALK_BEG();
     for (int q = tid; q < ntask; q += BR_BLOCK) {
+        PROF_TASK_DECL;
+        PROF_TASK_BEG();
         const int r = q / DESC_CHUNKS;
         const int c = q - r * DESC_CHUNKS;    // 0 is the top of the text
         const int g0 = s_start[r];
@@ -689,6 +718,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
 
         // Seed with the order of the suffixes starting at each block's last
         // byte. Insertion sort: len is the blocks in a run, typically four.
+        PROF_SEED_BEG();
         for (int i = 0; i < len; i++) ord[i] = base + i * 256;
         for (int i = 1; i < len; i++) {
             const int32_t v = ord[i];
@@ -701,6 +731,8 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         }
         // The chunk's one full key read; every column below it slides.
         for (int i = 0; i < len; i++) key[i] = descKey32(t, n, ord[i] + hi);
+        PROF_SEED_END(len);
+        PROF_COLS_BEG();
 
         // Which of this chunk's columns are constant across the run, in address
         // order. The walk used to rediscover that with `len` scattered loads per
@@ -744,6 +776,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                 col_same[off] = same;
             }
         }
+        PROF_COLS_END(len);
 
         for (int rel = hi; rel >= lo; rel--) {
             // Where this column's positions go. Every column of a run emits
@@ -757,12 +790,13 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
             while (i < len) {
                 const uint32_t k = key[i];
                 int j = i + 1;
-                while (j < len && key[j] == k) j++;
+                while (j < len && DESC_KEY_OF(key[j]) == DESC_KEY_OF(k)) j++;
 
                 const uint32_t off = (uint32_t)((size_t)g0 * 256 + aw);
                 for (int x = i; x < j; x++) arena[aw++] = (uint32_t)(ord[x] + rel);
 
                 const int d = atomicAdd(&s_ndesc, 1);
+                PROF_TASK_EMIT();
                 sc.words[d] = ((uint64_t)k << 32) |
                               ((uint64_t)off << DESC_LEN_BITS) | (uint32_t)(j - i);
                 i = j;
@@ -806,6 +840,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                 key[y] = kv;
             }
         }
+        PROF_TASK_END(len);
     }
 
     PROF_WALK_END();
@@ -828,7 +863,8 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
 
     // ---- 3. sort the descriptors by key. The key is the top 32 bits of the
     // word, so this is the block-wide radix sort with nothing packed around it.
-    uint64_t* sorted = blockRadixSort(sc.words, sc.words2, nd, 32, 32, sh);
+    uint64_t* sorted = blockRadixSort(sc.words, sc.words2, nd,
+                                      32 + DESC_KEY_DROP, 32 - DESC_KEY_DROP, sh);
     PROF_ADD(PH_D_RADIX);
 
     // ---- 4. output offsets: an exclusive scan over the sorted lengths. A key
@@ -870,6 +906,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         // the same answer, and would take 5.7 times the barriers to do it.
         int32_t*  const s_beg = (int32_t*)sh;              // first output of k
         uint32_t* const s_aof = (uint32_t*)(s_beg + BR_BLOCK);  // its arena slot
+        uint32_t* const s_key = s_aof + BR_BLOCK;          // and its sort key
         __shared__ int32_t s_end;                          // one past the window
 
         for (int dbase = 0; dbase < nd; dbase += BR_BLOCK) {
@@ -880,9 +917,39 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                 const int32_t  e = sc.offs[dbase + tid];
                 s_beg[tid] = e - (int32_t)(w & DESC_LEN_MASK);
                 s_aof[tid] = (uint32_t)((w >> DESC_LEN_BITS) & 0xFFFFFu);
+                s_key[tid] = (uint32_t)(w >> 32);
                 if (tid == nt - 1) s_end = e;
             }
             __syncthreads();
+
+            // Which key groups collide, answered here rather than in a pass of
+            // its own. Step 5 used to walk all ~20,000 descriptors again to ask
+            // exactly this, of exactly these words, and it read three of them
+            // per descriptor to do it -- the descriptor, its predecessor and its
+            // successor. All three are in the window this loop has already read,
+            // so the question costs shared memory instead of a second sweep of
+            // the array, and step 5 is handed the ~250 groups that answer yes
+            // instead of the whole array to sift.
+            //
+            // Only the two descriptors on the window's edges reach outside it,
+            // and they read the one word next to the window rather than the
+            // whole of it.
+            if (tid < nt) {
+                const uint32_t k = s_key[tid];
+                const int i = dbase + tid;
+                const bool head = (i == 0) ||
+                    (tid > 0 ? (DESC_KEY_OF(s_key[tid - 1]) != DESC_KEY_OF(k))
+                             : (DESC_KEY_OF(sorted[i - 1] >> 32) != DESC_KEY_OF(k)));
+                if (head) {
+                    const bool more = (tid + 1 < nt)
+                        ? (DESC_KEY_OF(s_key[tid + 1]) == DESC_KEY_OF(k))
+                        : (i + 1 < nd &&
+                           DESC_KEY_OF(sorted[i + 1] >> 32) == DESC_KEY_OF(k));
+                    // From the top of the dead array down, so the merge's bump
+                    // allocator can keep growing from the bottom.
+                    if (more) dead[2 * n - 1 - atomicAdd(&s_ncol, 1)] = i;
+                }
+            }
 
             for (int q = s_beg[0] + tid; q < s_end; q += BR_BLOCK) {
                 // The last descriptor of the window whose span starts at or
@@ -943,13 +1010,25 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
 #endif
     __syncthreads();
 #else
-    for (int i = tid; i < nd; i += BR_BLOCK) {
+#if DESC_COOP_SCATTER
+    const int ncol = s_ncol;    // step 5a already found them
+#else
+    const int ncol = nd;
+#endif
+    for (int ci = tid; ci < ncol; ci += BR_BLOCK) {
+#if DESC_COOP_SCATTER
+        const int i = dead[2 * n - 1 - ci];
+#else
+        const int i = ci;
+#endif
         const uint64_t w = sorted[i];
         const uint32_t key = (uint32_t)(w >> 32);
-        if (i > 0 && (uint32_t)(sorted[i - 1] >> 32) == key) continue;  // not first
+#if !DESC_COOP_SCATTER
+        if (i > 0 && DESC_KEY_OF(sorted[i - 1] >> 32) == DESC_KEY_OF(key)) continue;
+#endif
 
         int j = i + 1;
-        while (j < nd && (uint32_t)(sorted[j] >> 32) == key) j++;
+        while (j < nd && DESC_KEY_OF(sorted[j] >> 32) == DESC_KEY_OF(key)) j++;
 
         const uint32_t len0 = (uint32_t)(w & DESC_LEN_MASK);
         const int32_t o = sc.offs[i] - (int32_t)len0;
@@ -997,7 +1076,9 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         // this array holds.
         const int nb = 2 * (nlist0 + 1);
         const int bbase = atomicAdd(&s_bump, nb);
-        if (bbase + nb > 2 * n) { atomicExch(&s_fail, 1); continue; }
+        // The collision list step 5a wrote grows down from 2n, so the space
+        // this allocator may use ends where that list starts.
+        if (bbase + nb > 2 * n - ncol) { atomicExch(&s_fail, 1); continue; }
         int32_t* ba = dead + bbase;
         int32_t* bb = dead + bbase + nlist0 + 1;
 
@@ -1031,7 +1112,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                     int p1 = ba[l + 1], e1 = ba[l + 2];
                     while (p0 < e0 && p1 < e1) {
                         // 4: every position here shares the group's key.
-                        b[pos++] = descSuffixLessFrom(t, n, a[p1], a[p0], 4)
+                        b[pos++] = descSuffixLessFrom(t, n, a[p1], a[p0], DESC_KEY_BYTES)
                                        ? a[p1++] : a[p0++];
                     }
                     while (p0 < e0) b[pos++] = a[p0++];
@@ -1155,7 +1236,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                     while (lo < hi) {
                         const int mid = (lo + hi + 1) >> 1;
                         if (descSuffixLessFrom(t, n, a[s1 + diag - mid],
-                                               a[s0 + mid - 1], 4))
+                                               a[s0 + mid - 1], DESC_KEY_BYTES))
                             hi = mid - 1;
                         else
                             lo = mid;
@@ -1167,7 +1248,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                     while (d < stop) {
                         const bool takeB = (i >= n0) ||
                             (j < n1 && descSuffixLessFrom(t, n, a[s1 + j],
-                                                          a[s0 + i], 4));
+                                                          a[s0 + i], DESC_KEY_BYTES));
                         b[d++] = takeB ? a[s1 + j++] : a[s0 + i++];
                     }
                 }

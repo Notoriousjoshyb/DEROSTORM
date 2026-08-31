@@ -29,6 +29,20 @@ prof\build.bat
 gpu\prof\prof.exe gpu\vectors.bin
 ```
 
+## The per-task table
+
+The walk gives one task to one thread, so the table under the phase shares times
+each thread's own task and buckets it by the run's length, with the descriptors
+it emitted and how much of it went on the chunk seed. It is what says the walk
+is nearly all fixed cost per column -- 13,092 cycles at length 1 against 13,478
+at the mean length of 4.34, for 45 times the data at length 45.
+
+Read the seed column with care. At length 1 the seed is one `descKey32` and two
+shared stores, and it measures 32% of the task: a lane that has finished cannot
+leave until the warp reconverges, so it is billed for the slowest lane in its
+warp. The column is a warp measurement wearing a per-task label, which is useful
+as long as it is read that way.
+
 ## Reading it
 
 Absolute cycles mean little. The marks add barriers where the code had none, the

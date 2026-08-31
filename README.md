@@ -11,7 +11,7 @@ and `astrobwt/difftest` compares the two on every build.
 ```
       ░▒▒▒▒▒░        ██████  ███████ ██████   ██████  ███████ ████████  ██████  ██████  ███    ███
     ░▒▓█████▓▒░      ██   ██ ██      ██   ██ ██    ██ ██         ██    ██    ██ ██   ██ ████  ████  ┌────────┐
-   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.5.6 │
+   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.5.8 │
    ▒███████████▒     ██   ██ ██      ██   ██ ██    ██      ██    ██    ██    ██ ██   ██ ██  ██  ██  └────────┘
     ░▒▓▓█▟▙█▓▒░      ██████  ███████ ██   ██  ██████  ███████    ██     ██████  ██   ██ ██      ██
         ▝█▛                                    ASTROBWTv3 MINER FOR DERO
@@ -48,7 +48,7 @@ and `astrobwt/difftest` compares the two on every build.
  │ T04 ███████████████▌░  91%  ││     ⠈⠑⠐⠂⠤⠄⠤⠠⠤⠠⠤⠒⠊⠁   ⣀⠴⠃      ││ REJECTED             12 ││ LATENCY   42 ms │
  │ +11 more                    ││              ⠄⠠⠠⠠⠐⠐⠂⠉         ││ STALE                -- ││      GOOD       │
  └─────────────────────────────┘└───────────────────────────────┘└─────────────────────────┘└─────────────────┘
- [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.5.6
+ [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.5.8
 ```
 
 Eight screens, one key each. The **dashboard** above is the one you leave up;
@@ -559,26 +559,42 @@ otherwise. Everything in this section except the *Before* columns and the
 *What does not help* experiments comes from `derostorm --bench`, which needs no
 node and no wallet, so you can reproduce it on your own machine in a minute.
 
-Headline, all of it at once, re-measured on 2026-08-30 at 1.5.6:
+Headline, all of it at once, re-measured on 2026-08-31 at 1.5.8:
 
-| | H/s | at 1.5.5 | at 1.5.0 | at 1.4.0 |
-|---|---:|---:|---:|---:|
-| CPU, 15 threads | 31,150 | 32,640 | 34,293 | 33,700 – 34,500 |
-| RTX 5080 | **127,930** | 119,463 | 100,640 | 91,870 |
-| **together, real mining path** | **159,000 – 159,500** | 153,900 – 154,700 | 130,400 – 131,800 | 124,700 – 125,400 |
+| | H/s | at 1.5.6 | at 1.5.5 | at 1.5.0 | at 1.4.0 |
+|---|---:|---:|---:|---:|---:|
+| CPU, 15 threads | 33,000 | 32,940 | 32,640 | 34,293 | 33,700 – 34,500 |
+| RTX 5080 | **142,400** | 128,000 | 119,463 | 100,640 | 91,870 |
+| together, `--bench` sum | **175,400** | 160,900 | | | |
+| **together, real mining path** | not re-measured | **159,000 – 159,500** | 153,900 – 154,700 | 130,400 – 131,800 | 124,700 – 125,400 |
 
-The combined figure is `--run-for=55 --gpu=all`, not the sum of the two above:
-on the real path the two share a memory system and a job feed, so the sum
-overstates it slightly. Three runs, and 1.5.2 onwards no longer sweeps the block
-count — it sits at four blocks per SM (336 on a 5080), so the figure is not
-diluted by a tuning sweep in the first twelve seconds.
+Two notes on that table, because the columns are not all the same measurement.
 
-The CPU row is 1.6k lower than at 1.5.0 and the CPU did not get slower: nothing
-on that path changed except the descriptor compare at 1.5.3, which measured
-faster. Two `--bench` runs back to back read 32,637 and 32,606, so it is not
-scatter either — it is this machine on this day, and it is left as measured
-rather than quietly carried forward from a better one. The GPU and combined rows
-were taken in the same session, so the comparison between them holds.
+The 1.5.8 and 1.5.6 GPU figures were taken **on the same day, interleaved, on
+the same machine** — 142.18 / 142.55 against 128.06 / 127.91, +11.2% — so the
+comparison between those two is sound. The 1.5.6 column's own headline, 127,930, was
+measured a day earlier; the card reads about 1% higher today and ~8% higher warm
+than on the first run of a session, which is why nothing here is carried forward
+between days.
+
+The real mining path was **not** re-measured at 1.5.8. It needs a node and it
+submits shares, and this session had neither reason nor permission to do that,
+so the `--bench` sum is given instead and labelled as such. The sum overstates
+the real path slightly — mining shares a memory system and a job feed that the
+benchmark does not — so read 175,400 as an upper bound and 1.5.6's 159.0 – 159.5
+as the last honest real-path number.
+
+1.5.2 onwards no longer sweeps the block count — it sits at four blocks per SM
+(336 on a 5080), so no figure here is diluted by a tuning sweep in the first
+twelve seconds.
+
+The CPU row is 1.3k lower than at 1.5.0 and the CPU did not get slower: nothing
+on that path has changed since the descriptor compare at 1.5.3, which measured
+faster, and 1.5.8 is GPU-only. Four `--bench` runs across this session
+read 32.88, 33.00, 33.17 and 32.95 KH/s, so it is not scatter either — it is this
+machine on this day, and it is left as measured rather than quietly carried
+forward from a better one. Every row above was taken in the same session, so the
+comparisons between them hold.
 
 The GPU is where the gain keeps coming from. 1.4.0 was +28% on it in one
 session, all of it the same mistake in different files — see [The GPU was
@@ -615,6 +631,31 @@ and **85.87 KH/s at 336 suffix blocks** against 74.9k at 8,192. Stage 1 writes
 each 256-byte append as sixteen-byte stores. Mining defaults to four suffix
 blocks per SM (the occupancy this kernel actually reaches) instead of sweeping
 from a few KH/s up through 1,252, which measured slower under a display.
+
+**1.5.8 is two changes to the descriptor sort, +11.2% on the GPU together.**
+
+*The collision scan was reading the descriptor array twice.* Step 5a places
+every position and reads every descriptor to do it; step 5 then read all ~20,000
+of them again — three global words each — only to ask which key groups collide,
+and ~98.7% of them do not. The question is now asked in step 5a out of the window
+it has already staged in shared memory, and step 5 is handed the ~250 groups that
+answer yes. **+3.7%.**
+
+*And the sort was ordering a byte it did not need to.* The key is four text
+bytes, so the radix sort ordered 32 bits in five passes. Three bytes is enough:
+it orders 24 bits in four passes, and it hands the sort fewer descriptors as
+well, because a coarser key merges neighbouring groups into one. What it costs is
+collisions, and the merge that resolves them was 1.6% of the kernel against the
+radix's 20.7%. **+6.4%** on top, and two bytes is a clear loss, so three is the
+peak and not just a direction. This is the same trade the CPU sort settled a year
+of measurements ago and the GPU had never been asked.
+
+The rest of the session is in *What does not help*, and it is the more useful
+half: with the GPU performance counters finally unlocked, `suffix_kernel` turns
+out to be a latency kernel that is **register-saturated at exactly 64** — the
+number that fits four blocks on an SM — so anything that adds a live value
+spills, and it will not trade text locality for coalescing, balance or cache
+residency either.
 
 **1.5.6 runs stage 1 underneath the suffix sort.** The three kernels ran one
 after another because they shared one set of texts and suffix arrays, so the
@@ -902,7 +943,7 @@ profile-guided optimisation (+1.2%).
 
 | | Before | Now | |
 |---|---:|---:|---:|
-| RTX 5080 | 7.45 KH/s | 127,930 H/s | +1617% |
+| RTX 5080 | 7.45 KH/s | 142,400 H/s | +1811% |
 
 *Before* is the GPU on its own on the real mining path
 (`--mining-threads=1 --gpu=0 --run-for=90`), measured when GPU support first
@@ -912,6 +953,108 @@ to carry was the gain from the packed-key change described below; the rest came
 from the block-count sweep, the stage-1 work after it, the byte-load session at
 1.4.0, the merge described next, the batch pipeline and coalesced scatter at
 1.5.4 and 1.5.5, and the overlapped stage 1 at 1.5.6.
+
+**The collision scan was a second pass over words the scatter had already
+read.** Step 5a places every position: it walks the sorted descriptors in
+windows of 256, reads each window once into shared memory, and writes the
+output. Step 5 then walked *all ~20,000 descriptors again* to ask which key
+groups collide -- reading three global words per descriptor to do it, the
+descriptor, its predecessor and its successor -- when ~98.7% of them are
+singletons the answer is "no" for.
+
+All three words are in the window step 5a has already read. So the question is
+asked there, out of shared memory, and the ~250 groups that answer yes go into a
+compact list; step 5 iterates that list instead of sifting the whole array. The
+list grows down from the top of the `dead` array while the merge's bump
+allocator grows up from the bottom, so it costs no memory and the overflow guard
+that was already there covers both.
+
+| | before | after |
+|---|---:|---:|
+| desc: expand to sa | 368.2M cycles | 392.2M |
+| desc: find groups | 326.8M cycles | 137.8M |
+| the pair | 695.0M | **530.0M** |
+
+Three interleaved rounds of `--bench --gpu=all`, warm, with no overlap between
+the two sets: **129.97 / 130.55 / 130.21 KH/s becomes 135.63 / 135.84 / 135.61**,
++4.2%, and combined with the CPU 163.4 becomes 168.8, +3.3%. Hashes are
+unchanged and still bit-identical to the CPU.
+
+This is the same mistake 1.5.0 fixed once already, re-introduced by the 1.5.5
+scatter rewrite: two loops over all `nd` descriptors, both opening by asking the
+same question of the same words. It is worth checking for after any change that
+splits a pass in two.
+
+**Two things measured and not kept.** Handing the runs out longest-first, so a
+warp's lanes all draw runs of about the same length, is exact and **9% slower**
+-- 102-104k SA/s against 113-114k. It buys balance with locality: in run order a
+warp's eight runs are eight adjacent stretches of the text and of the arena, and
+ranked they are eight stretches from anywhere in 68 KB and 274 KB. The block
+waits for the same longest task either way, because 247 tasks over 256 threads
+means no thread ever gets a second one, so all the ranking can win is issue slots
+for the other blocks on the SM -- and that does not pay for the misses. Locality
+beats balance here, which is the `DESC_RUN_MAX` lesson from the other direction.
+
+`DESC_CHUNKS`, `BR_BITS` and `DESC_MERGE_WIDE` were all re-swept afterwards,
+because the three-byte key changes what the sort is doing. None of them moved:
+`DESC_CHUNKS` 4 reads 121.2k SA/s against 117.4k at 2 and 114.9k at 8, and
+`BR_BITS` 6 and `DESC_MERGE_WIDE` 128 each looked like a 2% win over three rounds
+and then gave it all back over three more — 122.3k and 121.4k against 121.2k,
+which is this harness's noise floor and not a result.
+
+**A warning about the sweeps, because it cost this session two wrong answers.**
+`cmd.exe` splits a batch argument on `=` as well as on spaces, so a build script
+taking its defines as `%2` receives `-DDESC_CHUNKS=8` as `-DDESC_CHUNKS` and
+turns it into 1. Every sweep run that way measures the same build twice and
+reports it as two settings that happen to agree. It produced a confident
+"`DESC_CHUNKS` 2 and 8 are 10% worse" that was one build of `DESC_CHUNKS=1`
+measured twice, and it nearly killed the three-byte key by making the four-byte
+control 5x slower than it is. Pass defines through an environment variable the
+script expands, and sanity-check any sweep where two settings land on the same
+number.
+
+**What the hardware counters say the kernel is.** With *Manage GPU Performance
+Counters* allowed (see [Profiling the GPU
+further](#profiling-the-gpu-further)), Nsight Compute answers in one run what
+build-and-measure had been circling. Nothing is saturated -- DRAM 34%, SM 31% --
+so `suffix_kernel` is a latency kernel, and its scheduler finds an eligible warp
+on 23.8% of cycles. The 27.8 cycles between two issues divide almost evenly
+between **waiting at a barrier for sibling warps (35%)** and **waiting on an
+L1TEX load (33%)**, the L1 hit rate is 55.6%, and **57% of every global sector
+fetched is excessive** -- global loads use 8.3 of each 32 bytes.
+
+By source line, the excessive sectors are 43% `descLoadBE64` (the text gather),
+20% the arena write in the walk, 10% the radix scatter. The largest single stall
+site is the first instruction after the barrier that ends the column walk, which
+is the walk's imbalance wearing a load's clothing.
+
+Four changes were built against that and all four lost, which is the useful
+part: an arena laid out column-major so a warp's runs write adjacent spans
+(+0.5%, noise -- the lanes are too divergent to issue the store together);
+warp-uniform chunks so all 32 lanes walk one column (-8%); L2 persistence pinned
+on the texts (-8%); and `col_same` as a 64-bit register mask instead of a
+64-byte local array (-1.4%). **This kernel will not trade text locality for
+anything** -- not for coalescing, not for balance, not for cache residency. The
+losses are 8-9% where the gains are noise.
+
+**And three more at the text gather, which is where the counters point.**
+`descLoadBE64` builds eight bytes from three four-byte loads, and four calls in a
+row -- the thirty-two-byte comparison step -- issue twelve, three of which re-read
+a word the call before already had. Two rewrites of it lost: five `uint2` loads
+for a whole thirty-two-byte step (-1.8%) and a two-load eight-byte form (-4.6%).
+Seeding the column walk by its four-byte key and full-comparing only on ties lost
+too (-4.2%), which is the second time that idea has been measured and the second
+time it has failed.
+
+All three failed the same way and it is worth knowing before trying a fourth:
+**`suffix_kernel` sits at exactly 64 registers with zero spills, and 64 is the
+number that fits four blocks on an SM.** ptxas will not go to 65 -- it spills
+instead. Each of those three added live state, each one spilled (the batched
+loader 404 bytes of stores and 1,428 of loads), and each paid more for the spill
+than it saved. The first rewrite was also simply wrong on its own terms: reading
+sixteen bytes to extract eight touches *more* memory than reading twelve, so it
+cut instructions and raised traffic. An optimisation here has to be register-
+neutral or register-negative before anything else about it matters.
 
 **The card was waiting for a CPU.** Taking two CPU mining threads away made the
 GPU faster, which should not happen: the CPU threads and the card share nothing
@@ -1559,7 +1702,11 @@ Compute needs a driver permission:
 
 > NVIDIA Control Panel → Desktop → Developer settings → *Manage GPU Performance
 > Counters* → allow access to all users. Needs admin, and takes effect on the
-> next launch.
+> next launch -- of the process, not of the machine. No reboot.
+
+It is worth the trip. `gpu/prof/` says *which phase*; this says *why*, and the
+GPU section above is the record of it answering in one run what a week of
+build-and-measure had been circling.
 
 Then:
 

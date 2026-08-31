@@ -231,5 +231,41 @@ int main(int argc, char** argv)
             printf("\n");
         }
     }
+    {
+        unsigned long long cyc[65], cnt[65], dsc[65], sed[65], col[65];
+        cudaMemcpyFromSymbol(sed, g_scyc, sizeof(sed));
+        cudaMemcpyFromSymbol(col, g_ccyc, sizeof(col));
+        cudaMemcpyFromSymbol(cyc, g_tcyc, sizeof(cyc));
+        cudaMemcpyFromSymbol(cnt, g_tcnt, sizeof(cnt));
+        cudaMemcpyFromSymbol(dsc, g_tdsc, sizeof(dsc));
+        unsigned long long tc = 0, tt = 0, td = 0;
+        for (int i = 0; i <= 64; i++) { tc += cyc[i]; tt += cnt[i]; td += dsc[i]; }
+        if (tt) {
+            printf("  column-walk task cost by run length "
+                   "(%llu tasks, %llu descriptors, %.2f per column)\n",
+                   tt, td, (double)td / (double)(tt * DESC_CHUNK_COLS));
+            printf("  %-5s %10s %12s %8s %8s %12s %10s\n",
+                   "len", "tasks", "cyc/task", "seed%", "cols%", "cyc/col", "desc/col");
+            for (int i = 0; i <= 64; i++) {
+                if (!cnt[i]) continue;
+                const double per = (double)cyc[i] / (double)cnt[i];
+                printf("  %-5d %10llu %12.0f %7.1f%% %7.1f%% %12.0f %10.2f\n", i, cnt[i], per,
+                       100.0 * (double)sed[i] / (double)cyc[i],
+                       100.0 * (double)col[i] / (double)cyc[i],
+                       per / DESC_CHUNK_COLS,
+                       (double)dsc[i] / (double)(cnt[i] * DESC_CHUNK_COLS));
+            }
+            printf("  share of walk cycles held by the longest 5%% of tasks: ");
+            unsigned long long acc = 0, n5 = tt / 20, seen = 0;
+            for (int i = 64; i >= 0; i--) {
+                if (!cnt[i]) continue;
+                const unsigned long long take = (seen + cnt[i] <= n5) ? cnt[i] : (n5 - seen);
+                acc += (unsigned long long)((double)cyc[i] * (double)take / (double)cnt[i]);
+                seen += take;
+                if (seen >= n5) break;
+            }
+            printf("%.1f%%\n\n", 100.0 * (double)acc / (double)tc);
+        }
+    }
     return bad ? 1 : 0;
 }

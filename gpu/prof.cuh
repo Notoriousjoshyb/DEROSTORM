@@ -53,6 +53,25 @@ __device__ unsigned long long g_wsum;
 __device__ unsigned long long g_wcnt;
 __device__ unsigned long long g_wblk;   // summed per-block maxima
 
+// Per-task cost of the column walk, bucketed by the run's length, plus the
+// descriptors each task emitted. The walk's imbalance is 1.97x while the run
+// lengths spread 1..45, so cost is not proportional to length: this says how
+// much of a task is fixed per column and how much scales with the run.
+__device__ unsigned long long g_scyc[65];   // the chunk seed alone
+__device__ unsigned long long g_ccyc[65];   // the col_same precompute alone
+__device__ unsigned long long g_tcyc[65];
+__device__ unsigned long long g_tcnt[65];
+__device__ unsigned long long g_tdsc[65];
+
+#define PROF_TASK_DECL      long long _tt0 = 0, _ts0 = 0; int _tnd = 0
+#define PROF_SEED_BEG()     do { _ts0 = clock64(); } while (0)
+#define PROF_SEED_END(len)  do { atomicAdd(&g_scyc[(len) < 64 ? (len) : 64], (unsigned long long)(clock64() - _ts0)); } while (0)
+#define PROF_COLS_BEG()     do { _ts0 = clock64(); } while (0)
+#define PROF_COLS_END(len)  do { atomicAdd(&g_ccyc[(len) < 64 ? (len) : 64], (unsigned long long)(clock64() - _ts0)); } while (0)
+#define PROF_TASK_BEG()     do { _tt0 = clock64(); _tnd = 0; } while (0)
+#define PROF_TASK_EMIT()    do { _tnd++; } while (0)
+#define PROF_TASK_END(len)  do {         const int _L = (len) < 64 ? (len) : 64;         atomicAdd(&g_tcyc[_L], (unsigned long long)(clock64() - _tt0));         atomicAdd(&g_tcnt[_L], 1ull);         atomicAdd(&g_tdsc[_L], (unsigned long long)_tnd);     } while (0)
+
 __device__ unsigned long long g_runlen[65];
 __device__ unsigned long long g_runmax;
 __device__ unsigned long long g_runsum;
@@ -86,6 +105,15 @@ __device__ unsigned long long g_runcnt;
 #define PROF_ADD(ph)    ((void)0)
 #define PROF_COUNT(c)   ((void)0)
 #define PROF_RUNS(s, n) ((void)0)
+#define PROF_TASK_DECL      ((void)0)
+#define PROF_SEED_BEG()     ((void)0)
+#define PROF_SEED_END(len)  ((void)0)
+#define PROF_COLS_BEG()     ((void)0)
+#define PROF_COLS_END(len)  ((void)0)
+#define PROF_TASK_BEG()     ((void)0)
+#define PROF_TASK_EMIT()    ((void)0)
+#define PROF_TASK_END(len)  ((void)0)
+
 #define PROF_WALK_BEG() ((void)0)
 #define PROF_WALK_END() ((void)0)
 
