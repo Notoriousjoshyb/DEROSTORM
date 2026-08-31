@@ -11,7 +11,7 @@ and `astrobwt/difftest` compares the two on every build.
 ```
       ░▒▒▒▒▒░        ██████  ███████ ██████   ██████  ███████ ████████  ██████  ██████  ███    ███
     ░▒▓█████▓▒░      ██   ██ ██      ██   ██ ██    ██ ██         ██    ██    ██ ██   ██ ████  ████  ┌────────┐
-   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.6.1 │
+   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.6.2 │
    ▒███████████▒     ██   ██ ██      ██   ██ ██    ██      ██    ██    ██    ██ ██   ██ ██  ██  ██  └────────┘
     ░▒▓▓█▟▙█▓▒░      ██████  ███████ ██   ██  ██████  ███████    ██     ██████  ██   ██ ██      ██
         ▝█▛                                    ASTROBWTv3 MINER FOR DERO
@@ -48,7 +48,7 @@ and `astrobwt/difftest` compares the two on every build.
  │ T04 ███████████████▌░  91%  ││     ⠈⠑⠐⠂⠤⠄⠤⠠⠤⠠⠤⠒⠊⠁   ⣀⠴⠃      ││ REJECTED             12 ││ LATENCY   42 ms │
  │ +11 more                    ││              ⠄⠠⠠⠠⠐⠐⠂⠉         ││ STALE                -- ││      GOOD       │
  └─────────────────────────────┘└───────────────────────────────┘└─────────────────────────┘└─────────────────┘
- [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.6.1
+ [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.6.2
 ```
 
 Eight screens, one key each. The **dashboard** above is the one you leave up;
@@ -679,6 +679,48 @@ hotter footprint for the same answer. The radix sort does not move, as expected:
 descriptor count and width are untouched. `gpu\desc_test.exe` is correct on all
 512 suffix arrays, `gpu\hash_parallel_test.exe` reports all 512 whole hashes
 bit-identical to the CPU, and `go test ./cmd/derostorm/` is green.
+
+**1.6.2 re-sweeps the radix sort at the width the library actually ships,
++3.3% on the GPU.** With the arena quiet, the sort is the second phase at ~18%,
+and its note says the only lever left on its top phase is fewer passes. That
+turned out to be wrong, and so did the sweeps behind it: every radix knob had
+been swept in `gpu\desc_test.exe` at `BR_BLOCK=1024`, and the shipped library is
+built at 256. Shared memory per block scales with `BR_WARPS * BR_BINS`, so a
+narrower block moves the whole trade.
+
+*Six-bit digits, not seven.* Three interleaved `--bench --gpu=0` rounds at 336
+blocks, `BR_BLOCK=256`:
+
+| `BR_BITS` | GPU |
+|---|---:|
+| 5 | 160.95 / 160.97 / 160.94 KH/s |
+| **6** | **163.77 / 163.79 / 163.71 KH/s** |
+| 7 (what shipped) | 160.44 / 160.00 / 160.56 KH/s |
+| 8 | 142.95 / 142.75 / 142.76 KH/s |
+
+**+2.1%**, a peak with no overlap either side. 8 is the interesting one: the key
+is 24 bits, so eight-bit digits order it in three passes instead of four, which
+is exactly the lever the note pointed at -- and it loses 12%. 256 bins double
+`warpCnt` and `hist`, the block's shared memory goes from 11.0 KB to about
+19 KB, and the SM holds fewer blocks. Occupancy beats pass count, which is also
+why 6 beats 7: same four passes, less shared memory, and same-digit runs of four
+instead of two. `BR_BLOCK` itself was re-checked at the same time and 256 is a
+real peak -- 142.3 KH/s at 128 and 134.3 at 512.
+
+*And six barriers a tile became three.* Between ranking a tile and staging it,
+the sort ran two scans over the bins: a column scan of the warp x digit matrix,
+one thread per digit, then `scanBins` for the prefix sum over the totals that
+walk had just produced -- and `scanBins` spent three `__syncthreads()` on a scan
+over 64 numbers. One warp can do both. Lane `l` takes bins `l`, `l+32`, ...,
+walks the rows for each, and carries an inclusive warp scan across them as it
+goes; shuffles need no barrier, so three of the six disappear and the fourth is
+the one the column scan already needed. Three interleaved rounds:
+**163.91/163.58/164.19 KH/s against 165.76/165.39/165.60, +1.1%**, again with no
+overlap. `BR_FUSED_BINSCAN=0` restores the two-step version.
+
+Together, **160.33 -> 165.58 KH/s, +3.3%**, and shared memory per block falls
+from 11.0 KB to 6.8 KB. All 512 suffix arrays and all 512 whole hashes stay
+bit-identical to the CPU.
 
 **1.5.8 is two changes to the descriptor sort, +11.2% on the GPU together.**
 
@@ -1761,7 +1803,7 @@ zero.
 
 `hiveos/` is a HiveOS custom miner package built on it -- `h-manifest.conf`,
 `h-config.sh`, `h-run.sh`, `h-stats.sh` and a README, packaged as
-`derostorm-1.6.1.tar.gz` and attached to the release. Point a flight sheet's
+`derostorm-1.6.2.tar.gz` and attached to the release. Point a flight sheet's
 *Installation URL* at it, set the miner name to `derostorm`, and put a **derod
 node address in the Pool URL field** -- which is the one thing worth saying
 twice, because this is a solo miner and there is no pool. Accepted counts

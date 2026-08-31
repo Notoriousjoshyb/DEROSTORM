@@ -1,4 +1,4 @@
-// blockradix.cuh -- a stable LSD radix sort of (uint64 key, int32 value) pairs
+﻿// blockradix.cuh -- a stable LSD radix sort of (uint64 key, int32 value) pairs
 // carried out by one thread block, plus the block-wide scans the suffix-array
 // code needs alongside it.
 //
@@ -136,10 +136,56 @@
 // Measured across 5, 6, 7 and 8: 6526, 6738, 6910, 6476 suffix arrays a second.
 // The spread is small and the shape is not monotonic, which is the finding
 // rather than the tuning -- see the note above the scatter.
+//
+// That sweep, and every one after it, ran at BR_BLOCK=1024. The shipped library
+// is built at 256, and the answer is different there -- which is the finding
+// this time, not the number. Shared memory per block scales with BR_WARPS *
+// BR_BINS, so a narrower block moves the whole trade. Three interleaved
+// `--bench --gpu=0` rounds at 336 blocks on an RTX 5080, at BR_BLOCK=256:
+//
+//     5  160.95 / 160.97 / 160.94 KH/s
+//     6  163.77 / 163.79 / 163.71        <- peak, and no overlap with 5 or 7
+//     7  160.44 / 160.00 / 160.56        <- what shipped
+//     8  142.95 / 142.75 / 142.76
+//     4  killed after 14 minutes on one round
+//
+// 8 is the interesting loss. The descriptor key is 24 bits, so 8-bit digits
+// order it in three passes instead of four, and the note above the scatter says
+// fewer passes is the only lever left on the top phase. It is a 12% loss anyway:
+// 256 bins doubles warpCnt and hist, the block's shared memory goes from about
+// 11 KB to about 19 KB, and the SM holds fewer blocks. Occupancy beats pass
+// count here, and that is why 6 wins over 7 as well -- same four passes, less
+// shared memory, and same-digit runs of 4 instead of 2.
 #ifndef BR_BITS
-#define BR_BITS 7
+#define BR_BITS 6
 #endif
 #define BR_BINS (1 << BR_BITS)
+
+// Fuse the warp x digit column scan and the bin scan into one warp-resident
+// step, which is three barriers per tile instead of six.
+//
+// The two steps either side of `preInTile` do almost nothing and cost almost
+// everything. The column scan is one thread per digit walking BR_WARPS rows;
+// scanBins is a prefix sum over the BR_BINS totals that walk just produced, and
+// it spends three __syncthreads() doing it -- a warp scan, a serial fixup on
+// thread 0, and a write-back. Six barriers a tile, ~310 tiles a hash, for a scan
+// over 64 numbers.
+//
+// One warp can do both. Lane `l` takes bins l, l+32, ... : it walks the rows for
+// each, which is the column scan, and carries an inclusive warp scan across them
+// as it goes, which is scanBins. Shuffles need no barrier, so the whole thing
+// costs the one __syncthreads() the column scan already needed and the other
+// three disappear. The other warps were waiting at that barrier either way.
+//
+// Requires BR_BINS to be a whole number of warps; below BR_BITS=5 it falls back.
+// 0 restores the two-step version exactly, for A/B.
+#ifndef BR_FUSED_BINSCAN
+#define BR_FUSED_BINSCAN 1
+#endif
+#if BR_BINS % 32 != 0
+#undef  BR_FUSED_BINSCAN
+#define BR_FUSED_BINSCAN 0
+#endif
 
 // Passes a key can need. The suffix sort packs two ranks of at most 17 bits
 // each, so 34 bits; this covers 48 with room to spare.
@@ -328,6 +374,41 @@ __device__ void blockRadixPass(const uint64_t* in, uint64_t* out,
         // Bank-conflict free: cell (w, b) is at word w * BR_BINS + b, and
         // BR_BINS is a multiple of 32, so the bank is b % 32 -- consecutive
         // threads take consecutive banks.
+#if BR_FUSED_BINSCAN
+        // Both scans on one warp, in one pass over the bins, with no barrier
+        // between them. See BR_FUSED_BINSCAN.
+        if (warp == 0) {
+            const int lane = tid & 31;
+            int carry = 0;
+#pragma unroll
+            for (int s = 0; s < BR_BINS / 32; s++) {
+                const int b = s * 32 + lane;
+                int run = 0;
+                for (int w = 0; w < BR_WARPS; w++) {
+                    const int c = sh->warpCnt[w][b];
+                    if (c) sh->warpCnt[w][b] = run;
+                    run += c;
+                }
+                sh->tileTot[b] = run;
+
+                int inc = run;                     // inclusive scan of run
+                for (int off = 1; off < 32; off <<= 1) {
+                    const int y = __shfl_up_sync(0xffffffffu, inc, off);
+                    if (lane >= off) inc += y;
+                }
+                sh->tileStart[b] = carry + inc - run;
+                carry += __shfl_sync(0xffffffffu, inc, 31);
+            }
+        }
+        __syncthreads();
+        PROF_ADD(PH_LEADER);
+
+        // One read each now; the barrier above covers warpCnt, tileTot and
+        // tileStart together.
+        int preInTile = 0;
+        if (live && isLeader) preInTile = sh->warpCnt[warp][d];
+        preInTile = __shfl_sync(0xffffffffu, preInTile, leaderLane);
+#else
         for (int b = tid; b < BR_BINS; b += BR_BLOCK) {
             int run = 0;
             for (int w = 0; w < BR_WARPS; w++) {
@@ -349,6 +430,7 @@ __device__ void blockRadixPass(const uint64_t* in, uint64_t* out,
         // ---- 3. stage the tile in digit order
         scanBins(sh);
         PROF_ADD(PH_SCANBINS);
+#endif
 
         if (live) sh->stageWord[sh->tileStart[d] + preInTile + rankInWarp] = w;
         __syncthreads();
