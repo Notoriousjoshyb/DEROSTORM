@@ -561,16 +561,31 @@ otherwise. Everything in this section except the *Before* columns and the
 *What does not help* experiments comes from `derostorm --bench`, which needs no
 node and no wallet, so you can reproduce it on your own machine in a minute.
 
-Headline, all of it at once, re-measured on 2026-08-31 at 1.5.8:
+Headline, all of it at once, re-measured on 2026-08-31 at 1.6.2:
 
-| | H/s | at 1.5.6 | at 1.5.5 | at 1.5.0 | at 1.4.0 |
-|---|---:|---:|---:|---:|---:|
-| CPU, 15 threads | 33,000 | 32,940 | 32,640 | 34,293 | 33,700 – 34,500 |
-| RTX 5080 | **142,400** | 128,000 | 119,463 | 100,640 | 91,870 |
-| together, `--bench` sum | **175,400** | 160,900 | | | |
-| **together, real mining path** | not re-measured | **159,000 – 159,500** | 153,900 – 154,700 | 130,400 – 131,800 | 124,700 – 125,400 |
+| | H/s at 1.6.2 | at 1.5.8 | at 1.5.6 | at 1.5.5 | at 1.5.0 | at 1.4.0 |
+|---|---:|---:|---:|---:|---:|---:|
+| CPU, 15 threads | 32,470 | 33,000 | 32,940 | 32,640 | 34,293 | 33,700 – 34,500 |
+| RTX 5080 | **170,390** | 142,400 | 128,000 | 119,463 | 100,640 | 91,870 |
+| together, `--bench` sum | 197,800 | 175,400 | 160,900 | | | |
+| **together, real mining path** | **202,870** | not measured | 159,000 – 159,500 | 153,900 – 154,700 | 130,400 – 131,800 | 124,700 – 125,400 |
 
-Two notes on that table, because the columns are not all the same measurement.
+**Reference machine: Ryzen 7 9800X3D (8C/16T, DDR5-6000 CL30) + RTX 5080.**
+
+Three notes on that table, because the columns are not all the same measurement.
+
+The 1.6.2 column is the **real mining path**, read off the miner's own dashboard
+while mining against a node — `202.87 KH/s` total, `CPU 32.47` and `GPU 170.39`,
+a 16 / 84 split. It is the first real-path figure since 1.5.6, and it is the one
+worth quoting. `--bench` on the same build reads 164.95 KH/s on the card and
+197.8 together, about 3% lower, because the benchmark starts cold and mining runs
+warm and steady — the opposite of the usual direction, and the reason the two
+rows are both given rather than one being called an estimate of the other.
+
+Real path against real path, that is **+27.4% over 1.5.6**. Bench against bench,
+the card is **+16% over 1.5.8** — 142.18 / 142.55 KH/s then, 164.95 now — which
+is 1.6.1's arena (+10.2%) and 1.6.2's radix sort (+3.3%) compounding with the
+compact arena entry (+3.2%) in between.
 
 The 1.5.8 and 1.5.6 GPU figures were taken **on the same day, interleaved, on
 the same machine** — 142.18 / 142.55 against 128.06 / 127.91, +11.2% — so the
@@ -579,12 +594,8 @@ measured a day earlier; the card reads about 1% higher today and ~8% higher warm
 than on the first run of a session, which is why nothing here is carried forward
 between days.
 
-The real mining path was **not** re-measured at 1.5.8. It needs a node and it
-submits shares, and this session had neither reason nor permission to do that,
-so the `--bench` sum is given instead and labelled as such. The sum overstates
-the real path slightly — mining shares a memory system and a job feed that the
-benchmark does not — so read 175,400 as an upper bound and 1.5.6's 159.0 – 159.5
-as the last honest real-path number.
+The CPU row moved by −1.6% across the 1.6 line and nothing on the CPU path
+changed: 1.6.1 and 1.6.2 are GPU-only. Read it as this machine on this day.
 
 1.5.2 onwards no longer sweeps the block count — it sits at four blocks per SM
 (336 on a 5080), so no figure here is diluted by a tuning sweep in the first
