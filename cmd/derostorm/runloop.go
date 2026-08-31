@@ -54,6 +54,7 @@ type runOpts struct {
 	runFor     int
 	rpcAddress string
 	logFile    string
+	statsFile  string
 }
 
 // renderTick is how often a frame is built. Eight a second: fast enough that
@@ -279,6 +280,11 @@ func run(o runOpts) {
 	heightAt := time.Time{}
 	var lastRenderErr string
 
+	// The machine-readable half of the console. nil unless --stats-file asked
+	// for one, and every method tolerates that.
+	stats := newStatsWriter(o.statsFile)
+	defer stats.Remove()
+
 	ticker := time.NewTicker(renderTick)
 	defer ticker.Stop()
 
@@ -406,6 +412,7 @@ func run(o runOpts) {
 			}
 
 			s := build(now)
+			stats.Write(s, version, false)
 			switch {
 			case tui != nil:
 				if err := tui.Render(s); err != nil && err.Error() != lastRenderErr {

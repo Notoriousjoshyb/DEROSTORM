@@ -58,3 +58,13 @@ graphify-out/
 .idea/
 Thumbs.db
 desktop.ini
+
+# The HiveOS package's copy of the miner. It is a build output -- build.ps1
+# puts it there -- and a 12 MB binary in git is 12 MB in git forever. The
+# wrapper scripts beside it are source and are tracked; the tarball is covered
+# by *.tar.gz above.
+hiveos/derostorm/derostorm
+hiveos/derostorm/derostorm-stats.json
+hiveos/derostorm/derostorm.conf
+hiveos/derostorm/derostorm.log
+hiveos/SHA256-hiveos-*.txt

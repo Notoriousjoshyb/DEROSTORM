@@ -11,7 +11,7 @@ and `astrobwt/difftest` compares the two on every build.
 ```
       ░▒▒▒▒▒░        ██████  ███████ ██████   ██████  ███████ ████████  ██████  ██████  ███    ███
     ░▒▓█████▓▒░      ██   ██ ██      ██   ██ ██    ██ ██         ██    ██    ██ ██   ██ ████  ████  ┌────────┐
-   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.5.8 │
+   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.5.9 │
    ▒███████████▒     ██   ██ ██      ██   ██ ██    ██      ██    ██    ██    ██ ██   ██ ██  ██  ██  └────────┘
     ░▒▓▓█▟▙█▓▒░      ██████  ███████ ██   ██  ██████  ███████    ██     ██████  ██   ██ ██      ██
         ▝█▛                                    ASTROBWTv3 MINER FOR DERO
@@ -48,7 +48,7 @@ and `astrobwt/difftest` compares the two on every build.
  │ T04 ███████████████▌░  91%  ││     ⠈⠑⠐⠂⠤⠄⠤⠠⠤⠠⠤⠒⠊⠁   ⣀⠴⠃      ││ REJECTED             12 ││ LATENCY   42 ms │
  │ +11 more                    ││              ⠄⠠⠠⠠⠐⠐⠂⠉         ││ STALE                -- ││      GOOD       │
  └─────────────────────────────┘└───────────────────────────────┘└─────────────────────────┘└─────────────────┘
- [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.5.8
+ [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.5.9
 ```
 
 Eight screens, one key each. The **dashboard** above is the one you leave up;
@@ -295,6 +295,8 @@ derostorm [options]
   --debug                           Verbose logging to the log file.
   --bench                           Benchmark the hash function and exit.
                                     Add --gpu=all to benchmark the GPU too.
+  --stats-file=<path>               Write a JSON status document here every
+                                    five seconds, for a rig manager to read.
   --run-for=<sec>                   Mine for this long, then print a summary.
   --cpuprofile=<path>               Write a CPU profile. Works with --bench
                                     and with --run-for.
@@ -1694,6 +1696,35 @@ consensus-critical path. Left alone.
   running the CPU hash entirely out of DRAM costs 8.8%, and at its natural
   footprint it never leaves L3.
 
+## Rig managers, and HiveOS
+
+`--stats-file=<path>` writes a JSON document every five seconds and nothing
+else: hashrate, the split by device, temperatures, fans, power, miniblocks and
+rejects. It is the machine-readable half of the console, and it exists because
+the other half is not one -- parsing a panel that was laid out for a person
+breaks the first time a column is widened.
+
+```
+derostorm --no-tui --stats-file=/run/derostorm.json
+```
+
+The file is written whole and renamed into place, so a reader polling it sees
+the previous document or the next one and never half of one, and it is deleted
+when the miner exits, so a monitor can tell a stopped miner from one running at
+zero.
+
+`hiveos/` is a HiveOS custom miner package built on it -- `h-manifest.conf`,
+`h-config.sh`, `h-run.sh`, `h-stats.sh` and a README, packaged as
+`derostorm-1.5.9.tar.gz` and attached to the release. Point a flight sheet's
+*Installation URL* at it, set the miner name to `derostorm`, and put a **derod
+node address in the Pool URL field** -- which is the one thing worth saying
+twice, because this is a solo miner and there is no pool. Accepted counts
+miniblocks and blocks.
+
+Its `h-stats.sh` reports the rig total including the CPU, and per-card figures
+for the GPUs only, so on a machine mining on both the cards do not add up to the
+total. The difference is the processor.
+
 ### Profiling the GPU further
 
 `gpu/prof/` gives phase shares without any special permission — see the GPU
@@ -1757,6 +1788,7 @@ derostorm/
 │   ├── nodeinfo.go         derod JSON-RPC: peers, net hashrate, block time
 │   ├── sysinfo*.go         CPU load, frequency and memory, per platform
 │   ├── sensors.go          temperatures, fan, power
+│   ├── statsfile.go        --stats-file: the JSON a rig manager reads
 │   ├── termdiag*.go        --termdiag: what each source says the size is
 │   ├── termprobe*.go       asks the terminal for a bigger window
 │   ├── affinity.go         CPU-slot → logical-CPU map
@@ -1804,6 +1836,8 @@ derostorm/
 │   ├── hash_parallel_test.cu  whole hash against 512 real CPU vectors
 │   ├── prof.cuh            phase timers, compiled out unless DS_PROF
 │   └── prof/               cycle attribution for the suffix kernel
+├── hiveos/                 the HiveOS custom miner package
+│   └── derostorm/          h-manifest, h-config, h-run, h-stats, the binary
 ├── vendor/                 all dependencies, including the optimised derohe
 ├── build.ps1 / build.sh
 ├── README.md

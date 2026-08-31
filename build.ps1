@@ -53,7 +53,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$Version  = '1.5.8'
+$Version  = '1.5.9'
 $Pkg      = './cmd/derostorm'
 $BoundsPkg = 'github.com/deroproject/derohe/astrobwt/astrobwtv3'
 $LdFlags  = '-s -w'
@@ -138,11 +138,21 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 # embedding it in a GOOS=linux cross-build is no different from embedding the
 # DLL, which is the reason these bindings avoid cgo (see
 # cmd/derostorm/gpu_cuda.go).
+#
+# Sources is what each one is compiled from, and it is there for the staleness
+# check below rather than for the build. It lists only what the library itself
+# pulls in -- gpu\derostorm_gpu.cu and the headers it includes, not the test
+# harnesses that sit beside them in the same directory.
+$GpuSources = @('gpu\derostorm_gpu.cu', 'gpu\derostorm_gpu.h', 'gpu\*.cuh', 'gpu\*.inc')
+$SaSources  = @('native\derostorm_sa.c', 'native\descriptor.c', 'native\descriptor.h',
+                'native\sha256ni.c', 'native\sha256ni.h', 'native\sha256arm.c',
+                'native\libsais\libsais.c', 'native\libsais\libsais.h')
+
 $Embedded = @(
-    @{ Path = 'cmd\derostorm\derostorm_gpu.dll';   Script = 'gpu\buildlib.bat';   What = 'CUDA kernels (Windows)' }
-    @{ Path = 'cmd\derostorm\libderostorm_gpu.so'; Script = 'gpu/buildlib.sh';    What = 'CUDA kernels (Linux)';   Wsl = $true; Needs = 'a Linux CUDA toolkit' }
-    @{ Path = 'cmd\derostorm\derostorm_sa.dll';    Script = 'native\build.bat';   What = 'descriptor suffix sort (Windows)' }
-    @{ Path = 'cmd\derostorm\libderostorm_sa.so';  Script = 'native/buildlib.sh'; What = 'descriptor suffix sort (Linux)'; Wsl = $true; Needs = 'gcc' }
+    @{ Path = 'cmd\derostorm\derostorm_gpu.dll';   Script = 'gpu\buildlib.bat';   What = 'CUDA kernels (Windows)'; Sources = $GpuSources }
+    @{ Path = 'cmd\derostorm\libderostorm_gpu.so'; Script = 'gpu/buildlib.sh';    What = 'CUDA kernels (Linux)';   Wsl = $true; Needs = 'a Linux CUDA toolkit'; Sources = $GpuSources }
+    @{ Path = 'cmd\derostorm\derostorm_sa.dll';    Script = 'native\build.bat';   What = 'descriptor suffix sort (Windows)'; Sources = $SaSources }
+    @{ Path = 'cmd\derostorm\libderostorm_sa.so';  Script = 'native/buildlib.sh'; What = 'descriptor suffix sort (Linux)'; Wsl = $true; Needs = 'gcc'; Sources = $SaSources }
 )
 
 if ($Native) {
@@ -174,6 +184,31 @@ foreach ($lib in $Embedded) {
         $how = if ($lib.Wsl) { "run $($lib.Script) under WSL with $($lib.Needs), or .\build.ps1 -Native" }
                else          { "run $($lib.Script), or .\build.ps1 -Native" }
         throw "$($lib.Path) is missing - $how"
+    }
+}
+
+# Present is not the same as current, and the difference has already shipped
+# once. The 1.4.0 Linux archives carried the *previous* CUDA kernels: nvcc
+# cannot build a .so under Windows, the machine cutting the release had no
+# Linux toolchain, and nothing here objected because the stale file was sitting
+# right where go:embed wanted it. Linux mined at 1.3.0 speed for a whole release
+# while Windows had everything, and 1.4.1 exists only to undo it.
+#
+# So a library older than any source it is compiled from stops the build. It is
+# a timestamp comparison and it will occasionally fire on a file that changed
+# nothing -- editing gpu\prof.cuh, which compiles out of the shipped kernel, is
+# the usual one. Rebuilding is cheap and shipping the wrong kernels is not.
+foreach ($lib in $Embedded) {
+    $built = (Get-Item $lib.Path).LastWriteTimeUtc
+    $newer = Get-ChildItem -Path $lib.Sources -File -ErrorAction SilentlyContinue |
+             Where-Object { $_.LastWriteTimeUtc -gt $built } |
+             Sort-Object LastWriteTimeUtc -Descending
+    if ($newer) {
+        $how = if ($lib.Wsl) { "run $($lib.Script) under WSL with $($lib.Needs), or .\build.ps1 -Native" }
+               else          { "run $($lib.Script), or .\build.ps1 -Native" }
+        $names = ($newer | Select-Object -First 3 | ForEach-Object { $_.Name }) -join ', '
+        throw ("$($lib.Path) is older than the source it is built from " +
+               "($names) - $how")
     }
 }
 

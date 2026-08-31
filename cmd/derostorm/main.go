@@ -31,7 +31,7 @@ import (
 	"github.com/docopt/docopt-go"
 )
 
-const version = "1.5.8"
+const version = "1.5.9"
 
 const usage = `DeroStorm ` + version + `
 AstroBWTv3 miner for DERO. Mines on the CPU, and on NVIDIA GPUs as well when
@@ -84,6 +84,10 @@ Options:
   --cpuprofile=<path>             Write a CPU profile. Works with --bench and
                                   with --run-for; this is how default.pgo is
                                   regenerated after a change to the hot path.
+  --stats-file=<path>             Write a JSON status document here every five
+                                  seconds: hashrate, the split by device, temps,
+                                  miniblocks and rejects. For HiveOS and other
+                                  rig managers; the consoles are for people.
   --run-for=<sec>                 Mine for this many seconds, then print the
                                   session summary and exit. For measuring the
                                   real mining path rather than the benchmark.
@@ -329,6 +333,14 @@ func main() {
 	defer logFile.Close()
 	globals.InitializeLog(io.Discard, logFile)
 
+	statsFile := optString(opts, "--stats-file")
+	if statsFile != "" {
+		if err := statsPathOK(statsFile); err != nil {
+			fmt.Fprintf(os.Stderr, "--stats-file: %v\n", err)
+			os.Exit(2)
+		}
+	}
+
 	runFor := 0
 	if v := optString(opts, "--run-for"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -352,6 +364,7 @@ func main() {
 		isTTY: isTTY, mode: mode, testnet: testnet, runFor: runFor,
 		rpcAddress: optString(opts, "--rpc-address"),
 		logFile:    logFile.Name(),
+		statsFile:  statsFile,
 	})
 }
 

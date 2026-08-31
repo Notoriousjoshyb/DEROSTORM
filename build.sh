@@ -40,7 +40,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION=1.5.8
+VERSION=1.5.9
 PKG=./cmd/derostorm
 BOUNDS_PKG=github.com/deroproject/derohe/astrobwt/astrobwtv3
 LDFLAGS="-s -w"
@@ -125,6 +125,33 @@ cmd/derostorm/libderostorm_sa.so:native/buildlib.sh, on Linux" ;;
     local path="${entry%%:*}" how="${entry#*:}"
     if [ ! -f "$path" ]; then
       echo "$goos/$goarch embeds $path, which is missing -- build it with $how" >&2
+      missing=1
+      continue
+    fi
+    # Present is not the same as current, and the difference has already
+    # shipped once. The 1.4.0 Linux archives carried the *previous* CUDA
+    # kernels: nvcc cannot build a .so under Windows, the machine cutting the
+    # release had no Linux toolchain, and nothing objected because the stale
+    # file was sitting exactly where go:embed wanted it. Linux mined at 1.3.0
+    # speed for a whole release while Windows had everything, and 1.4.1 exists
+    # only to undo it.
+    #
+    # So a library older than any source it is compiled from stops the build.
+    # It is a timestamp comparison and it will occasionally fire on a file that
+    # changed nothing -- gpu/prof.cuh compiles out of the shipped kernel and
+    # still counts. Rebuilding is cheap and shipping the wrong kernels is not.
+    local sources
+    case "$path" in
+      *derostorm_gpu.*) sources="gpu/derostorm_gpu.cu gpu/derostorm_gpu.h $(echo gpu/*.cuh gpu/*.inc)" ;;
+      *)                sources="native/derostorm_sa.c native/descriptor.c native/descriptor.h native/sha256ni.c native/sha256ni.h native/sha256arm.c native/libsais/libsais.c native/libsais/libsais.h" ;;
+    esac
+    local src stale=""
+    for src in $sources; do
+      [ -f "$src" ] || continue
+      [ "$src" -nt "$path" ] && stale="$stale $src"
+    done
+    if [ -n "$stale" ]; then
+      echo "$path is older than the source it is built from ($(echo $stale | cut -c1-120)) -- rebuild it with $how" >&2
       missing=1
     fi
   done <<EOF
