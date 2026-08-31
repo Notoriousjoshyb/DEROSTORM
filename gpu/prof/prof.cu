@@ -64,7 +64,7 @@ __global__ __launch_bounds__(BR_BLOCK) void prof_kernel(
         DescScratch dsc;
         dsc.words  = (uint64_t*)sc.wordA;
         dsc.words2 = (uint64_t*)sc.wordB;
-        dsc.arena  = (uint32_t*)sc.sa;
+        dsc.arena  = (uint16_t*)sc.sa;
         dsc.offs   = sc.rank;
         dsc.mbuf   = sc.tmp;
         if (descSuffixArrayBlock(texts + (size_t)h * stride, n,

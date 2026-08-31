@@ -283,7 +283,7 @@ struct Pool {
         DescScratch s;
         s.words  = keys + k + (size_t)ASTRO_MAX_TEXT * 0;
         s.words2 = keys + k + (size_t)ASTRO_MAX_TEXT * 1;
-        s.arena  = (uint32_t*)(words + w + (size_t)ASTRO_MAX_TEXT * 0);
+        s.arena  = (uint16_t*)(words + w + (size_t)ASTRO_MAX_TEXT * 0);
         s.offs   = words + w + (size_t)ASTRO_MAX_TEXT * 1;
         s.mbuf   = words + w + (size_t)ASTRO_MAX_TEXT * 2;
         return s;

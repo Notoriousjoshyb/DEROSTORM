@@ -79,7 +79,7 @@ __global__ __launch_bounds__(BR_BLOCK) void doubling_kernel(
 
 struct DescPool {
     uint64_t* words;
-    uint32_t* arena;
+    uint16_t* arena;
     int32_t*  offs;
     int32_t*  mbuf;
     int       stride;
@@ -190,14 +190,14 @@ int main(int argc, char** argv)
     DescPool cpool{};
     cpool.stride = stride;
     CK(cudaMalloc(&cpool.words, (size_t)blocks * stride * 2 * 8));
-    CK(cudaMalloc(&cpool.arena, (size_t)blocks * stride * 4));
+    CK(cudaMalloc(&cpool.arena, (size_t)blocks * stride * 2));
     CK(cudaMalloc(&cpool.offs, (size_t)blocks * stride * 4));
     CK(cudaMalloc(&cpool.mbuf, (size_t)blocks * stride * 4));
 
     printf("  %d resident blocks each; doubling %.1f MB per block, descriptor %.1f MB\n\n",
            blocks,
            (stride * 6.0 * 4 + stride * 2.0 * 8) / 1048576.0,
-           (stride * 2.0 * 8 + stride * 4.0 * 3) / 1048576.0);
+           (stride * 2.0 * 8 + stride * (2.0 + 4.0 + 4.0)) / 1048576.0);
 
     std::vector<int32_t> got((size_t)count * stride);
 

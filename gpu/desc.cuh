@@ -209,15 +209,19 @@ static_assert(DESC_CHUNKS * DESC_CHUNK_COLS == 256,
 // fourth byte a clear loss: it cut colliding groups 329 -> 247 and paid a third
 // radix pass for it, 5,403 -> 5,267 texts/s. This is that trade on the GPU.
 //
-// 4 restores the shipped behaviour exactly. Only 3 and 4 are meaningful; the
-// merge's tail comparison starts at DESC_KEY_BYTES, which is what makes the
-// group's shared bytes free.
 #ifndef DESC_KEY_BYTES
 #define DESC_KEY_BYTES 3
 #endif
-#define DESC_KEY_DROP  (8 * (4 - DESC_KEY_BYTES))
+// The compact arena below stores only the block index for each suffix and keeps
+// the shared column in the descriptor. That needs the shipped three-byte key:
+// the fourth byte of the descriptor's upper word is the column.
+#if DESC_KEY_BYTES != 3
+#error "the compact descriptor arena requires DESC_KEY_BYTES=3"
+#endif
+#define DESC_KEY_DROP  8
 #define DESC_KEY_OF(k) ((uint32_t)(k) >> DESC_KEY_DROP)
-
+#define DESC_REL_OF(k) ((uint32_t)(k) & 255u)
+#define DESC_KEYREL(k, rel) (((uint32_t)(k) & 0xFFFFFF00u) | (uint32_t)(rel))
 // How a key group that collides on all four bytes is resolved.
 //
 // These are rare and small on average -- the CPU measures 1,764 merged positions
@@ -323,20 +327,47 @@ static_assert(DESC_CHUNKS * DESC_CHUNK_COLS == 256,
 #define DESC_BIG_MAX 48
 #endif
 
-// Bits of the descriptor word. The key takes the top 32 so the radix sorts on
-// it directly, and the arena offset and length share the bottom 32.
+// Let a column point at another column's arena slot instead of writing its own.
+//
+// A constant column prepends the same byte to every suffix in the run, so the
+// order does not change -- that is the whole idea this file is built on, and
+// `col_same` already knows which columns those are. The walk still wrote the
+// order out again for each of them: 256 * len entries per run, the same `len`
+// block indices repeated for as long as the order held.
+//
+// It does not have to. Every column writes exactly ord[0..len) into one
+// contiguous slot, in order, whatever way the keys split it into groups, and a
+// column's slot is never touched again. So a column whose order has not moved
+// since the last write can hand its descriptors the earlier slot, and write
+// nothing at all. A group [i, j) reads from `awBase + i` either way.
+//
+// This removes a store loop from the walk -- the phase the profiler puts at
+// 39.5% and the one the register ceiling says to shrink by removal, not by
+// cleverness -- and it shrinks what the scatter reads back to the slots that
+// were actually written, which is a smaller and hotter footprint.
+//
+// 0 restores the write-every-column behaviour exactly, for A/B.
+#ifndef DESC_ARENA_REUSE
+#define DESC_ARENA_REUSE 1
+#endif
+
+// Bits of the descriptor word. The top 24 are the radix key, the next eight
+// hold the column shared by every entry in the descriptor, and the arena
+// offset and length share the bottom 32. An arena entry is a uint16 block index;
+// reconstructing `(block << 8) | column` halves the traffic of emitting and
+// expanding the positions without increasing descriptor traffic.
 #define DESC_LEN_BITS 12
 #define DESC_LEN_MASK ((1u << DESC_LEN_BITS) - 1u)
 
 struct DescScratch {
     uint64_t* words;    // n descriptor words, and the radix sort's other half
     uint64_t* words2;
-    uint32_t* arena;    // n positions, partitioned by run
+    uint16_t* arena;    // n block indices, partitioned by run
     int32_t*  offs;     // n output offsets, from the scan over lengths
     int32_t*  mbuf;     // n, the merge's other half; see the note above
 };
 
-#define DESC_BYTES_PER_SYMBOL (2 * 8 + 4 + 4 + 4)
+#define DESC_BYTES_PER_SYMBOL (2 * 8 + 2 + 4 + 4)
 
 // Four text bytes at an arbitrary offset, as one big-endian word.
 //
@@ -714,7 +745,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         // slices within a chunk are still disjoint.
         int32_t*  ord = s_order + (size_t)c * DESC_MAX_BLOCKS + g0;
         uint32_t* key = s_wkey  + (size_t)c * DESC_MAX_BLOCKS + g0;
-        uint32_t* arena = sc.arena + (size_t)g0 * 256;
+        uint16_t* arena = sc.arena + (size_t)g0 * 256;
 
         // Seed with the order of the suffixes starting at each block's last
         // byte. Insertion sort: len is the blocks in a run, typically four.
@@ -778,13 +809,33 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         }
         PROF_COLS_END(len);
 
+        // The arena slot that currently holds ord[0..len), and whether ord has
+        // moved since it was written there. See DESC_ARENA_REUSE.
+        uint32_t awBase  = 0;
+        bool     awDirty = true;
+
         for (int rel = hi; rel >= lo; rel--) {
             // Where this column's positions go. Every column of a run emits
             // every one of its blocks exactly once, so the offset is the column
             // number times the run length and needs no running total -- which is
             // what lets chunks write into the same arena without meeting.
-            uint32_t aw = (uint32_t)(255 - rel) * (uint32_t)len;
-            // Split the ordered suffixes into maximal groups sharing four
+            //
+            // The groups below partition [0, len) in order, so a column's slot
+            // is exactly ord[0..len) whichever way the keys split it. That is
+            // what lets a column point at another column's slot.
+#if DESC_ARENA_REUSE
+            if (awDirty) {
+                awBase = (uint32_t)(255 - rel) * (uint32_t)len;
+                for (int x = 0; x < len; x++)
+                    arena[awBase + x] = (uint16_t)(ord[x] >> 8);
+                awDirty = false;
+            }
+#else
+            awBase = (uint32_t)(255 - rel) * (uint32_t)len;
+            for (int x = 0; x < len; x++)
+                arena[awBase + x] = (uint16_t)(ord[x] >> 8);
+#endif
+            // Split the ordered suffixes into maximal groups sharing the key's
             // leading bytes, and record each as one descriptor.
             int i = 0;
             while (i < len) {
@@ -792,12 +843,11 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                 int j = i + 1;
                 while (j < len && DESC_KEY_OF(key[j]) == DESC_KEY_OF(k)) j++;
 
-                const uint32_t off = (uint32_t)((size_t)g0 * 256 + aw);
-                for (int x = i; x < j; x++) arena[aw++] = (uint32_t)(ord[x] + rel);
+                const uint32_t off = (uint32_t)((size_t)g0 * 256 + awBase + i);
 
                 const int d = atomicAdd(&s_ndesc, 1);
                 PROF_TASK_EMIT();
-                sc.words[d] = ((uint64_t)k << 32) |
+                sc.words[d] = ((uint64_t)DESC_KEYREL(k, rel) << 32) |
                               ((uint64_t)off << DESC_LEN_BITS) | (uint32_t)(j - i);
                 i = j;
             }
@@ -814,6 +864,10 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                     key[x] = (c0 << 24) | (key[x] >> 8);
                 continue;
             }
+
+            // ord is about to move, so the slot it lives in stops describing
+            // it and the next column has to write a fresh one.
+            awDirty = true;
 
             const uint8_t c0 = (uint8_t)t[ord[0] + col];
             key[0] = ((uint32_t)c0 << 24) | (key[0] >> 8);
@@ -851,9 +905,9 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
     // runs own 256 * nblocks of it and the arena is n long.
     for (int p = (int)(nblocks * 256) + tid; p < n; p += BR_BLOCK) {
         const uint32_t off = (uint32_t)p;
-        sc.arena[off] = (uint32_t)p;
+        sc.arena[off] = (uint16_t)(p >> 8);
         const int d = atomicAdd(&s_ndesc, 1);
-        sc.words[d] = ((uint64_t)descKey32(t, n, p) << 32) |
+        sc.words[d] = ((uint64_t)DESC_KEYREL(descKey32(t, n, p), p & 255) << 32) |
                       ((uint64_t)off << DESC_LEN_BITS) | 1u;
     }
     __syncthreads();
@@ -960,7 +1014,8 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                     const int mid = (lo + hi + 1) >> 1;
                     if (s_beg[mid] <= q) lo = mid; else hi = mid - 1;
                 }
-                sa[q] = (int32_t)sc.arena[s_aof[lo] + (q - s_beg[lo])];
+                sa[q] = (int32_t)(((uint32_t)sc.arena[s_aof[lo] + (q - s_beg[lo])] << 8) |
+                                  DESC_REL_OF(s_key[lo]));
             }
             __syncthreads();
         }
@@ -1005,7 +1060,9 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         const uint32_t len = (uint32_t)(w & DESC_LEN_MASK);
         const uint32_t off = (uint32_t)((w >> DESC_LEN_BITS) & 0xFFFFFu);
         const int32_t o = sc.offs[i] - (int32_t)len;
-        for (uint32_t x = 0; x < len; x++) sa[o + x] = (int32_t)sc.arena[off + x];
+        for (uint32_t x = 0; x < len; x++)
+            sa[o + x] = (int32_t)(((uint32_t)sc.arena[off + x] << 8) |
+                                  DESC_REL_OF(w >> 32));
     }
 #endif
     __syncthreads();
@@ -1037,7 +1094,8 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
 #if !DESC_COOP_SCATTER
             const uint32_t off = (uint32_t)((w >> DESC_LEN_BITS) & 0xFFFFFu);
             for (uint32_t x = 0; x < len0; x++)
-                sa[o + x] = (int32_t)sc.arena[off + x];
+                sa[o + x] = (int32_t)(((uint32_t)sc.arena[off + x] << 8) |
+                                      DESC_REL_OF(w >> 32));
 #endif
             continue;   // 5a placed it
         }
@@ -1092,7 +1150,9 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
             ba[k - i] = total;
 #if !DESC_COOP_SCATTER
             const uint32_t off = (uint32_t)((wk >> DESC_LEN_BITS) & 0xFFFFFu);
-            for (uint32_t x = 0; x < len; x++) a[total + x] = (int32_t)sc.arena[off + x];
+            for (uint32_t x = 0; x < len; x++)
+                a[total + x] = (int32_t)(((uint32_t)sc.arena[off + x] << 8) |
+                                         DESC_REL_OF(wk >> 32));
 #endif
             total += (int)len;
         }
@@ -1192,7 +1252,8 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
 #if !DESC_COOP_SCATTER
                 const uint32_t off = (uint32_t)((wk >> DESC_LEN_BITS) & 0xFFFFFu);
                 for (uint32_t x = 0; x < len; x++)
-                    a[base + x] = (int32_t)sc.arena[off + x];
+                    a[base + x] = (int32_t)(((uint32_t)sc.arena[off + x] << 8) |
+                                            DESC_REL_OF(wk >> 32));
 #endif
             }
             if (tid == 0) ba[L] = total;

@@ -11,7 +11,7 @@ and `astrobwt/difftest` compares the two on every build.
 ```
       ░▒▒▒▒▒░        ██████  ███████ ██████   ██████  ███████ ████████  ██████  ██████  ███    ███
     ░▒▓█████▓▒░      ██   ██ ██      ██   ██ ██    ██ ██         ██    ██    ██ ██   ██ ████  ████  ┌────────┐
-   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.6.0 │
+   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.6.1 │
    ▒███████████▒     ██   ██ ██      ██   ██ ██    ██      ██    ██    ██    ██ ██   ██ ██  ██  ██  └────────┘
     ░▒▓▓█▟▙█▓▒░      ██████  ███████ ██   ██  ██████  ███████    ██     ██████  ██   ██ ██      ██
         ▝█▛                                    ASTROBWTv3 MINER FOR DERO
@@ -48,7 +48,7 @@ and `astrobwt/difftest` compares the two on every build.
  │ T04 ███████████████▌░  91%  ││     ⠈⠑⠐⠂⠤⠄⠤⠠⠤⠠⠤⠒⠊⠁   ⣀⠴⠃      ││ REJECTED             12 ││ LATENCY   42 ms │
  │ +11 more                    ││              ⠄⠠⠠⠠⠐⠐⠂⠉         ││ STALE                -- ││      GOOD       │
  └─────────────────────────────┘└───────────────────────────────┘└─────────────────────────┘└─────────────────┘
- [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.6.0
+ [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.6.1
 ```
 
 Eight screens, one key each. The **dashboard** above is the one you leave up;
@@ -633,6 +633,52 @@ and **85.87 KH/s at 336 suffix blocks** against 74.9k at 8,192. Stage 1 writes
 each 256-byte append as sixteen-byte stores. Mining defaults to four suffix
 blocks per SM (the occupancy this kernel actually reaches) instead of sweeping
 from a few KH/s up through 1,252, which measured slower under a display.
+
+**The current descriptor arena moves half as many bytes.** Every position emitted
+by one descriptor has the same column within a 256-byte block. The arena now
+stores only the 16-bit block index and keeps that shared eight-bit column in the
+descriptor's unused fourth key byte; scatter reconstructs
+`(block << 8) | column`. Descriptor size and radix passes are unchanged, while
+both the column walk's stores and the scatter's loads are halved.
+
+Two baseline/compact `--bench --gpu=0` pairs on the RTX 5080 measured
+142.27/146.50 and 142.00/146.76 KH/s at 336 blocks: **+3.2% whole-hash
+throughput**, with all 512 suffix arrays and whole hashes bit-identical to the
+CPU. The same representation was built for the CPU and rejected: widening the
+indices during scatter cost more than the saved traffic there.
+
+**1.6.1 stops writing the arena when the order has not moved, +10.2% on the
+GPU.** Halving an entry was the first half of the same idea; not writing it at
+all is the second. A constant column prepends the same byte to every suffix in
+the run, so the order does not change -- that is the premise the whole file rests
+on, and `col_same` already knows which columns those are. The walk still wrote
+the order out again for each of them: 256 x `len` arena entries per run, the same
+handful of block indices repeated for as long as the order held.
+
+It does not have to. Every column writes exactly `ord[0..len)` into one
+contiguous slot, in order, whatever way the keys happen to split it into groups,
+and a column's slot is never touched again. So a column whose order has not
+moved can hand its descriptors the earlier slot and write nothing; a group
+`[i, j)` reads from `awBase + i` either way, and the descriptor word does not
+change shape at all. The store loop leaves the walk's inner loop entirely, which
+is the shape the register ceiling asked for -- something *removed*, not something
+added.
+
+Three interleaved `--bench --gpu=0` pairs on the RTX 5080, at 336 blocks:
+
+| | GPU |
+|---|---:|
+| write every column | 145.59 / 145.57 / 145.64 KH/s |
+| **write on change** | **160.61 / 160.24 / 160.29 KH/s** |
+
+**+10.2%, with no overlap between the two sets.** The profiler puts it in two
+places: the column walk falls from 922.2M cycles to 774.9M (-16%) because the
+stores are gone, and *expand to sa* falls from 340.0M to 274.9M (-19%) because
+what it reads back is now the slots that were actually written -- a smaller and
+hotter footprint for the same answer. The radix sort does not move, as expected:
+descriptor count and width are untouched. `gpu\desc_test.exe` is correct on all
+512 suffix arrays, `gpu\hash_parallel_test.exe` reports all 512 whole hashes
+bit-identical to the CPU, and `go test ./cmd/derostorm/` is green.
 
 **1.5.8 is two changes to the descriptor sort, +11.2% on the GPU together.**
 
@@ -1715,7 +1761,7 @@ zero.
 
 `hiveos/` is a HiveOS custom miner package built on it -- `h-manifest.conf`,
 `h-config.sh`, `h-run.sh`, `h-stats.sh` and a README, packaged as
-`derostorm-1.6.0.tar.gz` and attached to the release. Point a flight sheet's
+`derostorm-1.6.1.tar.gz` and attached to the release. Point a flight sheet's
 *Installation URL* at it, set the miner name to `derostorm`, and put a **derod
 node address in the Pool URL field** -- which is the one thing worth saying
 twice, because this is a solo miner and there is no pool. Accepted counts
