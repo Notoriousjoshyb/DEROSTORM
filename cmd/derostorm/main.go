@@ -315,7 +315,7 @@ func main() {
 	if cfg.Node == "" {
 		cfg.Node = DefaultNode(testnet)
 	}
-	if cfg.Threads < 1 {
+	if cfg.Threads < 0 {
 		cfg.Threads = DefaultThreads()
 	}
 

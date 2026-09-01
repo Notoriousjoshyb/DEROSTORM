@@ -74,7 +74,7 @@ func (c *Config) Save(path string) error {
 // Complete reports whether the config has everything needed to start mining
 // without asking the user anything.
 func (c *Config) Complete() bool {
-	return c != nil && c.Wallet != "" && c.Node != "" && c.Threads > 0
+	return c != nil && c.Wallet != "" && c.Node != "" && c.Threads >= 0
 }
 
 // DefaultNode is the node suggested for each network during setup.
