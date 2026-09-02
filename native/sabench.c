@@ -1,4 +1,4 @@
-/* sabench.c -- checks and times the two suffix sorts on the real texts.
+﻿/* sabench.c -- checks and times the two suffix sorts on the real texts.
  *
  * The miner's --bench measures a whole hash, of which the suffix sort is 84%.
  * That is the right number to judge a change by, but the wrong one to iterate
@@ -284,18 +284,19 @@ int main(int argc, char** argv)
     /* The phase table. Built with DSA_PROF, so the timers are themselves in the
      * measurement: absolute cycles are inflated and only the shares matter. */
     {
-        extern unsigned long long dsa_prof[5];
+        extern unsigned long long dsa_prof[6];
         extern unsigned long long dsa_stat[9];
-        static const char* ph[5] = {
+        static const char* ph[6] = {
             "run boundaries", "column walk + emit", "descriptor radix sort",
             "merge (key collisions)", "tail",
+            "  of which: colliding groups",
         };
         unsigned long long tot = 0;
         for (int i = 0; i < 5; i++) tot += dsa_prof[i];
         if (tot == 0) tot = 1;
 
         printf("  %-26s %14s %8s\n", "phase", "cycles", "share");
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 6; i++) {
             printf("  %-26s %14llu %7.1f%%\n", ph[i], dsa_prof[i],
                    100.0 * dsa_prof[i] / tot);
         }
@@ -318,3 +319,5 @@ int main(int argc, char** argv)
 #endif
     return desc_ok ? 0 : 1;
 }
+
+

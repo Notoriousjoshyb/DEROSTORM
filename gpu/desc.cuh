@@ -137,8 +137,42 @@
 #ifndef DESC_LOAD64_WIDE
 #define DESC_LOAD64_WIDE 1
 #endif
+// Bytes a wide comparison sweep reads before it decides.
+//
+// Re-swept after the comparison's loads stopped being generic (see
+// descLoadBE32), because that changed what a load costs. Three interleaved
+// `--bench --gpu=0` rounds on an RTX 5080 at 336 blocks:
+//
+//     8   167.4 k      16  172.1 k      32  175.8 k
+//     64  177.1 k     128  178.0 k     192  178.6 k     256  178.1 k
+//
+// Wider is better up to about 128 and then flat: 192 leads 128 by 0.3% over two
+// separate sets and 256 falls back to it, which is a plateau rather than a peak.
+// 128 is the middle of it, and it is the smaller unroll and the smaller
+// read-ahead on a card with less bandwidth to waste.
+//
+// The reason wider wins here is the one the old note gave and then under-sold:
+// reading ahead does not read less, it reads *sooner*, and colliding suffixes
+// are long-prefix matches by construction. A 32-byte sweep that has to go round
+// again is a full dependent round trip; a 128-byte one has sixteen loads per
+// suffix in flight at once.
+// Open a comparison with one eight-byte step before the wide sweep.
+//
+// It used to pay: most merge pairs separate in the first eight bytes past the
+// shared key, so a narrow opening issued six loads where a full sweep issues
+// six per eight bytes of it. That was against a 32-byte sweep. Against a
+// 128-byte one the opening is a dependent round trip in front of every
+// comparison that does *not* separate there -- which is all of the seed's, the
+// blocks being near copies -- and it measures **+0.89% to remove**, three
+// interleaved rounds at 336 blocks with no overlap.
+//
+// 1 restores it, for A/B.
+#ifndef DESC_LEAD8
+#define DESC_LEAD8 0
+#endif
+
 #ifndef DESC_WIDE_STEP
-#define DESC_WIDE_STEP 32
+#define DESC_WIDE_STEP 128
 #endif
 
 // Pieces the 256 columns of a run are cut into, each walked by its own thread.
@@ -404,9 +438,18 @@ struct DescScratch {
 // which is 0x0123 + 0x1111*m, and m is at most 3, so the top nibble reaches 6
 // and never leaves the eight bytes available.
 //
-// Two things this needs, neither obvious. Alignment: masking the address down is
+// The address is walked back with pointer arithmetic (`b - m`) rather than
+// masked as an integer, and that is not cosmetic. Casting a uintptr_t to a
+// pointer loses the address space with it, so ptxas has to assume the result
+// could be shared or local and emits a *generic* load: `LD.E` rather than
+// `LDG.E`. Nsight put 57% of the kernel's excessive global sectors on LD.E
+// instructions for exactly this reason. Derived from `t` by subtraction the
+// pointer stays provably global, and the comparison loop loads through the
+// global path again.
+//
+// Two things this needs, neither obvious. Alignment: walking the address down is
 // safe at any alignment of the text, because the selector is derived from the
-// same address and cancels it out; what it needs is that the masked address stay
+// same address and cancels it out; what it needs is that the lowered address stay
 // inside the allocation, which holds because texts are slices of one buffer.
 // Slack: the second load reaches up to seven bytes past p, and every caller
 // guarantees p+3 < n, so it reads at most four bytes past the text. Those bytes
@@ -415,9 +458,9 @@ struct DescScratch {
 __device__ __forceinline__ uint32_t descLoadBE32(const uint8_t* t, int p)
 {
 #if DESC_WIDE_LOAD
-    const uintptr_t a = (uintptr_t)(t + p);
-    const uint32_t  m = (uint32_t)(a & 3u);
-    const uint32_t* w = (const uint32_t*)(a & ~(uintptr_t)3);
+    const uint8_t*  b = t + p;
+    const uint32_t  m = (uint32_t)((uintptr_t)b & 3u);
+    const uint32_t* w = (const uint32_t*)(b - m);
     return __byte_perm(w[0], w[1], 0x0123u + 0x1111u * m);
 #else
     return ((uint32_t)t[p] << 24) | ((uint32_t)t[p + 1] << 16) |
@@ -433,9 +476,9 @@ __device__ __forceinline__ uint32_t descLoadBE32(const uint8_t* t, int p)
 #if DESC_LOAD64
 __device__ __forceinline__ uint64_t descLoadBE64(const uint8_t* t, int p)
 {
-    const uintptr_t a = (uintptr_t)(t + p);
-    const uint32_t  m = (uint32_t)(a & 3u);
-    const uint32_t* w = (const uint32_t*)(a & ~(uintptr_t)3);
+    const uint8_t*  b = t + p;
+    const uint32_t  m = (uint32_t)((uintptr_t)b & 3u);
+    const uint32_t* w = (const uint32_t*)(b - m);
     const uint32_t sel = 0x0123u + 0x1111u * m;
     const uint32_t lo = __byte_perm(w[0], w[1], sel);
     const uint32_t hi = __byte_perm(w[1], w[2], sel);
@@ -509,7 +552,7 @@ __device__ __forceinline__ bool descSuffixLessFrom(const uint8_t* t, int n,
     // one two-word step first, then the wide loop for the tail, issues fewer
     // loads on the common path without giving up in-flight loads on the long
     // ones.
-    if (i + 8 <= m) {
+    if (DESC_LEAD8 && i + 8 <= m) {
 #if DESC_LOAD64
         const uint64_t wa = descLoadBE64(t, a + i);
         const uint64_t wb = descLoadBE64(t, b + i);
@@ -527,22 +570,15 @@ __device__ __forceinline__ bool descSuffixLessFrom(const uint8_t* t, int n,
 
 #if DESC_LOAD64 && DESC_LOAD64_WIDE
     for (; i + DESC_WIDE_STEP <= m; i += DESC_WIDE_STEP) {
-        const uint64_t wa0 = descLoadBE64(t, a + i);
-        const uint64_t wb0 = descLoadBE64(t, b + i);
-        if (wa0 != wb0) return wa0 < wb0;
-#if DESC_WIDE_STEP >= 16
-        const uint64_t wa1 = descLoadBE64(t, a + i + 8);
-        const uint64_t wb1 = descLoadBE64(t, b + i + 8);
-        if (wa1 != wb1) return wa1 < wb1;
-#endif
-#if DESC_WIDE_STEP >= 32
-        const uint64_t wa2 = descLoadBE64(t, a + i + 16);
-        const uint64_t wb2 = descLoadBE64(t, b + i + 16);
-        if (wa2 != wb2) return wa2 < wb2;
-        const uint64_t wa3 = descLoadBE64(t, a + i + 24);
-        const uint64_t wb3 = descLoadBE64(t, b + i + 24);
-        if (wa3 != wb3) return wa3 < wb3;
-#endif
+        // One unrolled sweep of DESC_WIDE_STEP bytes. Written as a loop rather
+        // than as a hand-written ladder so the width is a knob and not a set of
+        // #if arms; nvcc unrolls it and hoists the loads exactly the same way.
+#pragma unroll
+        for (int u = 0; u < DESC_WIDE_STEP; u += 8) {
+            const uint64_t wau = descLoadBE64(t, a + i + u);
+            const uint64_t wbu = descLoadBE64(t, b + i + u);
+            if (wau != wbu) return wau < wbu;
+        }
     }
     for (; i + 8 <= m; i += 8) {
         const uint64_t wa = descLoadBE64(t, a + i);

@@ -72,6 +72,15 @@ __device__ unsigned long long g_tdsc[65];
 #define PROF_TASK_EMIT()    do { _tnd++; } while (0)
 #define PROF_TASK_END(len)  do {         const int _L = (len) < 64 ? (len) : 64;         atomicAdd(&g_tcyc[_L], (unsigned long long)(clock64() - _tt0));         atomicAdd(&g_tcnt[_L], 1ull);         atomicAdd(&g_tdsc[_L], (unsigned long long)_tnd);     } while (0)
 
+// Tasks the walk hands out per text (nruns * DESC_CHUNKS) against BR_BLOCK.
+// A text with more tasks than threads makes some threads take a second one, and
+// the block waits for those threads -- a 2x critical path for a few per cent
+// more work.
+__device__ unsigned long long g_ntask[40];   // bucket = ntask / 16
+__device__ unsigned long long g_ntover;      // texts with ntask > BR_BLOCK
+__device__ unsigned long long g_ntall;
+#define PROF_NTASK(nt) do { if (threadIdx.x == 0) {         const int _b = (nt) / 16;         atomicAdd(&g_ntask[_b < 39 ? _b : 39], 1ull);         atomicAdd(&g_ntall, 1ull);         if ((nt) > BR_BLOCK) atomicAdd(&g_ntover, 1ull); } } while (0)
+
 __device__ unsigned long long g_runlen[65];
 __device__ unsigned long long g_runmax;
 __device__ unsigned long long g_runsum;
@@ -105,6 +114,7 @@ __device__ unsigned long long g_runcnt;
 #define PROF_ADD(ph)    ((void)0)
 #define PROF_COUNT(c)   ((void)0)
 #define PROF_RUNS(s, n) ((void)0)
+#define PROF_NTASK(nt)  ((void)0)
 #define PROF_TASK_DECL      ((void)0)
 #define PROF_SEED_BEG()     ((void)0)
 #define PROF_SEED_END(len)  ((void)0)

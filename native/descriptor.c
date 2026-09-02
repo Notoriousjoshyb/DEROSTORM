@@ -121,7 +121,7 @@
  * ------------------------------------------------------------------------ */
 #ifdef DSA_PROF
 #include <intrin.h>
-unsigned long long dsa_prof[5];
+unsigned long long dsa_prof[6];
 unsigned long long dsa_stat[9];
 #define PROF_T0()      const unsigned long long _t0 = __rdtsc()
 #define PROF_ADD(i, t) (dsa_prof[i] += __rdtsc() - (t))
@@ -149,6 +149,7 @@ unsigned long long dsa_stat[9];
 #define PH_RADIX  2   /* radix sorting the descriptors */
 #define PH_MERGE  3   /* resolving descriptors that share a key */
 #define PH_TAIL   4
+#define PH_COLL   5   /* nested inside PH_MERGE: the colliding groups alone */
 
 /* dsa_stat slots */
 #define ST_DESC     0  /* descriptors emitted */
@@ -1249,6 +1250,7 @@ retry:
 
         PROF_STAT(ST_KEYGRP, 1);
         {
+            PROF_T0();
             PROF_STAT(ST_COLLIDE, 1);
             /* Several descriptors share these four bytes, so their positions
              * have to be interleaved by comparison. Each descriptor's list is
@@ -1320,6 +1322,7 @@ retry:
             memcpy(sa + out, a, total * sizeof(uint32_t));
             out += total;
             PROF_STAT(ST_MERGED, total);
+            PROF_ADD(PH_COLL, _t0);
         }
         i = j;
     }

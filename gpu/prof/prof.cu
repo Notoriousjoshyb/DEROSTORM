@@ -192,6 +192,22 @@ int main(int argc, char** argv)
     }
     printf("  %-30s %16llu\n\n", "total attributed", tot);
     {
+        unsigned long long nt[40], over = 0, all = 0;
+        cudaMemcpyFromSymbol(nt, g_ntask, sizeof(nt));
+        cudaMemcpyFromSymbol(&over, g_ntover, sizeof(over));
+        cudaMemcpyFromSymbol(&all, g_ntall, sizeof(all));
+        if (all) {
+            printf("  walk tasks per text (BR_BLOCK = %d): %llu of %llu texts exceed it (%.1f%%)\n",
+                   BR_BLOCK, over, all, 100.0 * (double)over / (double)all);
+            for (int i = 0; i < 40; i++) {
+                if (!nt[i]) continue;
+                printf("  %4d-%-4d %10llu %7.1f%%\n", i * 16, i * 16 + 15, nt[i],
+                       100.0 * (double)nt[i] / (double)all);
+            }
+            printf("\n");
+        }
+    }
+    {
         unsigned long long hist[65], mx = 0, sum = 0, cnt = 0;
         cudaMemcpyFromSymbol(hist, g_runlen, sizeof(hist));
         cudaMemcpyFromSymbol(&mx, g_runmax, sizeof(mx));

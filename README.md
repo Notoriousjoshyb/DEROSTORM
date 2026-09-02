@@ -11,7 +11,7 @@ and `astrobwt/difftest` compares the two on every build.
 ```
       ░▒▒▒▒▒░        ██████  ███████ ██████   ██████  ███████ ████████  ██████  ██████  ███    ███
     ░▒▓█████▓▒░      ██   ██ ██      ██   ██ ██    ██ ██         ██    ██    ██ ██   ██ ████  ████  ┌────────┐
-   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.6.2 │
+   ░▓█████████▓▒     ██   ██ █████   ██████  ██    ██ ███████    ██    ██    ██ ██████  ██ ████ ██  │ v1.6.3 │
    ▒███████████▒     ██   ██ ██      ██   ██ ██    ██      ██    ██    ██    ██ ██   ██ ██  ██  ██  └────────┘
     ░▒▓▓█▟▙█▓▒░      ██████  ███████ ██   ██  ██████  ███████    ██     ██████  ██   ██ ██      ██
         ▝█▛                                    ASTROBWTv3 MINER FOR DERO
@@ -48,7 +48,7 @@ and `astrobwt/difftest` compares the two on every build.
  │ T04 ███████████████▌░  91%  ││     ⠈⠑⠐⠂⠤⠄⠤⠠⠤⠠⠤⠒⠊⠁   ⣀⠴⠃      ││ REJECTED             12 ││ LATENCY   42 ms │
  │ +11 more                    ││              ⠄⠠⠠⠠⠐⠐⠂⠉         ││ STALE                -- ││      GOOD       │
  └─────────────────────────────┘└───────────────────────────────┘└─────────────────────────┘└─────────────────┘
- [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.6.2
+ [M] MINING   [S] STATISTICS   [N] NETWORK   [T] THREADS   [C] CONFIG   [L] LOGS   [P] POOLS   DEROSTORM v1.6.3
 ```
 
 Eight screens, one key each. The **dashboard** above is the one you leave up;
@@ -573,29 +573,41 @@ otherwise. Everything in this section except the *Before* columns and the
 *What does not help* experiments comes from `derostorm --bench`, which needs no
 node and no wallet, so you can reproduce it on your own machine in a minute.
 
-Headline, all of it at once, re-measured on 2026-08-31 at 1.6.2:
+Headline, all of it at once, re-measured on 2026-09-02 at 1.6.3:
 
-| | H/s at 1.6.2 | at 1.5.8 | at 1.5.6 | at 1.5.5 | at 1.5.0 | at 1.4.0 |
-|---|---:|---:|---:|---:|---:|---:|
-| CPU, 15 threads | 32,470 | 33,000 | 32,940 | 32,640 | 34,293 | 33,700 – 34,500 |
-| RTX 5080 | **170,390** | 142,400 | 128,000 | 119,463 | 100,640 | 91,870 |
-| together, `--bench` sum | 197,800 | 175,400 | 160,900 | | | |
-| **together, real mining path** | **202,870** | not measured | 159,000 – 159,500 | 153,900 – 154,700 | 130,400 – 131,800 | 124,700 – 125,400 |
+| | H/s at 1.6.3 | at 1.6.2 | at 1.5.8 | at 1.5.6 | at 1.5.5 | at 1.5.0 | at 1.4.0 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| CPU, 15 threads | 32,850 – 33,010 | 32,470 | 33,000 | 32,940 | 32,640 | 34,293 | 33,700 – 34,500 |
+| RTX 5080, `--bench` | **178,290 – 179,500** | 164,950 | 142,400 | 128,000 | 119,463 | 100,640 | 91,870 |
+| together, `--bench` sum | **211,310 – 212,350** | 197,800 | 175,400 | 160,900 | | | |
+| together, real mining path | not measured | 202,870 | not measured | 159,000 – 159,500 | 153,900 – 154,700 | 130,400 – 131,800 | 124,700 – 125,400 |
 
 **Reference machine: Ryzen 7 9800X3D (8C/16T, DDR5-6000 CL30) + RTX 5080.**
 
-Three notes on that table, because the columns are not all the same measurement.
+The 1.6.3 row is `--bench`, three rounds, on a day the card read about 5% higher
+than it did when 1.6.2's own bench figure was taken -- which is why the number
+that matters is not the difference between those two columns but the interleaved
+one: **1.6.2 and 1.6.3 measured against each other in the same session, four
+rounds each, are 173,483 – 173,990 against 178,113 – 179,885, +3.07% with no
+overlap between the two sets.** There is no real-path figure for 1.6.3; the 1.6.2
+row keeps its own, and the two are not comparable.
 
-The 1.6.2 column is the **real mining path**, read off the miner's own dashboard
-while mining against a node — `202.87 KH/s` total, `CPU 32.47` and `GPU 170.39`,
-a 16 / 84 split. It is the first real-path figure since 1.5.6, and it is the one
-worth quoting. `--bench` on the same build reads 164.95 KH/s on the card and
-197.8 together, about 3% lower, because the benchmark starts cold and mining runs
-warm and steady — the opposite of the usual direction, and the reason the two
-rows are both given rather than one being called an estimate of the other.
+Nothing on the CPU path changed at 1.6.3 and its row did not move. That was not
+for want of asking -- see [What does not help](#what-does-not-help), which is
+where this version's CPU work ended up.
 
-Real path against real path, that is **+27.4% over 1.5.6**. Bench against bench,
-the card is **+16% over 1.5.8** — 142.18 / 142.55 KH/s then, 164.95 now — which
+Three notes on the older columns, because they are not all the same measurement.
+
+The 1.6.2 column has **both** measurements and they disagree by about 3% in the
+direction nobody expects. Mining against a node, read off the miner's own
+dashboard, it is `202.87 KH/s` total — `CPU 32.47` and `GPU 170.39`, a 16 / 84
+split, the first real-path figure since 1.5.6. `--bench` on the same build reads
+164.95 on the card and 197.8 together, *lower*, because the benchmark starts cold
+and mining runs warm and steady. Both rows are given rather than one being
+called an estimate of the other.
+
+Real path against real path, 1.6.2 is **+27.4% over 1.5.6**. Bench against bench,
+the card is **+16% over 1.5.8** — 142.18 / 142.55 KH/s then, 164.95 there — which
 is 1.6.1's arena (+10.2%) and 1.6.2's radix sort (+3.3%) compounding with the
 compact arena entry (+3.2%) in between.
 
@@ -606,8 +618,44 @@ measured a day earlier; the card reads about 1% higher today and ~8% higher warm
 than on the first run of a session, which is why nothing here is carried forward
 between days.
 
-The CPU row moved by −1.6% across the 1.6 line and nothing on the CPU path
-changed: 1.6.1 and 1.6.2 are GPU-only. Read it as this machine on this day.
+The CPU row wanders by a percent or two across the whole 1.6 line and nothing on
+the CPU path changed in any of it: 1.6.1, 1.6.2 and 1.6.3 are all GPU-only. Read
+each column as this machine on that day.
+
+**1.6.3 is the suffix comparison, +3.1% on the GPU.** Three changes to
+`descSuffixLessFrom` and the loads under it, and the first of them is the one
+worth repeating elsewhere.
+
+*The wide load was compiling to a generic load.* `descLoadBE32` and
+`descLoadBE64` find the aligned words straddling an arbitrary offset by casting
+the address to `uintptr_t`, masking the low bits, and casting back. That cast
+loses the address space with it, so ptxas cannot prove the result is global and
+emits `LD.E` rather than `LDG.E`. With the counters aggregated by opcode, **57%
+of the kernel's excessive global sectors were on generic loads**, and every one
+of them was in those two functions. Deriving the pointer by subtraction instead
+of masking an integer is the same three words at the same addresses, provably
+global. **+0.81%.**
+
+*The comparison sweep wanted to be four times wider.* `DESC_WIDE_STEP` was last
+swept against a load that no longer exists. Re-swept, and generalised from a
+ladder of `#if` arms into one `#pragma unroll` loop so the width is a knob: 8 →
+167.4 KH/s, 16 → 172.1, 32 (what shipped) → 175.8, 64 → 177.1, 128 → 178.0, 192
+→ 178.6, 256 → 178.1. Monotone to about 128 and then flat, so 128 is the middle
+of a plateau rather than a peak. Reading ahead does not read *less*, it reads
+*sooner*, and these suffixes are long-prefix matches by construction.
+
+*And the eight-byte opening step had stopped paying.* The comparison opened with
+one narrow step before the wide loop, because most merge pairs separate in the
+first eight bytes past the shared key. Against a 32-byte sweep that was a good
+trade; against a 128-byte one it is a dependent round trip in front of every
+comparison that does *not* separate there -- which is all of the column walk's
+seed comparisons, the blocks being near copies. **+0.89% to remove**, and it
+takes `suffix_kernel` back to zero register spills.
+
+The rest of the session is in *What does not help*, and it is again the more
+useful half: the walk's imbalance, the kernel's shared-memory footprint, the
+descriptor counter's atomic and the scatter's binary search were each measured
+and each is not what limits this kernel.
 
 1.5.2 onwards no longer sweeps the block count — it sits at four blocks per SM
 (336 on a 5080), so no figure here is diluted by a tuning sweep in the first
@@ -1508,6 +1556,107 @@ buffer nothing touches is never in cache.
 
 ### What does not help
 
+**1.6.3: four things that are not what limits the GPU kernel.** Each had a
+mechanism behind it and each measured flat or negative, three interleaved
+`--bench --gpu=0` rounds at 336 blocks. They are here because knowing what does
+*not* limit this kernel is what made 1.6.3's comparison work quick.
+
+*Balancing the column walk is worth nothing.* `gpu/prof.exe` gained a histogram
+of the walk's task count per text, and it says something that looks damning:
+**173 of 512 texts (33.8%) hand out more than `BR_BLOCK` tasks**, reaching 367,
+so a third of texts had some thread taking a second task and the whole block
+waiting for it. It was fixed properly — the piece count became a per-text choice,
+`BR_BLOCK / nruns` clamped to a floor, with the boundaries on a sixteen-column
+grid so `col_same` keeps its aligned `uint4` path, and pieces no longer have to
+divide 256. Correct on all 512 vectors, 0 of 512 texts over the block
+afterwards, and **+0.02%**. The block-level imbalance does not move either:
+1,509,908 cycles of block wait before, 1,504,094 after.
+
+That is the finding. **At four blocks per SM, a block's critical path is not the
+SM's throughput** — while one block waits at a barrier its three neighbours
+issue. What the walk needs is *warps*, and 248 tasks over 256 threads already
+gives it eight. It is also why `DESC_CHUNKS` 2 loses: not because the chain is
+longer, but because 124 tasks leave half the block's warps with nothing.
+
+*Shared memory is not the limiter, and the scaffolding that said it was lied.*
+A `DS_SMEM_BALLAST` knob adds unused shared memory so its cost can be priced
+directly, and four kilobytes of it measured −2.1%. Acting on that, the walk's two
+6.7 KB tables were moved into the base of the sort's own dynamic scratch (they
+are dead before the sort touches it, so nothing overlaps in time and nothing
+needs to overlap in space), the order table was narrowed to a `uint16` block
+index, and `s_keep` was dropped in favour of reading the scan's own output.
+**Static shared memory fell 12,272 → 2,272 bytes and the hashrate moved
++0.01%.** Nsight settles it: `Block Limit Registers` is 4 and `Block Limit Shared
+Mem` is 5, so shared memory is not the occupancy limiter here. The ballast was
+measuring its own touch loop and barrier — unused shared memory is optimised
+away, so it has to be written and read to exist. **Scaffolding that has to be
+used in order to exist cannot measure the cost of existing.**
+
+*Warp-aggregating the descriptor counter costs 1.1%.* The walk emits ~19,600
+descriptors a text and each takes its own `atomicAdd(&s_ndesc, 1)`; the SASS
+carries a plain `ATOMS.ADD` on one address, because the result is wanted and
+ptxas can only fold a discarded increment into `ATOMS.POPC.INC`. Aggregating it
+also hands the lanes consecutive slots, so the descriptor stores coalesce —
+Nsight put 7.3% of the kernel's excessive global sectors on that one `STG`. Two
+wins from one change, and **177,385 against 179,414**. The walk runs at 16.1
+active threads per warp, so the mask, the ballot, the shuffle and the forced
+reconvergence cost more than a contended shared atomic.
+
+*A coarse index for the scatter's owner search is null (−0.06%).* Step 5a finds
+which descriptor owns each output position with eight *dependent* shared loads,
+once per output position. Bracketing that search between two slots of a coarse
+index cuts it to two or three steps, and buys nothing: the dependent shared
+loads are not that phase's cost, the scattered `arena` gather beside them is.
+
+*And splitting the sort's staged tile into two 32-bit arrays costs 0.4%.* Nsight
+put **30% of the kernel's excessive shared wavefronts on one instruction** —
+`STS.64`, the radix sort staging a tile at a permuted index. A 64-bit shared
+access covers two banks, so lanes collide when their indices agree modulo 16; at
+32 bits the test is modulo 32 and the same permutation collides about half as
+often. 176,765 against 177,444: halving the conflicts does not pay for doubling
+the instructions.
+
+**1.6.3 on the CPU: a profile, and three measured ties.** The CPU path had not
+been touched since 1.5.3 and was worth asking about. It did not move, and what
+it produced instead is worth having.
+
+`native/descriptor.c` gained a nested phase timer, and it says the phase named
+"merge" is not mostly merging:
+
+| phase | share |
+|---|---:|
+| run boundaries | 1.6% |
+| column walk + emit | 39.1% |
+| descriptor radix sort | 13.5% |
+| merge (key collisions) | 45.8% |
+| — of which the colliding groups themselves | **13.8%** |
+
+**Seventy per cent of that phase is the scatter**, not the merge: 19,742
+descriptors each copying ~3.5 words out of the arena into `sa`, against 329
+colliding groups and 2,205 merged positions. Three things tried against the
+whole sort, `native\sabench.exe` at 15 threads, three interleaved rounds:
+
+| | texts/s | vs base |
+|---|---:|---:|
+| base | 43,195 | |
+| `DSA_KEY_BYTES=4` | 41,706 | **−3.5%** |
+| `/arch:AVX512` throughout | 42,925 | **−0.6%** |
+| a scalar loop instead of the masked scatter store | 33,371 | **−22.2%** |
+
+The AVX-512 row is the useful null. This is a Zen 5 with a full-width
+implementation, the file already carries a 64-byte comparison arm for it, and
+building the entire sort — libsais included — against it is worth nothing. **A
+runtime-dispatched AVX-512 build would be effort spent on a measured tie**,
+which is worth knowing before anyone spends it.
+
+The GPU's 1.6.1 arena trick does not transfer either. It needs the arena entry to
+be position-independent, which on the GPU it is — a block index, with the column
+carried in the descriptor's spare key byte — and on the CPU it is not. The
+representation that would make it so was already built for the CPU once and
+rejected, and the arithmetic says why it stays rejected: the arena is 272 KB a
+text, which sits in L2 on this machine, so what it would save is L2 traffic. The
+store into `sa` is the same volume and cannot be avoided at all.
+
 **Everything else tried on the GPU this session.** Recorded because each one
 looked reasonable and each one measured worse, interleaved against the build
 beside it:
@@ -1826,7 +1975,7 @@ zero.
 
 `hiveos/` is a HiveOS custom miner package built on it -- `h-manifest.conf`,
 `h-config.sh`, `h-run.sh`, `h-stats.sh` and a README, packaged as
-`derostorm-1.6.2.tar.gz` and attached to the release. Point a flight sheet's
+`derostorm-1.6.3.tar.gz` and attached to the release. Point a flight sheet's
 *Installation URL* at it, set the miner name to `derostorm`, and put a **derod
 node address in the Pool URL field** -- which is the one thing worth saying
 twice, because this is a solo miner and there is no pool. Accepted counts
@@ -1857,6 +2006,34 @@ ncu --section SpeedOfLight --section WarpStateStats ^
     --kernel-name suffix_kernel --launch-count 1 --clock-control none ^
     gpu\hash_parallel_test.exe gpu\vectors.bin
 ```
+
+**Profile the miner itself and the launch you get is not the one you want.**
+`--bench` opens with a one-block verification launch and then sweeps 21, 42, 84
+and 168 blocks before it reaches 336, so `--launch-count 1` lands on a grid that
+fills a fraction of the card and reports 16% occupancy and 0.6% memory
+throughput. Find the first 336-block launch before profiling it:
+
+```
+ncu --kernel-name suffix_kernel --launch-count 40 --clock-control none ^
+    --metrics launch__grid_size --csv bin\derostorm-windows-amd64.exe ^
+    --bench --gpu=0 --no-tui
+```
+
+which as of 1.6.3 is index 29, so `--launch-skip 29 --launch-count 1` is the one
+to profile. Build the library with `-lineinfo` first if the source view is
+wanted; it does not change codegen.
+
+The counters that answered the most in 1.6.3 were not in the summary pages.
+Exporting the SASS view and aggregating one column by opcode --
+
+```
+ncu --import rep.ncu-rep --page source --print-source sass --csv
+```
+
+-- is what showed that 57% of the kernel's excessive global sectors were on
+generic `LD` instructions rather than `LDG`, which is a fact about the *address
+arithmetic* in `descLoadBE64` and is invisible at every level above the
+instruction.
 
 The note at the top of `gpu/blockradix.cuh` carries the full record: what the
 phase shares were, what was changed, and what was tried and thrown away.
