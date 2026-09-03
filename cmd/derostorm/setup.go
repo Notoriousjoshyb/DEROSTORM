@@ -101,7 +101,7 @@ func RunSetup(theme *Theme, preferred, path string, existing *Config, flagTestne
 	}
 	if existing != nil {
 		*cfg = *existing
-		if cfg.Threads <= 0 {
+		if cfg.Threads < 0 {
 			cfg.Threads = DefaultThreads()
 		}
 		if cfg.Theme == "" {
@@ -210,20 +210,27 @@ func RunSetup(theme *Theme, preferred, path string, existing *Config, flagTestne
 		// with everything else the machine has to do. Suggesting cpus-1 rather
 		// than cpus is worth a few percent and costs nothing.
 		suggest := cfg.Threads
-		if suggest <= 0 {
+		if suggest < 0 || suggest > maxThreads {
 			suggest = cpus - 1
 		}
-		if suggest < 1 {
+		if suggest < 0 {
+			suggest = 0
+		}
+		if suggest == 0 && gpuCount == 0 {
 			suggest = 1
 		}
 		ans, err := s.ask(4, "Mining threads", strconv.Itoa(suggest),
-			fmt.Sprintf("this machine has %d logical CPUs; one below that is usually fastest", cpus))
+			fmt.Sprintf("this machine has %d logical CPUs; one below that is usually fastest, 0 turns the CPU off for GPU-only mining", cpus))
 		if err != nil {
 			return nil, err
 		}
 		n, err := strconv.Atoi(ans)
-		if err != nil || n < 1 || n > maxThreads {
-			s.fail(fmt.Sprintf("enter a number between 1 and %d", maxThreads))
+		if err != nil || n < 0 || n > maxThreads {
+			s.fail(fmt.Sprintf("enter a number between 0 and %d", maxThreads))
+			continue
+		}
+		if n == 0 && gpuCount == 0 {
+			s.fail("no CPU threads and no GPU found — nothing would mine")
 			continue
 		}
 		if n > cpus {
@@ -243,7 +250,7 @@ func RunSetup(theme *Theme, preferred, path string, existing *Config, flagTestne
 	if gpuCount > 0 {
 		for {
 			ans, err := s.ask(step, "Use the GPU as well?", boolWord(len(cfg.GPUs) > 0),
-				"yes or no — the GPU mines alongside the CPU, not instead of it")
+				"yes or no — the GPU mines alongside the CPU threads above")
 			if err != nil {
 				return nil, err
 			}
@@ -252,14 +259,24 @@ func RunSetup(theme *Theme, preferred, path string, existing *Config, flagTestne
 				s.fail("type yes or no")
 				continue
 			}
+			if !yes && cfg.Threads == 0 {
+				s.fail("the CPU is already off — answering no leaves nothing mining")
+				continue
+			}
 			cfg.GPUs = nil
 			if yes {
 				for i := 0; i < gpuCount && i < maxGPUs; i++ {
 					cfg.GPUs = append(cfg.GPUs, i)
 				}
-				fmt.Fprintf(s.out, "  %s %s\n", t.C(t.Good, "✓"),
-					t.C(t.Dim, fmt.Sprintf("mining on %d GPU(s) as well as %d CPU threads",
-						len(cfg.GPUs), cfg.Threads)))
+				if cfg.Threads == 0 {
+					fmt.Fprintf(s.out, "  %s %s\n", t.C(t.Good, "✓"),
+						t.C(t.Dim, fmt.Sprintf("mining on %d GPU(s), CPU off",
+							len(cfg.GPUs))))
+				} else {
+					fmt.Fprintf(s.out, "  %s %s\n", t.C(t.Good, "✓"),
+						t.C(t.Dim, fmt.Sprintf("mining on %d GPU(s) as well as %d CPU threads",
+							len(cfg.GPUs), cfg.Threads)))
+				}
 			}
 			break
 		}

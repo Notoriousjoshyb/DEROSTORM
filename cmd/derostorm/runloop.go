@@ -236,7 +236,11 @@ func run(o runOpts) {
 	}
 	if len(cfg.GPUs) > 0 {
 		engine.SetGPUs(cfg.GPUs, cfg.GPUBatch, cfg.GPUBlocks)
-		logf(LogInfo, "start", "mining with %d threads and %d GPU(s)", cfg.Threads, len(cfg.GPUs))
+		if cfg.Threads == 0 {
+			logf(LogInfo, "start", "mining on %d GPU(s), CPU off", len(cfg.GPUs))
+		} else {
+			logf(LogInfo, "start", "mining with %d threads and %d GPU(s)", cfg.Threads, len(cfg.GPUs))
+		}
 	} else {
 		logf(LogInfo, "start", "mining with %d threads", cfg.Threads)
 	}

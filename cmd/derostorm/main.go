@@ -31,7 +31,7 @@ import (
 	"github.com/docopt/docopt-go"
 )
 
-const version = "1.7.4"
+const version = "1.8.0"
 
 const usage = `DeroStorm ` + version + `
 AstroBWTv3 miner for DERO. Mines on the CPU, and on NVIDIA or AMD GPUs as well
@@ -62,7 +62,7 @@ Options:
   --config=<path>                 Use this config file instead of the default.
   --wallet-address=<addr>         Mining rewards go to this address.
   --daemon-rpc-address=<host:port>  derod getwork address.
-  --mining-threads=<n>            Number of mining threads.
+  --mining-threads=<n>            Number of mining threads (0 = GPU only, needs --gpu).
   --gpu=<list>                    Also mine on these devices: 0, 0,1, all or
                                   off. NVIDIA cards are numbered first, then
                                   AMD. Overrides the saved setting.
@@ -206,13 +206,13 @@ func main() {
 	// no node and no config, so it must not trip the setup gate below.
 	if optBool(opts, "--bench") {
 		threads := DefaultThreads()
-		if cfg != nil && cfg.Threads > 0 {
+		if cfg != nil && cfg.Threads >= 0 {
 			threads = cfg.Threads
 		}
 		if v := optString(opts, "--mining-threads"); v != "" {
 			n, err := strconv.Atoi(v)
-			if err != nil || n < 1 || n > maxThreads {
-				fmt.Fprintf(os.Stderr, "--mining-threads must be between 1 and %d\n", maxThreads)
+			if err != nil || n < 0 || n > maxThreads {
+				fmt.Fprintf(os.Stderr, "--mining-threads must be between 0 and %d\n", maxThreads)
 				os.Exit(2)
 			}
 			threads = n
@@ -281,8 +281,8 @@ func main() {
 	}
 	if v := optString(opts, "--mining-threads"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > maxThreads {
-			fmt.Fprintf(os.Stderr, "--mining-threads must be between 1 and %d\n", maxThreads)
+		if err != nil || n < 0 || n > maxThreads {
+			fmt.Fprintf(os.Stderr, "--mining-threads must be between 0 and %d\n", maxThreads)
 			os.Exit(2)
 		}
 		cfg.Threads = n
@@ -318,8 +318,15 @@ func main() {
 	if cfg.Node == "" {
 		cfg.Node = DefaultNode(testnet)
 	}
-	if cfg.Threads < 1 {
+	if cfg.Threads < 0 {
 		cfg.Threads = DefaultThreads()
+	}
+	// Zero threads is GPU-only mode, which needs a card named. Without one
+	// the miner would sit connected and hash nothing; failing fast beats
+	// that, and beats silently taking CPU the user gave to another miner.
+	if cfg.Threads == 0 && len(cfg.GPUs) == 0 {
+		fmt.Fprintln(os.Stderr, "nothing to mine with: 0 CPU threads and no GPU (--gpu=0,1,all)")
+		os.Exit(2)
 	}
 
 	// ---- validate the wallet against the live network
@@ -379,8 +386,11 @@ func main() {
 // its power limit is a card that will not go faster whatever else is tuned.
 func buildDeviceRows(e *Engine, perGPU map[int]*rateWindow, cpuRate float64, sensed SensorSample) []DeviceStat {
 	rows := make([]DeviceStat, 0, 1+len(perGPU))
-	rows = append(rows, DeviceStat{Label: "CPU", Rate: cpuRate, TempC: sensed.CPUTemp()})
-
+	cpuLabel := "CPU"
+	if e.Threads() == 0 {
+		cpuLabel = "CPU off"
+	}
+	rows = append(rows, DeviceStat{Label: cpuLabel, Rate: cpuRate, TempC: sensed.CPUTemp()})
 	for _, d := range e.GPUDeviceList() {
 		row := DeviceStat{
 			Label: "GPU " + strconv.Itoa(d),
@@ -420,10 +430,13 @@ func runBench(t *Theme, maxThreadsWanted int, gpus []int, gpuBatch int,
 		noteColour = t.Warn
 	}
 	fmt.Printf("  %s\n\n", t.C(noteColour, saNote))
-	fmt.Printf("  %s\n", t.C(t.Muted, fmt.Sprintf("%8s %14s %16s %14s", "threads", "H/s", "time/hash", "H/s/thread")))
-
-	if maxThreadsWanted < 1 {
+	if maxThreadsWanted < 0 {
 		maxThreadsWanted = DefaultThreads()
+	}
+	if maxThreadsWanted == 0 {
+		fmt.Printf("  %s\n", t.C(t.Dim, "CPU off — benchmarking the GPU only"))
+	} else {
+		fmt.Printf("  %s\n", t.C(t.Muted, fmt.Sprintf("%8s %14s %16s %14s", "threads", "H/s", "time/hash", "H/s/thread")))
 	}
 
 	const iterations = 1000

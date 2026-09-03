@@ -1,8 +1,8 @@
-# AMD (HIP) kernel libraries
+# GPU kernel libraries
 
-The miner embeds one GPU library per vendor. NVIDIA's sits beside this
-directory (`derostorm_gpu.dll`, `libderostorm_gpu.so`). AMD's goes in here:
-
+The miner embeds one GPU library per vendor. NVIDIA's lives in
+`../gpucuda/` (`windows/derostorm_gpu.dll`, `linux/libderostorm_gpu.so`).
+AMD's goes in here:
     windows/derostorm_hip.dll       built by gpu\buildlib_hip.bat
     linux/libderostorm_hip7.so      built by gpu/buildlib_hip.sh  (ROCm 7)
     linux/libderostorm_hip6.so      built by gpu/buildlib_hip.sh  (ROCm 6)
@@ -41,12 +41,12 @@ Windows has one file because Windows has only ever had the ROCm 6 line —
 ### They are not in git
 
 None of these libraries are, on either side: they are build products, and a fat
-binary in git is a fat binary in git forever. The difference is that the NVIDIA
-ones are **required** and these are **optional**. `go:embed` takes this whole
-directory rather than the files, so a tree without them still compiles; the HIP
-backend then finds no library and reports no devices — the same thing, to the
-miner, as a machine with no AMD card. See the long note in
-`cmd/derostorm/gpu_backend.go`.
+binary in git is a fat binary in git forever. All of the GPU libraries are
+**optional** -- NVIDIA's exactly like these. `go:embed` takes the whole
+directory rather than the files, so a tree without them still compiles; the
+backend then finds no library and reports no devices -- the same thing, to the
+miner, as a machine with no such card. An AMD-only rig has no nvcc and needs
+none. See the long note in `cmd/derostorm/gpu_backend.go`.
 
 ## Building it
 

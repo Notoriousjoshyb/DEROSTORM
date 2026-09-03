@@ -42,6 +42,14 @@ case "$OS/$ARCH" in
     ;;
   *)
     BASE="$BASE -march=x86-64-v3 -fno-stack-protector"
+    # Tune for the Zen 4/5 miners actually run on without changing the ISA:
+    # -mtune only schedules, so the library still runs everywhere v3 does.
+    # Probed because older GCCs do not know znver5.
+    if echo 'int x;' | $CC -mtune=znver5 -x c -c - -o /dev/null 2>/dev/null; then
+      BASE="$BASE -mtune=znver5"
+    elif echo 'int x;' | $CC -mtune=znver4 -x c -c - -o /dev/null 2>/dev/null; then
+      BASE="$BASE -mtune=znver4"
+    fi
     ;;
 esac
 

@@ -22,6 +22,11 @@ setup.
 > 1.7.3 carries a ROCm 7 library and picks whichever generation the rig can
 > actually load.
 >
+> **1.8.0 builds on AMD-only rigs.** The CUDA library is optional like the HIP
+> one, so a machine with no NVIDIA toolkit builds a miner with no NVIDIA
+> support instead of failing. `0` threads runs the GPU alone, for a separate
+> CPU miner beside it.
+>
 > If you have an RX 5000, 6000, 7000 or 9000, please
 > [open an issue](https://github.com/Notoriousjoshyb/DEROSTORM/issues) —
 > whether it works or not. Wrong hashes, a card that is not detected, a launch
@@ -107,7 +112,7 @@ Run it. There is nothing to configure first.
 derostorm
 ```
 
-On the first run it asks five questions — network, wallet address, node, threads, theme — and saves the answers to `derostorm.json` **next to the executable**. If a GPU is present it names the card and asks a sixth: whether to mine on it as well. Every run after that starts straight into mining.
+On the first run it asks five questions — network, wallet address, node, threads (`0` turns the CPU off for GPU-only mining), theme — and saves the answers to `derostorm.json` **next to the executable**. If a GPU is present it names the card and asks a sixth: whether to mine on it as well. Every run after that starts straight into mining.
 
 To change any of it later:
 
@@ -134,7 +139,7 @@ Press `:` first for anything that takes an argument, then type and press Enter:
 
 | Command | What it does |
 |---|---|
-| `threads <n>` | Change the thread count live. Also accepts `+2` or `-4`. |
+| `threads <n>` | Change the thread count live (`0` turns the CPU off). Also accepts `+2` or `-4`. |
 | `theme <name>` | Switch colour theme. |
 | `save` | Write the current settings to the config file. |
 | `config` | Show the active settings and where they came from. |
@@ -391,7 +396,7 @@ derostorm [options]
   --rpc-address=<host:port>         derod JSON-RPC, for peer count, network
                                     hashrate and block interval. Default: the
                                     getwork host with the port two higher.
-  --mining-threads=<n>              Override the saved thread count.
+  --mining-threads=<n>              Override the saved thread count (0 = GPU only, needs --gpu).
   --gpu=<list>                      Mine on these devices: 0, 0,1, all or
                                     off. NVIDIA cards first, then AMD.
   --gpu-batch=<n>                   Nonces per GPU launch.
@@ -656,48 +661,48 @@ still pass. It costs a slower link and nothing else.
 
 ### Building the native libraries
 
-Four of them are embedded in the executable and bound at run time: the CUDA
-kernels for Windows, the same kernels for Linux, and the descriptor suffix sort
-for each. They are build products, not source, so they are not in git — build them
-once and the copies under `cmd/derostorm/` are what `go:embed` picks up from
-then on. After that an ordinary build needs neither a C toolchain nor CUDA, and
-they only need rebuilding when their sources change.
+Two of them are embedded in every executable and bound at run time: the
+descriptor suffix sort for Windows and for Linux. They are build products, not
+source, so they are not in git — build them once and the copies under
+`cmd/derostorm/` are what `go:embed` picks up from then on. After that an
+ordinary build needs no C toolchain, and they only need rebuilding when their
+sources change.
 
-A fifth and sixth are **optional**: the AMD kernels, one per platform. They are
-the same source as the CUDA pair through `hipcc` instead of `nvcc`, they need
-ROCm or the AMD HIP SDK to build, and a tree without them still compiles — see
-*Which cards* above and `cmd/derostorm/gpulib/README.md`. Everything below is
-about the four required ones unless it says otherwise.
+The rest are **optional**: the NVIDIA and AMD kernels, one set per platform.
+The CUDA pair comes from `nvcc`, the AMD set from `hipcc` out of the same
+source, and a tree without either still compiles — see *Which cards* above and
+`cmd/derostorm/gpulib/README.md`. An AMD-only rig has no nvcc and needs none.
+Everything below is about the two required ones unless it says otherwise.
 
 **Which ones you need depends on the target, not on your machine**, and for some
 targets the answer is none:
 
 | Target | Needs |
 | --- | --- |
-| `windows/amd64` | `derostorm_gpu.dll` and `derostorm_sa.dll` |
-| `linux/amd64` | `libderostorm_gpu.so` and `libderostorm_sa.so` |
+| `windows/amd64` | `derostorm_sa.dll` |
+| `linux/amd64` | `libderostorm_sa.so` |
 | `linux/arm64`, `darwin/amd64`, `darwin/arm64` | **nothing** |
 
-and, to add AMD support, optionally:
+and, to add GPU support, optionally:
 
 | Target | Optional |
 | --- | --- |
-| `windows/amd64` | `gpulib\windows\derostorm_hip.dll` |
-| `linux/amd64` | `gpulib/linux/libderostorm_hip<N>.so`, one per ROCm generation |
+| `windows/amd64` | `gpucuda\windows\derostorm_gpu.dll`, `gpulib\windows\derostorm_hip.dll` |
+| `linux/amd64` | `gpucuda/linux/libderostorm_gpu.so`, `gpulib/linux/libderostorm_hip<N>.so` (one per ROCm generation) |
 
 So building for macOS needs no GPU, no CUDA and no libraries: `./build.sh` on a
 Mac produces a working CPU miner from a clean clone. `build.sh` checks only what
 the target it is building actually embeds.
 
 ```
-.\build.ps1 -Native      # all four, then the miner
+.\build.ps1 -Native      # the required pair, whatever GPU toolchains are here, then the miner
 ```
 
 or one at a time:
 
 ```
-gpu\buildlib.bat         # CUDA kernels  -> cmd\derostorm\derostorm_gpu.dll
-gpu/buildlib.sh          # CUDA kernels  -> cmd\derostorm\libderostorm_gpu.so   (run under Linux)
+gpu\buildlib.bat         # CUDA kernels  -> cmd\derostorm\gpucuda\windows\derostorm_gpu.dll
+gpu/buildlib.sh          # CUDA kernels  -> cmd/derostorm/gpucuda/linux/libderostorm_gpu.so  (run under Linux)
 native\build.bat         # suffix sort   -> cmd\derostorm\derostorm_sa.dll
 native/buildlib.sh       # suffix sort   -> cmd\derostorm\libderostorm_sa.so    (run under Linux)
 
@@ -705,14 +710,15 @@ gpu\buildlib_hip.bat     # HIP kernels   -> cmd\derostorm\gpulib\windows\derosto
 gpu/buildlib_hip.sh      # HIP kernels   -> cmd/derostorm/gpulib/linux/libderostorm_hip<N>.so  (run under Linux)
 ```
 
-The two HIP scripts are the optional pair. `-Native` runs them when it finds a
-toolchain and names the ones it skipped when it does not, so a build with no AMD
-support is something you are told about rather than something a miner discovers
-later.
+The four GPU scripts are the optional set. `-Native` runs each when it finds
+its toolchain and names the ones it skipped when it does not, so a build
+missing a vendor is something you are told about rather than something a miner
+discovers later.
 
-Each script copies its result into `cmd\derostorm\` itself, because doing that
-by hand is how a stale library gets shipped. Both build scripts refuse to build
-if a copy is missing, since `go:embed` fails with no hint as to the cause.
+Each script copies its result into place itself, because doing that by hand is
+how a stale library gets shipped. Both build scripts refuse to build if a
+*required* copy is missing, since `go:embed` fails with no hint as to the
+cause; a missing optional one only narrows the miner.
 
 The CUDA halves need the toolkit and a host compiler — MSVC on Windows, gcc on
 Linux; the suffix-sort halves need only the host compiler, MSVC or gcc. The HIP

@@ -116,10 +116,11 @@ func (e *Engine) Threads() int { return int(atomic.LoadInt32(&e.nthread)) }
 
 // SetThreads grows or shrinks the mining pool at runtime. Growing starts new
 // workers on the free slots; shrinking signals the highest slots to finish
-// their current job iteration and exit.
+// their current job iteration and exit. Zero stops every CPU worker, for
+// GPU-only mining alongside a separate CPU miner.
 func (e *Engine) SetThreads(n int) error {
-	if n < 1 || n > maxThreads {
-		return fmt.Errorf("threads must be between 1 and %d", maxThreads)
+	if n < 0 || n > maxThreads {
+		return fmt.Errorf("threads must be between 0 and %d", maxThreads)
 	}
 	e.wmu.Lock()
 	defer e.wmu.Unlock()

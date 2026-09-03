@@ -172,7 +172,15 @@
 #endif
 
 #ifndef DESC_WIDE_STEP
-#define DESC_WIDE_STEP 128
+#if defined(DSG_HIP) && DSG_HIP
+// RDNA coalesces at 64 B lines and has less bandwidth to waste on read-ahead:
+// 64 is the bandwidth-constrained default; NVIDIA stays wide (see below).
+#define DESC_WIDE_STEP 64
+#else
+// 192 leads 128 by ~0.3% over two interleaved 5080 sets (8..256 sweep above);
+// 256 falls back. Plateau, not peak — 192 is the top of it.
+#define DESC_WIDE_STEP 192
+#endif
 #endif
 
 // Pieces the 256 columns of a run are cut into, each walked by its own thread.

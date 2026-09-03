@@ -41,7 +41,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION=1.7.4
+VERSION=1.8.0
 PKG=./cmd/derostorm
 BOUNDS_PKG=github.com/deroproject/derohe/astrobwt/astrobwtv3
 LDFLAGS="-s -w"
@@ -65,10 +65,10 @@ done
 # exits. It is a separate flag rather than something a build does on its own,
 # because a build that quietly deletes things is a build nobody trusts.
 #
-# What it never touches: the three embedded libraries under cmd/derostorm. They
-# are inputs to the build, not outputs of it -- go:embed fails without them and
-# rebuilding them needs nvcc, MSVC and WSL. gpu/vectors.bin is left for the same
-# reason: the GPU tests read it.
+# What it never touches: the embedded libraries under cmd/derostorm. They
+# are inputs to the build, not outputs of it -- go:embed needs the suffix-sort
+# pair there, and rebuilding anything needs its own toolchain. gpu/vectors.bin
+# is left for the same reason: the GPU tests read it.
 if [ "$CLEAN" -eq 1 ]; then
   # bin is emptied of build output rather than removed. It also holds
   # derostorm.json, which carries the wallet address the setup wizard asked
@@ -95,19 +95,17 @@ mkdir -p "$OUTDIR"
 
 # The embedded copies, checked per target rather than up front.
 #
-# Which ones a build needs is decided by build tags, not by the host:
+# Which ones a build needs is decided by build tags, not by the host. The
+# suffix-sort library is the only required one: it needs just gcc, which an
+# AMD-only rig has as well. The GPU libraries are all optional -- see
+# check_optional_embedded -- because each needs its own vendor toolchain and
+# an AMD-only rig has no nvcc at all:
 #
-#   windows/amd64   derostorm_gpu.dll    gpu/buildlib.bat     (built on Windows)
-#                   derostorm_sa.dll     native/build.bat     (built on Windows)
-#   linux/amd64     libderostorm_gpu.so  gpu/buildlib.sh      (built on Linux)
-#                   libderostorm_sa.so   native/buildlib.sh   (built on Linux)
+#   windows/amd64   derostorm_sa.dll     native/build.bat     (built on Windows)
+#   linux/amd64     libderostorm_sa.so   native/buildlib.sh   (built on Linux)
 #   everything else nothing
 #
-# The AMD kernels are the exception and check_optional_embedded handles them
-# separately: building them needs ROCm, most machines have none, and a miner
-# without them simply has no AMD support. Missing is fine; stale is not.
-#
-# Checking all three whatever the target is what an earlier version did, and it
+# Checking all whatever the target is what an earlier version did, and it
 # stopped macOS building at all: a Mac needs none of them -- gpu_other.go and
 # sa_other.go cover that build and embed nothing -- so the check failed on files
 # the compiler would never have asked for. A missing one is still worth catching,
@@ -121,10 +119,8 @@ mkdir -p "$OUTDIR"
 check_embedded() {
   local goos="$1" goarch="$2" missing=0 entries=""
   case "$goos/$goarch" in
-    windows/*)   entries="cmd/derostorm/derostorm_gpu.dll:gpu/buildlib.bat, on Windows
-cmd/derostorm/derostorm_sa.dll:native/build.bat, on Windows" ;;
-    linux/amd64) entries="cmd/derostorm/libderostorm_gpu.so:gpu/buildlib.sh, on Linux
-cmd/derostorm/libderostorm_sa.so:native/buildlib.sh, on Linux" ;;
+    windows/*)   entries="cmd/derostorm/derostorm_sa.dll:native/build.bat, on Windows" ;;
+    linux/amd64) entries="cmd/derostorm/libderostorm_sa.so:native/buildlib.sh, on Linux" ;;
     *)           return 0 ;;
   esac
   while IFS= read -r entry; do
@@ -167,28 +163,33 @@ EOF
   [ "$missing" -eq 0 ] || exit 1
 }
 
-# The AMD library, which may legitimately not be there.
+# The GPU libraries, which may legitimately not be there.
 #
-# go:embed takes the whole gpulib/<goos> directory rather than the file, so a
-# tree without it still compiles -- see cmd/derostorm/gpu_backend.go. That makes
-# absence a build configuration and not an error: the finished miner reports no
-# AMD devices, exactly as it would on a machine with no AMD card.
+# go:embed takes the whole gpucuda/<goos> and gpulib/<goos> directories rather
+# than the files, so a tree without them still compiles -- see
+# cmd/derostorm/gpu_backend.go. That makes absence a build configuration and
+# not an error: the finished miner reports no devices for that vendor, exactly
+# as it would on a machine with no such card. An AMD-only rig has no nvcc, so
+# it can never build the CUDA library; before it went optional that ended the
+# build in a go:embed error naming the missing file and nothing else.
 #
 # What is still an error is a stale one. The reasoning is check_embedded's, and
-# it bites harder here: nobody on this side of the build has an AMD card to
+# it bites harder here: nobody on this side of the build may have the card to
 # notice with.
 check_optional_embedded() {
   local goos="$1" goarch="$2" paths="" how=""
   case "$goos/$goarch" in
-    windows/*)   paths="cmd/derostorm/gpulib/windows/derostorm_hip.dll"
-                 how="gpu\buildlib_hip.bat, on Windows with the AMD HIP SDK" ;;
+    windows/*)   paths="cmd/derostorm/gpucuda/windows/derostorm_gpu.dll
+cmd/derostorm/gpulib/windows/derostorm_hip.dll"
+                 how="a GPU toolchain on Windows (nvcc for CUDA, the AMD HIP SDK for HIP)" ;;
     # One per ROCm generation, because a HIP library names the runtime it links
     # to by soname and a rig has one generation installed, not three. Whichever
     # ones are here get checked; none is required.
-    linux/amd64) paths="cmd/derostorm/gpulib/linux/libderostorm_hip7.so
+    linux/amd64) paths="cmd/derostorm/gpucuda/linux/libderostorm_gpu.so
+cmd/derostorm/gpulib/linux/libderostorm_hip7.so
 cmd/derostorm/gpulib/linux/libderostorm_hip6.so
 cmd/derostorm/gpulib/linux/libderostorm_hip5.so"
-                 how="gpu/buildlib_hip.sh, on Linux with ROCm" ;;
+                 how="a GPU toolchain on Linux (nvcc for CUDA, ROCm for HIP)" ;;
     *)           return 0 ;;
   esac
   local path src stale
@@ -212,7 +213,7 @@ cmd/derostorm/gpulib/linux/libderostorm_hip5.so"
 # clear message on a build and no message at all on a clone: the tests ran
 # first and failed with
 #
-#     pattern libderostorm_gpu.so: no matching files found
+#     pattern gpucuda/linux: no matching files found
 #     FAIL github.com/notoriousjoshyb/derostorm/cmd/derostorm [setup failed]
 #
 # which says nothing about what to do. The embedded libraries are gitignored --
@@ -228,16 +229,24 @@ cmd/derostorm/gpulib/linux/libderostorm_hip5.so"
 # Linux toolchain at all -- nvcc and the host compiler both target the machine
 # they run on -- so `--all` from Linux still needs those two copied across from
 # a Windows build. That is not a limitation of this script; it is what a
-# cross-platform fat binary costs.
 if [ "$NATIVE" -eq 1 ]; then
   case "$(go env GOOS)" in
     linux)
-      echo "building CUDA kernels (Linux)"
-      sh gpu/buildlib.sh
+      # The CUDA kernels only if this machine can: an AMD-only rig has no
+      # nvcc, and since the library went optional that is a narrower build,
+      # not a failure -- the miner builds and mines without it, on everything
+      # but NVIDIA.
+      NVCC_BIN="${NVCC:-nvcc}"
+      command -v "$NVCC_BIN" >/dev/null 2>&1 || NVCC_BIN=/usr/local/cuda/bin/nvcc
+      if command -v "$NVCC_BIN" >/dev/null 2>&1; then
+        echo "building CUDA kernels (Linux)"
+        sh gpu/buildlib.sh
+      else
+        echo "no CUDA compiler found -- skipping the NVIDIA kernels (this build will have no NVIDIA support)"
+      fi
       # The AMD kernels only if this machine can: ROCm is a large install and
       # most build machines have none. Skipping is not a failure -- the miner
       # builds and mines without them, on everything but AMD.
-      #
       # amdclang++ counts as well as hipcc, and has to: ROCm 6 deprecated the
       # hipcc wrapper and ROCm 7 on Arch ships amdclang++ without it, so a
       # hipcc-only test skipped the AMD kernels on exactly the machines that

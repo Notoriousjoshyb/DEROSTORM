@@ -154,7 +154,7 @@ func TestParseThreadArg(t *testing.T) {
 		{"+2", 8, 10, false},
 		{"-4", 16, 12, false},
 		{"1", 16, 1, false},
-		{"0", 16, 0, true},
+		{"0", 16, 0, false},
 		{"-20", 16, 0, true},
 		{"abc", 16, 0, true},
 		{"999", 16, 0, true},

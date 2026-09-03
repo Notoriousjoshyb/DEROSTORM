@@ -17,14 +17,18 @@ const configName = "derostorm.json"
 type Config struct {
 	Node    string `json:"node"`
 	Wallet  string `json:"wallet"`
+	// CPU mining threads. Zero turns the CPU off for GPU-only mining, for
+	// running a separate CPU miner beside this one; it needs a GPU in
+	// `gpus`, or nothing mines at all.
 	Threads int    `json:"threads"`
 	Testnet bool   `json:"testnet"`
 	Theme   string `json:"theme"`
 
-	// CUDA device indices to mine on beside the CPU. Empty means CPU only.
-	// GPUBatch is the nonces per kernel launch; 0 lets the library size it from
-	// free VRAM. Larger batches hash a little faster but take longer to notice
-	// a new job, so the whole batch is wasted work when one arrives mid-launch.
+	// GPU device indices to mine on. Empty means CPU only; combined with
+	// Threads 0 the GPU mines alone. GPUBatch is the nonces per kernel
+	// launch; 0 lets the library size it from free VRAM. Larger batches hash
+	// a little faster but take longer to notice a new job, so the whole
+	// batch is wasted work when one arrives mid-launch.
 	GPUs     []int `json:"gpus,omitempty"`
 	GPUBatch int   `json:"gpu_batch,omitempty"`
 
@@ -72,9 +76,11 @@ func (c *Config) Save(path string) error {
 }
 
 // Complete reports whether the config has everything needed to start mining
-// without asking the user anything.
+// without asking the user anything. Zero threads counts as complete when a
+// GPU is configured, for GPU-only mining.
 func (c *Config) Complete() bool {
-	return c != nil && c.Wallet != "" && c.Node != "" && c.Threads > 0
+	return c != nil && c.Wallet != "" && c.Node != "" &&
+		c.Threads >= 0 && (c.Threads > 0 || len(c.GPUs) > 0)
 }
 
 // DefaultNode is the node suggested for each network during setup.

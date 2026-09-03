@@ -10,10 +10,12 @@
 # has to come from a Linux toolchain. WSL is enough: the build needs nvcc, not
 # a GPU, so no card has to be visible to the distribution doing it.
 #
-# The copy in cmd/derostorm/ is what go:embed picks up. It is checked in the
-# same place the DLL is, in build.ps1, because a missing one is a go:embed
-# error with no hint as to the cause. Cross-compiling the Linux miner from
-# Windows works precisely because the .so is a file on disk by then.
+# The copy in cmd/derostorm/gpucuda/linux/ is what go:embed picks up. It is
+# checked in the same place the DLL is, in build.ps1, because a missing one
+# used to be a go:embed error with no hint as to the cause -- since the CUDA
+# library went optional that check only fires when the file is present but
+# stale. Cross-compiling the Linux miner from Windows works precisely because
+# the .so is a file on disk by then.
 #
 # Run from the repository root:  gpu/buildlib.sh
 set -e
@@ -47,5 +49,6 @@ GENCODE="-gencode arch=compute_75,code=sm_75 \
         -cudart static -Xcompiler -fPIC -shared \
         -o gpu/libderostorm_gpu.so gpu/derostorm_gpu.cu
 
-cp -f gpu/libderostorm_gpu.so cmd/derostorm/
-echo "built gpu/libderostorm_gpu.so and copied it to cmd/derostorm/"
+mkdir -p cmd/derostorm/gpucuda/linux
+cp -f gpu/libderostorm_gpu.so cmd/derostorm/gpucuda/linux/
+echo "built gpu/libderostorm_gpu.so and copied it to cmd/derostorm/gpucuda/linux/"

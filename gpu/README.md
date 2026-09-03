@@ -215,8 +215,9 @@ gpu\build.bat hash_test   builds just one
 gpu\sweep.bat             rebuilds option B at several radix widths
 ```
 
-After changing the kernels, copy the DLL to `cmd\derostorm\derostorm_gpu.dll`,
-which is the copy `go:embed` picks up.
+After changing the kernels, copy the DLL to
+`cmd\derostorm\gpucuda\windows\derostorm_gpu.dll`, which is the copy `go:embed`
+picks up (`buildlib.bat` already does this).
 
 Then the miner:
 

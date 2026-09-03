@@ -11,7 +11,14 @@ import (
 	"syscall"
 )
 
-//go:embed derostorm_gpu.dll
+// The NVIDIA library lives in a subdirectory, and the whole subdirectory is
+// what is embedded, so a build made on an AMD-only rig with no nvcc still
+// compiles -- there is a README in there and go:embed is happy with just that.
+// The CUDA backend then finds no file, reports no devices, and the miner
+// behaves exactly as it does on a machine with no NVIDIA card. Dropping the
+// DLL in and rebuilding is the whole of turning NVIDIA support on.
+//
+//go:embed gpucuda/windows
 var gpuLibFS embed.FS
 
 // The AMD library lives in a subdirectory, and the whole subdirectory is what
@@ -30,7 +37,7 @@ var hipLibFS embed.FS
 var (
 	cudaBackend = &gpuBackend{
 		kind: "NVIDIA CUDA", libFS: gpuLibFS,
-		files: []string{"derostorm_gpu.dll"},
+		files: []string{"gpucuda/windows/derostorm_gpu.dll"},
 	}
 	// One candidate, where Linux has two. Windows has only ever had the ROCm 6
 	// line -- amdhip64_6.dll, which ships inside the Adrenalin driver -- so

@@ -94,12 +94,18 @@ func RunCommand(ctx CommandContext, line string) {
 			ctx.Log(LogError, "threads", "%v", err)
 			return
 		}
-		ctx.Config.Threads = n
-		if cpus := DefaultThreads(); n > cpus {
-			ctx.Log(LogWarn, "threads", "now %d — more than the %d CPUs available, expect this to be slower", n, cpus)
+	ctx.Config.Threads = n
+	if n == 0 {
+		if ctx.Engine.GPUs() == 0 {
+			ctx.Log(LogWarn, "threads", "now 0 with no GPU workers running — nothing is mining")
 		} else {
-			ctx.Log(LogGood, "threads", "now %d", n)
+			ctx.Log(LogGood, "threads", "CPU off — GPU only")
 		}
+	} else if cpus := DefaultThreads(); n > cpus {
+		ctx.Log(LogWarn, "threads", "now %d — more than the %d CPUs available, expect this to be slower", n, cpus)
+	} else {
+		ctx.Log(LogGood, "threads", "now %d", n)
+	}
 
 	case "theme":
 		if len(args) == 0 {
@@ -163,8 +169,8 @@ func parseThreadArg(s string, current int) (int, error) {
 	if rel != 0 {
 		n = current + rel*n
 	}
-	if n < 1 || n > maxThreads {
-		return 0, fmt.Errorf("threads must be between 1 and %d", maxThreads)
+	if n < 0 || n > maxThreads {
+		return 0, fmt.Errorf("threads must be between 0 and %d", maxThreads)
 	}
 	return n, nil
 }

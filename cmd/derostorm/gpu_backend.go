@@ -45,11 +45,13 @@ package main
 // the other. A machine with an NVIDIA card and no ROCm gets the CUDA backend
 // and a quiet nothing from the HIP one, which is the common case on both sides.
 //
-// The AMD library may not be present at all. It has to be built by someone with
-// ROCm installed, and until it has been, cmd/derostorm/gpulib/ holds only its
-// README -- so the embedded file is missing and the HIP backend reports no
-// devices, exactly as it would on a machine with no AMD card. That is why this
-// reads the embedded bytes before anything else and treats "not there" as an
+// Either library may not be present at all. The AMD one has to be built by
+// someone with ROCm installed, and the NVIDIA one by someone with a CUDA
+// toolkit -- an AMD-only rig has neither reason nor means to build the
+// latter. Until it has been, the embedded directory holds only its README --
+// so the embedded file is missing and that backend reports no devices,
+// exactly as it would on a machine with no such card. That is why this reads
+// the embedded bytes before anything else and treats "not there" as an
 // ordinary absence rather than an error.
 //
 // Intel GPUs are not supported and would need a third port, to SYCL or Vulkan.
@@ -125,9 +127,9 @@ type gpuBackend struct {
 // --gpu list should not renumber itself when a build gains AMD support.
 var gpuBackends = []*gpuBackend{cudaBackend, hipBackend}
 
-// errLibAbsent is the HIP backend on a build where nobody has put the library
-// in place yet. Not an error the user should see: it means "no such hardware
-// here", the same as a machine with no AMD card.
+// errLibAbsent is a backend whose library nobody has put in place yet. Not an
+// error the user should see: it means "no such hardware here", the same as a
+// machine with no such card.
 var errLibAbsent = errors.New("no library embedded for this backend")
 
 // extractEmbeddedLib writes an embedded library somewhere stable and returns
@@ -206,9 +208,9 @@ func extractEmbeddedLib(libFS embed.FS, file string) (string, error) {
 //
 // Each candidate is tried in turn and the first that both unpacks and loads is
 // the one bound. A candidate that is not embedded at all is skipped without
-// comment: absent is not broken. The AMD library has to be built by someone
-// with ROCm, and a build made before that happened simply has no AMD support --
-// which is the same thing, to the user, as having no AMD card.
+// comment: absent is not broken. Either vendor's library needs its own
+// toolchain to build, and a build made without it simply has no support for
+// that vendor -- which is the same thing, to the user, as having no such card.
 func (b *gpuBackend) load() error {
 	b.once.Do(func() {
 		var sym func(string) (uintptr, error)

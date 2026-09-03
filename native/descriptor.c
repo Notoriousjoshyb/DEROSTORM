@@ -283,12 +283,15 @@ typedef char dsa_off_fits[((256 * 384) <= (int)DSA_MAX_OFF) ? 1 : -1];
  *     the full bound and the text is redone. Costs one wasted walk, and never
  *     happened on any of the 512.
  *   - A key group larger than DSA_GROUP_CAP makes the whole call fail, and the
- *     caller falls back to libsais for that hash. Nine times the observed
- *     maximum, so this is for a text unlike anything measured, and giving up a
- *     hash to libsais costs a few microseconds rather than being wrong.
+ *     caller falls back to libsais for that hash. Four times the observed
+ *     maximum (879 positions, 262 lists over 512 texts), so this is for a text
+ *     unlike anything measured, and giving up a hash to libsais costs a few
+ *     microseconds rather than being wrong. Halved from 8192: merge/merge2/bnd/
+ *     bnd2 are 4x (cap+8) words per thread, so this saves ~128 KB per thread,
+ *     ~1.9 MB at 15 threads, kept out of the shared L3.
  */
 #ifndef DSA_GROUP_CAP
-#define DSA_GROUP_CAP 8192
+#define DSA_GROUP_CAP 4096
 #endif
 
 typedef struct {

@@ -53,7 +53,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$Version  = '1.7.4'
+$Version  = '1.8.0'
 $Pkg      = './cmd/derostorm'
 $BoundsPkg = 'github.com/deroproject/derohe/astrobwt/astrobwtv3'
 $LdFlags  = '-s -w'
@@ -129,8 +129,10 @@ if ($Clean) { Invoke-Clean; return }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
-# The embedded copies. Their presence is checked on every build, because a
-# missing one is a build error from go:embed with no hint as to the cause.
+# The embedded copies. The suffix-sort pair below is required on every build,
+# because a missing one is a build error from go:embed with no hint as to the
+# cause -- and required is fair for them, since they need only MSVC and gcc,
+# which an AMD-only rig has as well.
 #
 # The two Linux libraries are the odd ones out: a compiler targets the host it
 # runs on, so neither .so can come from this toolchain and both are built under
@@ -149,22 +151,22 @@ $SaSources  = @('native\derostorm_sa.c', 'native\descriptor.c', 'native\descript
                 'native\libsais\libsais.c', 'native\libsais\libsais.h')
 
 $Embedded = @(
-    @{ Path = 'cmd\derostorm\derostorm_gpu.dll';   Script = 'gpu\buildlib.bat';   What = 'CUDA kernels (Windows)'; Sources = $GpuSources }
-    @{ Path = 'cmd\derostorm\libderostorm_gpu.so'; Script = 'gpu/buildlib.sh';    What = 'CUDA kernels (Linux)';   Wsl = $true; Needs = 'a Linux CUDA toolkit'; Sources = $GpuSources }
     @{ Path = 'cmd\derostorm\derostorm_sa.dll';    Script = 'native\build.bat';   What = 'descriptor suffix sort (Windows)'; Sources = $SaSources }
     @{ Path = 'cmd\derostorm\libderostorm_sa.so';  Script = 'native/buildlib.sh'; What = 'descriptor suffix sort (Linux)'; Wsl = $true; Needs = 'gcc'; Sources = $SaSources }
 )
 
-# The AMD kernels, which are optional in a way the four above are not.
+# The GPU kernels, which are optional in a way the two above are not.
 #
-# They come from the same sources through a HIP compiler instead of nvcc, and
-# building them needs ROCm or the AMD HIP SDK. go:embed takes the whole
-# cmd\derostorm\gpulib\<goos> directory rather than the file, so a tree without
-# them still compiles and the finished miner simply reports no AMD devices. See
-# the long note in cmd\derostorm\gpu_backend.go.
+# The CUDA pair used to be required, and that is what kept an AMD-only rig from
+# building at all: nvcc does not exist there, so the library could never be
+# produced and go:embed failed on the missing file. Now both vendors work the
+# same way. go:embed takes the whole cmd\derostorm\gpucuda\<goos> and
+# cmd\derostorm\gpulib\<goos> directories rather than the files, so a tree
+# without them still compiles and the finished miner simply reports no devices
+# for that vendor. See the long note in cmd\derostorm\gpu_backend.go.
 #
 # So missing is a build configuration and not an error. Stale is still an error,
-# and a worse one than for the NVIDIA libraries: nobody on this side has an AMD
+# and a worse one than for the suffix sort: nobody on this side may have the
 # card to notice with.
 #
 # Linux has one per ROCm generation, and that is not a mistake. A HIP library
@@ -185,6 +187,8 @@ $Embedded = @(
 # default there. DSG_HIPCC is how a machine with several builds the rest; see
 # gpu/buildlib_hip.sh.
 $Optional = @(
+    @{ Path = 'cmd\derostorm\gpucuda\windows\derostorm_gpu.dll';   Script = 'gpu\buildlib.bat';     What = 'CUDA kernels (Windows)'; Needs = 'an NVIDIA CUDA toolkit'; Sources = $GpuSources }
+    @{ Path = 'cmd\derostorm\gpucuda\linux\libderostorm_gpu.so';   Script = 'gpu/buildlib.sh';      What = 'CUDA kernels (Linux)';   Wsl = $true; Needs = 'a Linux CUDA toolkit'; Sources = $GpuSources }
     @{ Path = 'cmd\derostorm\gpulib\windows\derostorm_hip.dll';  Script = 'gpu\buildlib_hip.bat'; What = 'HIP kernels (Windows)'; Needs = 'the AMD HIP SDK for Windows'; Sources = $GpuSources }
     @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip7.so'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux, ROCm 7)'; Wsl = $true; Needs = 'ROCm 7'; Sources = $GpuSources }
     @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip6.so'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux, ROCm 6)'; Wsl = $true; Needs = 'ROCm 6'; Sources = $GpuSources }
@@ -222,18 +226,33 @@ if ($Native) {
     # library three times over.
     foreach ($group in $Optional | Group-Object Script) {
         $lib = $group.Group[0]
-        $have = if ($lib.Wsl) {
-            # amdclang++ as well as hipcc: ROCm 6 deprecated the hipcc wrapper
-            # and ROCm 7 on Arch ships without it, so a hipcc-only test skips
-            # the AMD kernels on the machines that build the newest ones.
-            & wsl.exe -- bash -lc '[ -n "$DSG_HIPCC" ] || [ -x /opt/rocm/bin/amdclang++ ] || command -v hipcc >/dev/null 2>&1 || [ -x /opt/rocm/bin/hipcc ]' 2>$null
-            $LASTEXITCODE -eq 0
-        } else {
-            $hip = if ($env:HIP_PATH) { $env:HIP_PATH } else { 'C:\Program Files\AMD\ROCm\6.2' }
-            Test-Path (Join-Path $hip 'bin\hipcc.exe')
+        # Each GPU library needs its own toolchain, and an AMD-only rig has
+        # only some of them: probe for the right one before building, and skip
+        # what cannot be built here. A skip is a narrower miner, not a failure.
+        $have = switch -Wildcard ($lib.Script) {
+            '*hip*' {
+                if ($lib.Wsl) {
+                    # amdclang++ as well as hipcc: ROCm 6 deprecated the hipcc wrapper
+                    # and ROCm 7 on Arch ships without it, so a hipcc-only test skips
+                    # the AMD kernels on the machines that build the newest ones.
+                    & wsl.exe -- bash -lc '[ -n "$DSG_HIPCC" ] || [ -x /opt/rocm/bin/amdclang++ ] || command -v hipcc >/dev/null 2>&1 || [ -x /opt/rocm/bin/hipcc ]' 2>$null
+                    $LASTEXITCODE -eq 0
+                } else {
+                    $hip = if ($env:HIP_PATH) { $env:HIP_PATH } else { 'C:\Program Files\AMD\ROCm\6.2' }
+                    Test-Path (Join-Path $hip 'bin\hipcc.exe')
+                }
+            }
+            default {
+                if ($lib.Wsl) {
+                    & wsl.exe -- bash -lc 'command -v nvcc >/dev/null 2>&1 || [ -x /usr/local/cuda/bin/nvcc ]' 2>$null
+                    $LASTEXITCODE -eq 0
+                } else {
+                    $null -ne (Get-Command nvcc -ErrorAction SilentlyContinue)
+                }
+            }
         }
         if (-not $have) {
-            Write-Host "skipping $($lib.What) - no HIP compiler here" -ForegroundColor DarkYellow
+            Write-Host "skipping $($lib.What) - no $($lib.Needs) here" -ForegroundColor DarkYellow
             continue
         }
         Write-Host "building $($lib.What)" -ForegroundColor Cyan
@@ -260,12 +279,12 @@ foreach ($lib in $Embedded) {
     }
 }
 
-# Said once, so a release cut without AMD support is a choice and not something
-# a miner discovers three days later.
+# Said once, so a release cut without GPU support for a vendor is a choice and
+# not something a miner discovers three days later.
 $MissingOptional = @($Optional | Where-Object { -not (Test-Path $_.Path) })
 if ($MissingOptional) {
     $names = ($MissingOptional | ForEach-Object { $_.What }) -join ', '
-    Write-Host "no AMD support in this build - $names not present" -ForegroundColor DarkYellow
+    Write-Host "not in this build - $names not present; those cards mine on the CPU" -ForegroundColor DarkYellow
 }
 
 # Present is not the same as current, and the difference has already shipped

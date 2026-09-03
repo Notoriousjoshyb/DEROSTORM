@@ -344,7 +344,13 @@ __global__ void stage1_kernel(const uint8_t* work, uint32_t nonceBase, int count
 //
 // One atomicAdd per hash, by one thread of the block, against tens of
 // milliseconds of work per hash: the counter is not a bottleneck.
-__global__ __launch_bounds__(BR_BLOCK) void suffix_kernel(
+//
+// __launch_bounds__ pins 4 resident blocks/SM: the kernel runs at 64 regs with
+// no spills (sm_120 ptxas), so 4x256-thread blocks fit the register file and
+// that is where the curve plateaus (336 on an 84-SM card). Deliberately NOT a
+// global -maxrregcount: that would also cap stage1_kernel, which is shared-
+// memory bound and must be free to take the registers it wants.
+__global__ __launch_bounds__(BR_BLOCK, 4) void suffix_kernel(
         const uint8_t* texts, const int32_t* lens, int count,
         Pool pool, int32_t* saOut, int32_t* nextHash)
 {
@@ -567,8 +573,12 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     if ((e = cudaMemGetInfo(&freeB, &totB)) != cudaSuccess) {
         setErr("free memory", e); free(c); return DSG_ERR_ALLOC;
     }
-    // Leave a gigabyte and a half for the display and the driver.
-    size_t budget = freeB > (size_t)1500e6 ? freeB - (size_t)1500e6 : 0;
+    // Leave room for the display and the driver: 1.5 GB on big cards, 1.0 GB
+    // on <=8 GB cards where 1.5 GB is a fifth of the card (RX 7600/6600, RTX
+    // 3060 8 GB, gfx115x APUs). Batch sizing below divides what is left, so
+    // this is +~7% batch on an 8 GB card and nothing on a 16 GB one.
+    size_t reserve = totB <= (size_t)8e9 ? (size_t)1000e6 : (size_t)1500e6;
+    size_t budget = freeB > reserve ? freeB - reserve : 0;
 
     // The blocks are sized first because what they need is bounded -- the
     // measured curve is flat past a couple of blocks per SM -- while the chunk

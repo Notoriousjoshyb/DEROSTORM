@@ -22,7 +22,14 @@ import (
 	"github.com/ebitengine/purego"
 )
 
-//go:embed libderostorm_gpu.so
+// The NVIDIA library lives in a subdirectory, and the whole subdirectory is
+// what is embedded, so a build made on an AMD-only rig with no nvcc still
+// compiles -- there is a README in there and go:embed is happy with just that.
+// The CUDA backend then finds no file, reports no devices, and the miner
+// behaves exactly as it does on a machine with no NVIDIA card. Dropping the
+// .so in and rebuilding is the whole of turning NVIDIA support on.
+//
+//go:embed gpucuda/linux
 var gpuLibFS embed.FS
 
 // The AMD library lives in a subdirectory, and the whole subdirectory is what
@@ -41,7 +48,7 @@ var hipLibFS embed.FS
 var (
 	cudaBackend = &gpuBackend{
 		kind: "NVIDIA CUDA", libFS: gpuLibFS,
-		files: []string{"libderostorm_gpu.so"},
+		files: []string{"gpucuda/linux/libderostorm_gpu.so"},
 	}
 	// However many AMD libraries the build has, newest ROCm first.
 	//
