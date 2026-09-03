@@ -744,6 +744,68 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
      * column keeps the check off the inner loop. */
     const size_t desc_room = s->desc_cap;
     const uint32_t base = first_block * DSA_BLOCK;
+    /* A one-block run needs no suffix ordering or constant-column discovery:
+     * every column is already a singleton. Keep the rolling key used by the
+     * general walk, but emit directly from registers. Single-block runs are
+     * about 27% of real runs, so avoiding the order/key arrays and 256-entry
+     * constant masks removes common fixed work on every architecture. */
+    if (blocks == 1) {
+        uint32_t key = key32(t, n, base + DSA_BLOCK - 1);
+        for (int rel = DSA_BLOCK - 1; rel >= 0; rel--) {
+            Desc* d = &s->desc[*desc_len];
+            d->key = key;
+            d->packed = desc_pack((uint32_t)*arena_len, 1);
+            s->arena[(*arena_len)++] = base + (uint32_t)rel;
+            (*desc_len)++;
+            if (rel != 0) {
+                key = ((uint32_t)t[base + (uint32_t)rel - 1] <<
+                       (8 * (DSA_KEY_BYTES - 1))) | (key >> 8);
+            }
+        }
+        return 1;
+    }
+    /* Two blocks also fit entirely in registers. Stable prepend ordering is a
+     * single state bit: unequal new bytes decide it, equal bytes retain the
+     * previous suffix order. This avoids the shared-sized temporary arrays and
+     * the constant-column mask for another 17% of real runs. */
+    if (blocks == 2) {
+        if (*desc_len + 2 * DSA_BLOCK > desc_room) return 0;
+        const uint32_t b0 = base;
+        const uint32_t b1 = base + DSA_BLOCK;
+        uint32_t key0 = key32(t, n, b0 + DSA_BLOCK - 1);
+        uint32_t key1 = key32(t, n, b1 + DSA_BLOCK - 1);
+        int swapped = suffix_less(t, n, b1 + DSA_BLOCK - 1,
+                                  b0 + DSA_BLOCK - 1);
+
+        for (int rel = DSA_BLOCK - 1; rel >= 0; rel--) {
+            const uint32_t off = (uint32_t)*arena_len;
+            const uint32_t first = swapped ? b1 : b0;
+            const uint32_t second = swapped ? b0 : b1;
+            const uint32_t first_key = swapped ? key1 : key0;
+            const uint32_t second_key = swapped ? key0 : key1;
+            s->arena[(*arena_len)++] = first + (uint32_t)rel;
+            s->arena[(*arena_len)++] = second + (uint32_t)rel;
+
+            Desc* d = &s->desc[(*desc_len)++];
+            d->key = first_key;
+            d->packed = desc_pack(off, first_key == second_key ? 2 : 1);
+            if (first_key != second_key) {
+                d = &s->desc[(*desc_len)++];
+                d->key = second_key;
+                d->packed = desc_pack(off + 1, 1);
+            }
+
+            if (rel != 0) {
+                const uint32_t col = (uint32_t)rel - 1;
+                const uint8_t c0 = t[b0 + col];
+                const uint8_t c1 = t[b1 + col];
+                key0 = ((uint32_t)c0 << (8 * (DSA_KEY_BYTES - 1))) | (key0 >> 8);
+                key1 = ((uint32_t)c1 << (8 * (DSA_KEY_BYTES - 1))) | (key1 >> 8);
+                if (c0 != c1) swapped = c1 < c0;
+            }
+        }
+        return 1;
+    }
     uint32_t* order = s->order;
 
     /* Seed: the suffixes starting at each block's last byte, sorted. Insertion

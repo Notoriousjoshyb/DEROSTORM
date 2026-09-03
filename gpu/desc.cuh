@@ -783,6 +783,81 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         uint32_t* key = s_wkey  + (size_t)c * DESC_MAX_BLOCKS + g0;
         uint16_t* arena = sc.arena + (size_t)g0 * 256;
 
+        // A one-block run has no ordering problem: every column is a singleton
+        // and therefore constant. Keep its rolling key and block index in
+        // registers instead of building shared order/key arrays and a local
+        // constant-column table. These are about 27% of real runs, and this
+        // path is vendor-neutral CUDA/HIP code.
+        if (len == 1) {
+            const uint32_t awBase = (uint32_t)(255 - hi);
+            arena[awBase] = (uint16_t)g0;
+            const uint32_t off = (uint32_t)((size_t)g0 * 256 + awBase);
+            uint32_t oneKey = descKey32(t, n, base + hi);
+            for (int rel = hi; rel >= lo; rel--) {
+                const int d = atomicAdd(&s_ndesc, 1);
+                PROF_TASK_EMIT();
+                sc.words[d] = ((uint64_t)DESC_KEYREL(oneKey, rel) << 32) |
+                              ((uint64_t)off << DESC_LEN_BITS) | 1u;
+                if (rel != lo)
+                    oneKey = ((uint32_t)t[base + rel - 1] << 24) | (oneKey >> 8);
+            }
+            PROF_TASK_END(len);
+            continue;
+        }
+
+        // For two blocks, suffix order is one register bit. Unequal prepended
+        // bytes decide the next order; equal bytes preserve it. This retains
+        // the exact stable ordering rule while removing shared arrays and the
+        // constant-column table for another 17% of observed runs.
+        if (len == 2) {
+            const int b0 = base;
+            const int b1 = base + 256;
+            uint32_t key0 = descKey32(t, n, b0 + hi);
+            uint32_t key1 = descKey32(t, n, b1 + hi);
+            bool swapped = descSuffixLess(t, n, b1 + hi, b0 + hi);
+            uint32_t awBase = 0;
+            bool awDirty = true;
+
+            for (int rel = hi; rel >= lo; rel--) {
+                if (awDirty) {
+                    awBase = (uint32_t)(255 - rel) * 2u;
+                    arena[awBase] = (uint16_t)(swapped ? g0 + 1 : g0);
+                    arena[awBase + 1] = (uint16_t)(swapped ? g0 : g0 + 1);
+                    awDirty = false;
+                }
+                const uint32_t firstKey = swapped ? key1 : key0;
+                const uint32_t secondKey = swapped ? key0 : key1;
+                const uint32_t off = (uint32_t)((size_t)g0 * 256 + awBase);
+
+                int d = atomicAdd(&s_ndesc, 1);
+                PROF_TASK_EMIT();
+                if (DESC_KEY_OF(firstKey) == DESC_KEY_OF(secondKey)) {
+                    sc.words[d] = ((uint64_t)DESC_KEYREL(firstKey, rel) << 32) |
+                                  ((uint64_t)off << DESC_LEN_BITS) | 2u;
+                } else {
+                    sc.words[d] = ((uint64_t)DESC_KEYREL(firstKey, rel) << 32) |
+                                  ((uint64_t)off << DESC_LEN_BITS) | 1u;
+                    d = atomicAdd(&s_ndesc, 1);
+                    PROF_TASK_EMIT();
+                    sc.words[d] = ((uint64_t)DESC_KEYREL(secondKey, rel) << 32) |
+                                  ((uint64_t)(off + 1) << DESC_LEN_BITS) | 1u;
+                }
+
+                if (rel != lo) {
+                    const int col = rel - 1;
+                    const uint8_t c0 = t[b0 + col];
+                    const uint8_t c1 = t[b1 + col];
+                    key0 = ((uint32_t)c0 << 24) | (key0 >> 8);
+                    key1 = ((uint32_t)c1 << 24) | (key1 >> 8);
+                    const bool nextSwapped = (c0 == c1) ? swapped : (c1 < c0);
+                    awDirty = nextSwapped != swapped;
+                    swapped = nextSwapped;
+                }
+            }
+            PROF_TASK_END(len);
+            continue;
+        }
+
         // Seed with the order of the suffixes starting at each block's last
         // byte. Insertion sort: len is the blocks in a run, typically four.
         PROF_SEED_BEG();
