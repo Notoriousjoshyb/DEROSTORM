@@ -1,4 +1,4 @@
-# DeroStorm build script (Windows / PowerShell).
+﻿# DeroStorm build script (Windows / PowerShell).
 #
 #   .\build.ps1              build for this machine into .\bin
 #   .\build.ps1 -All         cross-compile every supported platform
@@ -151,8 +151,8 @@ $SaSources  = @('native\derostorm_sa.c', 'native\descriptor.c', 'native\descript
                 'native\libsais\libsais.c', 'native\libsais\libsais.h')
 
 $Embedded = @(
-    @{ Path = 'cmd\derostorm\derostorm_sa.dll';    Script = 'native\build.bat';   What = 'descriptor suffix sort (Windows)'; Sources = $SaSources }
-    @{ Path = 'cmd\derostorm\libderostorm_sa.so';  Script = 'native/buildlib.sh'; What = 'descriptor suffix sort (Linux)'; Wsl = $true; Needs = 'gcc'; Sources = $SaSources }
+    @{ Path = 'cmd\derostorm\derostorm_sa.dll';    Goos = 'windows'; Script = 'native\build.bat';   What = 'descriptor suffix sort (Windows)'; Sources = $SaSources }
+    @{ Path = 'cmd\derostorm\libderostorm_sa.so';  Goos = 'linux'; Script = 'native/buildlib.sh'; What = 'descriptor suffix sort (Linux)'; Wsl = $true; Needs = 'gcc'; Sources = $SaSources }
 )
 
 # The GPU kernels, which are optional in a way the two above are not.
@@ -187,16 +187,29 @@ $Embedded = @(
 # default there. DSG_HIPCC is how a machine with several builds the rest; see
 # gpu/buildlib_hip.sh.
 $Optional = @(
-    @{ Path = 'cmd\derostorm\gpucuda\windows\derostorm_gpu.dll';   Script = 'gpu\buildlib.bat';     What = 'CUDA kernels (Windows)'; Needs = 'an NVIDIA CUDA toolkit'; Sources = $GpuSources }
-    @{ Path = 'cmd\derostorm\gpucuda\linux\libderostorm_gpu.so';   Script = 'gpu/buildlib.sh';      What = 'CUDA kernels (Linux)';   Wsl = $true; Needs = 'a Linux CUDA toolkit'; Sources = $GpuSources }
-    @{ Path = 'cmd\derostorm\gpulib\windows\derostorm_hip.dll';  Script = 'gpu\buildlib_hip.bat'; What = 'HIP kernels (Windows)'; Needs = 'the AMD HIP SDK for Windows'; Sources = $GpuSources }
-    @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip7.so'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux, ROCm 7)'; Wsl = $true; Needs = 'ROCm 7'; Sources = $GpuSources }
-    @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip6.so'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux, ROCm 6)'; Wsl = $true; Needs = 'ROCm 6'; Sources = $GpuSources }
-    @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip5.so'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux, ROCm 5)'; Wsl = $true; Needs = 'ROCm 5'; Sources = $GpuSources }
+    @{ Path = 'cmd\derostorm\gpucuda\windows\derostorm_gpu.dll';   Goos = 'windows'; Script = 'gpu\buildlib.bat';     What = 'CUDA kernels (Windows)'; Needs = 'an NVIDIA CUDA toolkit'; Sources = $GpuSources }
+    @{ Path = 'cmd\derostorm\gpucuda\linux\libderostorm_gpu.so';   Goos = 'linux'; Script = 'gpu/buildlib.sh';      What = 'CUDA kernels (Linux)';   Wsl = $true; Needs = 'a Linux CUDA toolkit'; Sources = $GpuSources }
+    @{ Path = 'cmd\derostorm\gpulib\windows\derostorm_hip.dll';  Goos = 'windows'; Script = 'gpu\buildlib_hip.bat'; What = 'HIP kernels (Windows)'; Needs = 'the AMD HIP SDK for Windows'; Sources = $GpuSources }
+    @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip7.so'; Goos = 'linux'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux, ROCm 7)'; Wsl = $true; Needs = 'ROCm 7'; Sources = $GpuSources }
+    @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip6.so'; Goos = 'linux'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux, ROCm 6)'; Wsl = $true; Needs = 'ROCm 6'; Sources = $GpuSources }
+    @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip5.so'; Goos = 'linux'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux, ROCm 5)'; Wsl = $true; Needs = 'ROCm 5'; Sources = $GpuSources }
 )
 
+# The targets this run will actually build, and therefore the only libraries
+# worth having an opinion about. Without -All that is the host alone.
+#
+# go:embed decides which it needs by build tag and not by the host, so a
+# windows/amd64 build embeds the Windows suffix sort and never looks at the
+# Linux one. Checking both regardless is what left a Windows machine with no
+# WSL unable to build at all: it got past derostorm_sa.dll and was then asked
+# for a Linux .so it had no toolchain for and no build of its own needed.
+# build.sh has always checked per target; this is the same rule.
+$TargetOS = if ($All) { @('windows', 'linux', 'darwin') } else { @(go env GOOS) }
+$Needed   = @($Embedded | Where-Object { $TargetOS -contains $_.Goos })
+$Watched  = @($Optional | Where-Object { $TargetOS -contains $_.Goos })
+
 if ($Native) {
-    foreach ($lib in $Embedded) {
+    foreach ($lib in $Needed) {
         Write-Host "building $($lib.What)" -ForegroundColor Cyan
 
         # $ErrorActionPreference is Stop for this script, which turns *anything*
@@ -271,7 +284,7 @@ if ($Native) {
     }
 }
 
-foreach ($lib in $Embedded) {
+foreach ($lib in $Needed) {
     if (-not (Test-Path $lib.Path)) {
         $how = if ($lib.Wsl) { "run $($lib.Script) under WSL with $($lib.Needs), or .\build.ps1 -Native" }
                else          { "run $($lib.Script), or .\build.ps1 -Native" }
@@ -281,7 +294,7 @@ foreach ($lib in $Embedded) {
 
 # Said once, so a release cut without GPU support for a vendor is a choice and
 # not something a miner discovers three days later.
-$MissingOptional = @($Optional | Where-Object { -not (Test-Path $_.Path) })
+$MissingOptional = @($Watched | Where-Object { -not (Test-Path $_.Path) })
 if ($MissingOptional) {
     $names = ($MissingOptional | ForEach-Object { $_.What }) -join ', '
     Write-Host "not in this build - $names not present; those cards mine on the CPU" -ForegroundColor DarkYellow
@@ -298,7 +311,7 @@ if ($MissingOptional) {
 # a timestamp comparison and it will occasionally fire on a file that changed
 # nothing -- editing gpu\prof.cuh, which compiles out of the shipped kernel, is
 # the usual one. Rebuilding is cheap and shipping the wrong kernels is not.
-foreach ($lib in ($Embedded + ($Optional | Where-Object { Test-Path $_.Path }))) {
+foreach ($lib in ($Needed + ($Watched | Where-Object { Test-Path $_.Path }))) {
     $built = (Get-Item $lib.Path).LastWriteTimeUtc
     $newer = Get-ChildItem -Path $lib.Sources -File -ErrorAction SilentlyContinue |
              Where-Object { $_.LastWriteTimeUtc -gt $built } |
@@ -358,7 +371,7 @@ if ($All) {
 
 
 Write-Host ''
-foreach ($lib in ($Embedded + ($Optional | Where-Object { Test-Path $_.Path }))) {
+foreach ($lib in ($Needed + ($Watched | Where-Object { Test-Path $_.Path }))) {
     $kb = [math]::Round((Get-Item $lib.Path).Length / 1KB)
     Write-Host ("  embedded {0,-24} {1} KB" -f $lib.What, $kb) -ForegroundColor DarkGray
 }
