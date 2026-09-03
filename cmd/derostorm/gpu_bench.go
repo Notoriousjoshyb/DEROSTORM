@@ -20,6 +20,7 @@ package main
 import (
 	"fmt"
 	"math/big"
+	"runtime"
 	"time"
 
 	"github.com/deroproject/derohe/astrobwt/astrobwtv3"
@@ -39,6 +40,20 @@ const (
 // the curve. Returns the best rate, or 0 if the device could not be measured.
 func runGPUBench(t *Theme, device int, batch int) float64 {
 	fmt.Printf("\n  %s\n\n", t.C(t.Accent+t.Bold, fmt.Sprintf("GPU %d · %s", device, GPUDeviceKind(device))))
+
+	// Same reason gpuWorker does it: CUDA and HIP both keep the current device
+	// per OS thread, so a goroutine that migrates mid-batch is measuring
+	// something it does not own.
+	//
+	// It also decides whether an error is readable. The library's message
+	// buffer is thread-local -- so that two GPU workers cannot overwrite each
+	// other's -- and Go will happily run the failing call on one OS thread and
+	// the dsg_error that reads it back on another, which is how a real "out of
+	// memory" arrives here as "unknown error". Seen, not theorised: an
+	// integrated Radeon that would not allocate reported both messages on
+	// different runs of the same build.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
 	// Four blocks per SM is the mining default and the allocation ceiling.
 	g, err := NewGPUContext(device, batch, 0)
@@ -94,9 +109,22 @@ func runGPUBench(t *Theme, device int, batch int) float64 {
 					failed = true
 					break
 				}
+				elapsed := time.Since(start)
 				nonce += uint32(g.Batch())
+				// A batch that came back in no measurable time did not hash
+				// anything, whatever it returned. Dividing by that zero is how
+				// a device reporting "+Inf TH/s" happens -- seen on an
+				// integrated Radeon whose driver accepted the allocations and
+				// then ran nothing -- and an impossible number in the output is
+				// worse than an error, because someone will believe it.
+				if elapsed <= 0 {
+					fmt.Printf("\n  %s\n", t.C(t.Err,
+						"a batch returned instantly: the device is not running the kernels"))
+					failed = true
+					break
+				}
 				if k >= benchWarmup {
-					sum[i] += float64(g.Batch()) / time.Since(start).Seconds()
+					sum[i] += float64(g.Batch()) / elapsed.Seconds()
 					n[i]++
 				}
 			}

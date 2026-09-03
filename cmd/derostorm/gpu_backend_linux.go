@@ -36,10 +36,25 @@ var hipLibFS embed.FS
 
 var (
 	cudaBackend = &gpuBackend{
-		kind: "NVIDIA CUDA", libFS: gpuLibFS, file: "libderostorm_gpu.so",
+		kind: "NVIDIA CUDA", libFS: gpuLibFS,
+		files: []string{"libderostorm_gpu.so"},
 	}
+	// Two AMD libraries, not one, and this is the reason.
+	//
+	// A HIP library links against the ROCm runtime by soname:
+	// libamdhip64.so.6 for ROCm 6 and libamdhip64.so.5 for ROCm 5. A rig has
+	// one of those installed, not both, and there is no build that satisfies
+	// each -- so both are built and dlopen decides. ROCm 6 is tried first
+	// because it is the current line and the only one that can target RDNA 4.
+	//
+	// Neither is required. A binary built with neither has no AMD support and
+	// says so by reporting no devices.
 	hipBackend = &gpuBackend{
-		kind: "AMD HIP", libFS: hipLibFS, file: "gpulib/linux/libderostorm_hip.so",
+		kind: "AMD HIP", libFS: hipLibFS,
+		files: []string{
+			"gpulib/linux/libderostorm_hip6.so",
+			"gpulib/linux/libderostorm_hip5.so",
+		},
 	}
 )
 

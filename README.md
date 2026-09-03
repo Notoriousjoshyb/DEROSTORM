@@ -4,18 +4,25 @@ An AstroBWTv3 miner for DERO. Mines on the CPU and, when an NVIDIA or AMD card
 is present, on the GPU as well. Full-screen themed console, guided first-run
 setup.
 
-> **AMD support is new in 1.7.0 and has not been tested on an AMD card.**
-> Nobody working on DeroStorm owns one. The kernels are the same kernels the
-> NVIDIA build has run for months and they compile for RDNA, but *compiles* is
-> not *runs*, and no hashrate figure anywhere in this file is an AMD figure.
+> **AMD support ships in the binaries from 1.7.1, and has never mined.**
+>
+> What is proven: the kernels build for every RDNA target, the library loads on
+> a real AMD driver, a real AMD GPU is detected, and the hash it produces
+> **matches the CPU exactly** — checked on a `gfx1036` Radeon. That is stage 1,
+> the suffix sort and the SHA-256 all correct on AMD silicon.
+>
+> What is not: the batched mining path, and any hashrate at all. The only AMD
+> device available here is a 1-CU integrated Radeon that cannot allocate enough
+> memory to run a batch, so **no hashrate figure anywhere in this file is an AMD
+> figure** and nobody has watched an AMD card mine for a minute, let alone a day.
 >
 > If you have an RX 5000, 6000, 7000 or 9000, please
 > [open an issue](https://github.com/Notoriousjoshyb/DEROSTORM/issues) —
 > whether it works or not. Wrong hashes, a card that is not detected, a launch
 > failure, or a hashrate that looks low for the card: all of it is useful, and
 > low-and-working is as worth reporting as broken. Say which card, which driver
-> or ROCm version, and what `derostorm --bench --gpu=all` and
-> `go test ./cmd/derostorm/ -run GPU` printed. See *Which cards* below.
+> or ROCm version, and what `derostorm --bench --gpu=all` printed. See *Which
+> cards* below.
 
 The proof-of-work output is bit-for-bit identical to the reference
 implementation — every optimisation here is a faster route to the same 32 bytes,
@@ -413,24 +420,40 @@ older were dropped by CUDA 13 itself and mine on the CPU. Only the display
 driver is needed at run time: the CUDA runtime is linked into the embedded
 library, so there is no toolkit to install.
 
-**AMD — HIP, RDNA only, and untested.** `gfx1010` and `gfx1012` (RX 5000),
-`gfx1030`–`gfx1036` (RX 6000), `gfx1100`–`gfx1103` (RX 7000) and
-`gfx1200`/`gfx1201` (RX 9000).
+**AMD — HIP, RDNA only, and never yet mined.** `gfx1010`–`gfx1013` (RX 5000),
+`gfx1030`–`gfx1036` (RX 6000), `gfx1100`–`gfx1103` (RX 7000), `gfx1150`/`gfx1151`
+(Strix Point APUs) and `gfx1200`/`gfx1201` (RX 9000). All nineteen are in the
+shipped library, so there is nothing to build and nothing to install beyond the
+runtime.
 
-Untested is meant literally: this has never been run on an AMD card. What *is*
-known is that the kernels are unchanged for NVIDIA — 512 real vectors still hash
-identically, and five interleaved benchmark rounds put the port at 98,548 H/s
-against 98,683 before it, which is inside the run-to-run spread. What is not
-known is anything at all about how they behave on RDNA. The sort is memory-bound
-and RDNA's cache hierarchy is not Ada's, so the hashrate could land anywhere.
+What has actually been checked, on a `gfx1036` integrated Radeon:
+
+| | |
+|---|---|
+| builds for all 19 RDNA targets | yes, both OSes |
+| library loads through the AMD driver | yes, Windows/Adrenalin |
+| device detected and named | yes — `AMD Radeon(TM) Graphics (gfx1036, 1 CUs)` |
+| **hash matches the CPU exactly** | **yes** |
+| a batch mines | **no — never run** |
+| hashrate | **unknown** |
+
+The hash check is the one that matters most and it passed: stage 1, the
+descriptor suffix sort and the SHA-256 all produce the same 32 bytes the CPU
+does, on real AMD silicon. What stopped there is the *batched* path. The only
+AMD device on hand is a one-compute-unit integrated Radeon whose driver reports
+system memory as VRAM and then refuses the allocations, so it fails at
+`create stream: out of memory` before a batch ever starts.
+
+So the NVIDIA figures below are the only hashrate figures in this file. The sort
+is memory-bound and RDNA's cache hierarchy is not Ada's, so an AMD number could
+land anywhere.
 
 **Please report what you see**, working or not, at
 [the issue tracker](https://github.com/Notoriousjoshyb/DEROSTORM/issues). A card
 that mines correctly but slowly is a bug worth filing — the block count, the
 batch size and the radix width were all swept on NVIDIA hardware and none of
 those answers is likely to be the right one here. Include the card, the driver
-or ROCm version, and the output of both checks in
-`cmd/derostorm/gpulib/README.md`.
+or ROCm version, and what `derostorm --bench --gpu=all` printed.
 Vega, Polaris and the CDNA MI cards are **not** supported and will not be: they
 are wave64, and the block radix sort's shared-memory layout is 32 lanes wide
 throughout `gpu/blockradix.cuh`. `gpu/gpuapi.cuh` turns a wave64 build into a
@@ -444,11 +467,17 @@ Two things about AMD are worth knowing before filing a bug:
   in `gpu/buildlib_hip.sh` reports "no kernel image is available for execution"
   and the miner falls back to the CPU. Adding one is a line in that list and a
   rebuild.
-- **The AMD library is not in every build.** Building it needs ROCm or the AMD
-  HIP SDK, which the machine cutting releases does not have, so a build made
-  without one embeds no AMD kernels and reports no AMD devices — the same thing,
-  to the miner, as a machine with no AMD card. `cmd/derostorm/gpulib/README.md`
-  says how to put it in.
+- **The release binaries carry it from 1.7.1 on.** Nothing to build, nothing to
+  add: the AMD kernels are inside the same executable as the NVIDIA ones. A
+  build made *from source* without ROCm still embeds none and reports no AMD
+  devices — the same thing, to the miner, as a machine with no AMD card.
+  `cmd/derostorm/gpulib/README.md` says how to put them in.
+
+- **Linux carries two AMD libraries.** A HIP library names the ROCm runtime it
+  links to by soname, and a rig has one generation installed, not both, so the
+  binary holds a ROCm 6 build and a ROCm 5 build and `dlopen` picks whichever
+  the rig can resolve. Only the ROCm 6 one covers RDNA 4. Windows has one,
+  because Windows has only ever had the ROCm 6 line.
 
 At run time AMD needs the HIP runtime: on Windows that ships inside the
 Adrenalin driver, and on Linux it means ROCm (`libamdhip64`) installed.

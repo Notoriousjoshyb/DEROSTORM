@@ -43,9 +43,17 @@
 // pins with -mwavefrontsize32.
 #define DSG_WAVE 32
 
-#if DSG_HIP
+// Checked on the device pass only. hipcc compiles every translation unit twice,
+// once per GPU target and once for the host, and the host pass carries a
+// wavefront macro that means nothing there -- it reads 64 whatever the card is.
+// Testing it outside __HIP_DEVICE_COMPILE__ fails a build that was going to be
+// correct.
+#if DSG_HIP && defined(__HIP_DEVICE_COMPILE__)
 #if defined(__AMDGCN_WAVEFRONT_SIZE__) && __AMDGCN_WAVEFRONT_SIZE__ != 32
-#error "DeroStorm's AMD kernels are wave32 only -- build gfx10 and newer with -mwavefrontsize32, and do not build Vega/Polaris/CDNA at all."
+#error "DeroStorm's AMD kernels are wave32 only -- build gfx10 and newer with -mno-wavefrontsize64, and do not build Vega/Polaris/CDNA at all."
+#endif
+#if defined(__AMDGCN_WAVEFRONT_SIZE) && __AMDGCN_WAVEFRONT_SIZE != 32
+#error "DeroStorm's AMD kernels are wave32 only -- build gfx10 and newer with -mno-wavefrontsize64, and do not build Vega/Polaris/CDNA at all."
 #endif
 #endif
 
@@ -197,6 +205,48 @@ __device__ __forceinline__ uint32_t dsgBytePerm(uint32_t a, uint32_t b, uint32_t
     return r;
 }
 #define __byte_perm dsgBytePerm
+#endif
+
+// Byte-wise compares of a packed word. CUDA has both as single instructions
+// (VSET4/VSET on the SIMD-in-a-word unit); AMD has no per-byte compare at all,
+// so they are rebuilt with the standard SWAR zero-byte test.
+//
+//   ((v & 0x7f) + 0x7f) | v   has bit 7 set exactly when the byte v is non-zero
+//
+// Applied to all four lanes at once: the masked add tops out at 0xfe a lane, so
+// nothing carries between them. That gives one bit per differing byte, and the
+// two intrinsics are that bit spread the two ways their callers want.
+//
+// Five instructions instead of one, on a path desc.cuh puts at about a third of
+// the kernel, so this is the first place to look if the AMD hashrate lands low.
+// It is correct, which is what it has to be first.
+#if DSG_HIP
+__device__ __forceinline__ uint32_t dsgNeqByteBits(uint32_t a, uint32_t b)
+{
+    const uint32_t x = a ^ b;
+    return ((((x & 0x7f7f7f7fu) + 0x7f7f7f7fu) | x) & 0x80808080u) >> 7;
+}
+
+// 0x01 in each byte lane where the two differ, 0x00 where they match. The
+// caller sums the lanes with a multiply by 0x01010101, so the lanes must be
+// exactly 0 or 1 and not merely non-zero.
+__device__ __forceinline__ uint32_t dsgVsetne4(uint32_t a, uint32_t b)
+{
+    return dsgNeqByteBits(a, b);
+}
+
+// 0xff in each byte lane where the two match, 0x00 where they differ.
+//
+// The multiply by 0xff is a lane-wise broadcast and not a mistake: every lane
+// of the input is 0 or 1, so each contributes at most 0xff and nothing carries
+// into the lane above.
+__device__ __forceinline__ uint32_t dsgVcmpeq4(uint32_t a, uint32_t b)
+{
+    return (dsgNeqByteBits(a, b) ^ 0x01010101u) * 0xffu;
+}
+
+#define __vsetne4 dsgVsetne4
+#define __vcmpeq4 dsgVcmpeq4
 #endif
 
 // An L2 prefetch hint, and the only inline PTX in the miner. AMD has no

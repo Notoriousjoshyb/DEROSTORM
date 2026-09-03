@@ -465,13 +465,13 @@ extern "C" DSG_API int dsg_device_info(int device, char* buf, int len)
     int n = 0;
     cudaError_t e = cudaGetDeviceCount(&n);
     if (e != cudaSuccess || device < 0 || device >= n) {
-        setErr("no such CUDA device", e);
+        setErr("no such device", e);
         return DSG_ERR_NO_DEVICE;
     }
 
     cudaDeviceProp prop;
     if ((e = cudaGetDeviceProperties(&prop, device)) != cudaSuccess) {
-        setErr("cudaGetDeviceProperties", e);
+        setErr("device properties", e);
         return DSG_ERR_NO_DEVICE;
     }
     snprintf(buf, (size_t)len, "%s, %.0f GB, %d %s",
@@ -488,7 +488,7 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
 
     int n = 0;
     cudaError_t e = cudaGetDeviceCount(&n);
-    if (e != cudaSuccess || n == 0) { setErr("no CUDA device", e); return DSG_ERR_NO_DEVICE; }
+    if (e != cudaSuccess || n == 0) { setErr("no GPU device", e); return DSG_ERR_NO_DEVICE; }
     if (device < 0 || device >= n) {
         snprintf(g_err, sizeof(g_err), "device %d out of range (%d present)", device, n);
         return DSG_ERR_NO_DEVICE;
@@ -506,11 +506,11 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     // flag the first worker set still applies, so the error is dropped.
     cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
 
-    if ((e = cudaSetDevice(device)) != cudaSuccess) { setErr("cudaSetDevice", e); return DSG_ERR_NO_DEVICE; }
+    if ((e = cudaSetDevice(device)) != cudaSuccess) { setErr("select device", e); return DSG_ERR_NO_DEVICE; }
 
     cudaDeviceProp prop;
     if ((e = cudaGetDeviceProperties(&prop, device)) != cudaSuccess) {
-        setErr("cudaGetDeviceProperties", e); return DSG_ERR_NO_DEVICE;
+        setErr("device properties", e); return DSG_ERR_NO_DEVICE;
     }
 
     // Shared memory beyond 48 KB has to be asked for explicitly, and it is a
@@ -565,7 +565,7 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
 
     size_t freeB = 0, totB = 0;
     if ((e = cudaMemGetInfo(&freeB, &totB)) != cudaSuccess) {
-        setErr("cudaMemGetInfo", e); free(c); return DSG_ERR_ALLOC;
+        setErr("free memory", e); free(c); return DSG_ERR_ALLOC;
     }
     // Leave a gigabyte and a half for the display and the driver.
     size_t budget = freeB > (size_t)1500e6 ? freeB - (size_t)1500e6 : 0;
@@ -629,7 +629,7 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
 
 #define ALLOC(p, bytes) do { \
         if ((e = cudaMalloc((void**)&(p), (bytes))) != cudaSuccess) { \
-            setErr("cudaMalloc", e); dsg_free(c); return DSG_ERR_ALLOC; } \
+            setErr("device allocation", e); dsg_free(c); return DSG_ERR_ALLOC; } \
     } while (0)
 
     ALLOC(c->words, (size_t)c->maxBlocks * ASTRO_MAX_TEXT * 6 * 4);
@@ -657,7 +657,7 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     }
 #undef ALLOC
 
-#define HALLOC(p, bytes) do {         if ((e = cudaHostAlloc((void**)&(p), (bytes), cudaHostAllocDefault)) != cudaSuccess) {             setErr("cudaHostAlloc", e); dsg_free(c); return DSG_ERR_ALLOC; }     } while (0)
+#define HALLOC(p, bytes) do {         if ((e = cudaHostAlloc((void**)&(p), (bytes), cudaHostAllocDefault)) != cudaSuccess) {             setErr("pinned host allocation", e); dsg_free(c); return DSG_ERR_ALLOC; }     } while (0)
 
     for (int i = 0; i < DSG_SLOTS; i++) {
         HALLOC(c->slot[i].hWork,   DSG_WORK_SIZE);
@@ -672,15 +672,15 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     for (int b = 0; b < DSG_BANKS; b++) {
         if ((e = cudaStreamCreateWithFlags(&c->bank[b].stream,
                                            cudaStreamNonBlocking)) != cudaSuccess) {
-            setErr("cudaStreamCreate", e); dsg_free(c); return DSG_ERR_ALLOC;
+            setErr("create stream", e); dsg_free(c); return DSG_ERR_ALLOC;
         }
         if ((e = cudaEventCreateWithFlags(&c->bank[b].sorted,
                                           cudaEventDisableTiming)) != cudaSuccess) {
-            setErr("cudaEventCreate", e); dsg_free(c); return DSG_ERR_ALLOC;
+            setErr("create event", e); dsg_free(c); return DSG_ERR_ALLOC;
         }
         if ((e = cudaEventCreateWithFlags(&c->bank[b].drained,
                                           cudaEventDisableTiming)) != cudaSuccess) {
-            setErr("cudaEventCreate", e); dsg_free(c); return DSG_ERR_ALLOC;
+            setErr("create event", e); dsg_free(c); return DSG_ERR_ALLOC;
         }
         // Recorded once here, on an empty stream, so `sorted` is never waited
         // on before it has been recorded at all. CUDA treats that case as no
@@ -689,7 +689,7 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
         // thing to both without depending on either. Costs one record per bank,
         // once.
         if ((e = cudaEventRecord(c->bank[b].sorted, c->bank[b].stream)) != cudaSuccess) {
-            setErr("cudaEventRecord", e); dsg_free(c); return DSG_ERR_ALLOC;
+            setErr("record event", e); dsg_free(c); return DSG_ERR_ALLOC;
         }
     }
 
@@ -699,7 +699,7 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
         if ((e = cudaEventCreateWithFlags(&c->slot[i].done,
                                           cudaEventDisableTiming | cudaEventBlockingSync))
             != cudaSuccess) {
-            setErr("cudaEventCreate", e); dsg_free(c); return DSG_ERR_ALLOC;
+            setErr("create event", e); dsg_free(c); return DSG_ERR_ALLOC;
         }
     }
 
@@ -862,7 +862,7 @@ extern "C" DSG_API int dsg_submit(dsg_context* ctx,
     }
 
     cudaError_t e;
-    if ((e = cudaSetDevice(ctx->device)) != cudaSuccess) { setErr("cudaSetDevice", e); return DSG_ERR_STATE; }
+    if ((e = cudaSetDevice(ctx->device)) != cudaSuccess) { setErr("select device", e); return DSG_ERR_STATE; }
 
     dsg_slot* sl = &ctx->slot[ctx->head];
 
@@ -1022,7 +1022,7 @@ extern "C" DSG_API int dsg_hash_one(dsg_context* ctx,
     if (!ctx) { snprintf(g_err, sizeof(g_err), "dsg_hash_one: null context"); return DSG_ERR_STATE; }
 
     cudaError_t e;
-    if ((e = cudaSetDevice(ctx->device)) != cudaSuccess) { setErr("cudaSetDevice", e); return DSG_ERR_STATE; }
+    if ((e = cudaSetDevice(ctx->device)) != cudaSuccess) { setErr("select device", e); return DSG_ERR_STATE; }
     if ((e = cudaMemcpy(ctx->slot[0].dWork, work, DSG_WORK_SIZE, cudaMemcpyHostToDevice)) != cudaSuccess) {
         setErr("upload work", e); return DSG_ERR_LAUNCH;
     }

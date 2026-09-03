@@ -81,7 +81,15 @@ const GPUAvailable = true
 type gpuBackend struct {
 	kind  string // what to call it to the user: "NVIDIA CUDA", "AMD HIP"
 	libFS embed.FS
-	file  string // path inside libFS
+
+	// Candidate libraries inside libFS, best first. Usually one; the AMD side
+	// carries two, because a HIP library links against the ROCm runtime by
+	// soname -- libamdhip64.so.6 or .so.5 -- and a rig has one of those, not
+	// both. There is no build that satisfies each, so both are built and the
+	// first that loads wins. Trying is the only way to ask: the question is
+	// whether this machine's dynamic loader can resolve the file, and that is
+	// what dlopen answers.
+	files []string
 
 	once sync.Once
 	err  error
@@ -189,29 +197,41 @@ func extractEmbeddedLib(libFS embed.FS, file string) (string, error) {
 
 // load unpacks and binds this backend's library. Safe to call repeatedly; the
 // result, including a failure, is remembered.
+//
+// Each candidate is tried in turn and the first that both unpacks and loads is
+// the one bound. A candidate that is not embedded at all is skipped without
+// comment: absent is not broken. The AMD library has to be built by someone
+// with ROCm, and a build made before that happened simply has no AMD support --
+// which is the same thing, to the user, as having no AMD card.
 func (b *gpuBackend) load() error {
 	b.once.Do(func() {
-		// Absent is not broken. The AMD library has to be built by someone with
-		// ROCm, and a build made before that happened simply has no AMD
-		// support -- which is the same thing, to the user, as having no AMD
-		// card.
-		if _, err := b.libFS.ReadFile(b.file); err != nil {
-			b.err = errLibAbsent
-			return
+		var sym func(string) (uintptr, error)
+		b.err = errLibAbsent
+
+		for _, file := range b.files {
+			if _, err := b.libFS.ReadFile(file); err != nil {
+				continue // not built into this binary
+			}
+			libPath, err := extractEmbeddedLib(b.libFS, file)
+			if err != nil {
+				b.err = fmt.Errorf("cannot unpack the %s library: %w", b.kind, err)
+				return
+			}
+			s, err := openNativeLibrary(libPath)
+			if err != nil {
+				// The usual cause on the AMD side is a machine whose ROCm is a
+				// different generation from the one this candidate was built
+				// against, or one with no ROCm at all: the library is fine,
+				// the amdhip64 it links to is not there. Either way the next
+				// candidate is the answer, and if there is none this stays as
+				// quiet as a missing NVIDIA driver does.
+				b.err = fmt.Errorf("cannot load the %s library: %w", b.kind, err)
+				continue
+			}
+			sym, b.err = s, nil
+			break
 		}
-		libPath, err := extractEmbeddedLib(b.libFS, b.file)
-		if err != nil {
-			b.err = fmt.Errorf("cannot unpack the %s library: %w", b.kind, err)
-			return
-		}
-		sym, err := openNativeLibrary(libPath)
-		if err != nil {
-			// The usual cause on the AMD side is a machine with no ROCm
-			// runtime: the library itself is fine, the amdhip64 it links
-			// against is not there. Nothing to report and nothing to fix
-			// unless the user has an AMD card, so this stays quiet the way a
-			// missing NVIDIA driver does.
-			b.err = fmt.Errorf("cannot load the %s library: %w", b.kind, err)
+		if sym == nil {
 			return
 		}
 		// Every entry point is resolved here rather than on first use, so a

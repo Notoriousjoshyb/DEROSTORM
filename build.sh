@@ -41,7 +41,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION=1.7.0
+VERSION=1.7.1
 PKG=./cmd/derostorm
 BOUNDS_PKG=github.com/deroproject/derohe/astrobwt/astrobwtv3
 LDFLAGS="-s -w"
@@ -178,24 +178,31 @@ EOF
 # it bites harder here: nobody on this side of the build has an AMD card to
 # notice with.
 check_optional_embedded() {
-  local goos="$1" goarch="$2" path="" how=""
+  local goos="$1" goarch="$2" paths="" how=""
   case "$goos/$goarch" in
-    windows/*)   path="cmd/derostorm/gpulib/windows/derostorm_hip.dll"
+    windows/*)   paths="cmd/derostorm/gpulib/windows/derostorm_hip.dll"
                  how="gpu\buildlib_hip.bat, on Windows with the AMD HIP SDK" ;;
-    linux/amd64) path="cmd/derostorm/gpulib/linux/libderostorm_hip.so"
+    # Two, because a HIP library names the ROCm runtime it links to by soname
+    # and a rig has one generation installed, not both. Whichever ones are here
+    # get checked; neither is required.
+    linux/amd64) paths="cmd/derostorm/gpulib/linux/libderostorm_hip6.so
+cmd/derostorm/gpulib/linux/libderostorm_hip5.so"
                  how="gpu/buildlib_hip.sh, on Linux with ROCm" ;;
     *)           return 0 ;;
   esac
-  [ -f "$path" ] || return 0
-  local src stale=""
-  for src in gpu/derostorm_gpu.cu gpu/derostorm_gpu.h gpu/*.cuh gpu/*.inc; do
-    [ -f "$src" ] || continue
-    [ "$src" -nt "$path" ] && stale="$stale $src"
+  local path src stale
+  for path in $paths; do
+    [ -f "$path" ] || continue
+    stale=""
+    for src in gpu/derostorm_gpu.cu gpu/derostorm_gpu.h gpu/*.cuh gpu/*.inc; do
+      [ -f "$src" ] || continue
+      [ "$src" -nt "$path" ] && stale="$stale $src"
+    done
+    if [ -n "$stale" ]; then
+      echo "$path is older than the source it is built from ($(echo $stale | cut -c1-120)) -- rebuild it with $how" >&2
+      exit 1
+    fi
   done
-  if [ -n "$stale" ]; then
-    echo "$path is older than the source it is built from ($(echo $stale | cut -c1-120)) -- rebuild it with $how" >&2
-    exit 1
-  fi
 }
 
 # The host's own libraries are checked before the tests, not with the first

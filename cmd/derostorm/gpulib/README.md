@@ -3,19 +3,43 @@
 The miner embeds one GPU library per vendor. NVIDIA's sits beside this
 directory (`derostorm_gpu.dll`, `libderostorm_gpu.so`). AMD's goes in here:
 
-    windows/derostorm_hip.dll      built by gpu\buildlib_hip.bat
-    linux/libderostorm_hip.so      built by gpu/buildlib_hip.sh
+    windows/derostorm_hip.dll       built by gpu\buildlib_hip.bat
+    linux/libderostorm_hip6.so      built by gpu/buildlib_hip.sh  (ROCm 6)
+    linux/libderostorm_hip5.so      built by gpu/buildlib_hip.sh  (ROCm 5)
 
-Both come from the same source as the NVIDIA library — `gpu/derostorm_gpu.cu`
-and the headers beside it — through `hipcc` instead of `nvcc`.
-`gpu/gpuapi.cuh` is the only file that knows which compiler it is talking to.
+All of them come from the same source as the NVIDIA library —
+`gpu/derostorm_gpu.cu` and the headers beside it — through a HIP compiler
+instead of `nvcc`. `gpu/gpuapi.cuh` is the only file that knows which compiler
+it is talking to.
 
-None of these libraries are in git: they are build products, and a fat binary in
-git is a fat binary in git forever. The difference is that the NVIDIA ones are
-**required** and these are **optional**. `go:embed` takes this whole directory
-rather than the files, so a tree without them still compiles; the HIP backend
-then finds no library and reports no devices — the same thing, to the miner, as
-a machine with no AMD card. See the long note in `cmd/derostorm/gpu_backend.go`.
+### Why Linux has two
+
+A HIP library links to the ROCm runtime by soname: `libamdhip64.so.6` for
+ROCm 6, `libamdhip64.so.5` for ROCm 5. A rig has one of those installed, not
+both, and no single build satisfies each — a `.so.5` library will not load on a
+ROCm 6 rig and the reverse is equally true.
+
+So both are built, `gpu_backend_linux.go` carries both names, and `dlopen`
+decides: whichever one the rig can resolve is the one that runs. ROCm 6 is tried
+first, because it is the current line and the only one that can target RDNA 4.
+
+`buildlib_hip.sh` names its output after the runtime it actually linked
+against, read back out of the finished ELF. Building on a machine with only one
+ROCm produces one of the two, which is a perfectly good library for every rig on
+that generation.
+
+Windows has one file because Windows has only ever had the ROCm 6 line —
+`amdhip64_6.dll`, which ships inside the Adrenalin driver.
+
+### They are not in git
+
+None of these libraries are, on either side: they are build products, and a fat
+binary in git is a fat binary in git forever. The difference is that the NVIDIA
+ones are **required** and these are **optional**. `go:embed` takes this whole
+directory rather than the files, so a tree without them still compiles; the HIP
+backend then finds no library and reports no devices — the same thing, to the
+miner, as a machine with no AMD card. See the long note in
+`cmd/derostorm/gpu_backend.go`.
 
 ## Building it
 
@@ -24,15 +48,28 @@ from the Adrenalin driver. Neither needs an AMD card to be present: the compiler
 targets the `gfx` list in the build script, not the machine it runs on.
 
 ```
-gpu/buildlib_hip.sh          # Linux   -> gpulib/linux/libderostorm_hip.so
+gpu/buildlib_hip.sh          # Linux   -> gpulib/linux/libderostorm_hip<N>.so
 gpu\buildlib_hip.bat         # Windows -> gpulib\windows\derostorm_hip.dll
 ```
 
 Each script copies its result into place itself. Then build the miner as usual
 (`./build.sh` or `.\build.ps1`); it picks the library up from here.
 
-If the compiler rejects a `gfx` target it has never heard of — an older ROCm and
-a newer card, usually — trim the list rather than giving up:
+On Linux, ROCm 6 from AMD's own repository is the one to have — it is the
+current runtime and the only toolchain that can target RDNA 4. ROCm 5 is three
+packages from Ubuntu 24.04's universe if that is all you can get:
+
+```
+apt-get install hipcc libamdhip64-dev rocm-device-libs-17
+```
+
+`DSG_HIPCC` picks the compiler when a machine has both, which is how the
+shipped pair is built.
+
+The script offers each `gfx` target to the compiler before using it and builds
+only the ones it accepts, so an older ROCm produces a narrower library rather
+than a failed build. It prints what it skipped. `DSG_HIP_ARCHS` overrides the
+list outright:
 
 ```
 DSG_HIP_ARCHS="gfx1030 gfx1100" gpu/buildlib_hip.sh
@@ -40,7 +77,7 @@ set DSG_HIP_ARCHS=gfx1030 gfx1100
 ```
 
 There is no PTX equivalent on AMD, so a card whose `gfx` target is not in the
-list does not compile at load — it fails to launch and mines on the CPU. Keep
+library does not compile at load — it fails to launch and mines on the CPU. Keep
 the list ahead of the hardware.
 
 ## Running it
@@ -71,10 +108,15 @@ card proves itself exactly the way the NVIDIA one did. A share is not trusted
 until it has.
 
 **Report what you get either way**, at
-<https://github.com/Notoriousjoshyb/DEROSTORM/issues>. This has never been run
-on an AMD card, so "it works, here is the hashrate" is as useful a report as a
+<https://github.com/Notoriousjoshyb/DEROSTORM/issues>. No AMD card has ever
+mined with this, so "it works, here is the hashrate" is as useful a report as a
 failure — and a card that mines correctly but slowly is worth an issue too. The
 block count, batch size and radix width were all tuned on NVIDIA hardware.
+
+One known non-bug: an integrated Radeon reports system memory as VRAM, so the
+miner sizes a batch the driver will not actually back and `dsg_init` fails with
+`create stream: out of memory`. A one-compute-unit iGPU was never going to mine
+anyway; a large APU might, and that sizing has not been fixed.
 
 What to report if something goes wrong:
 

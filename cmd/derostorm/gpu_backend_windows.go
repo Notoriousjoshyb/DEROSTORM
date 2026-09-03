@@ -29,10 +29,15 @@ var hipLibFS embed.FS
 
 var (
 	cudaBackend = &gpuBackend{
-		kind: "NVIDIA CUDA", libFS: gpuLibFS, file: "derostorm_gpu.dll",
+		kind: "NVIDIA CUDA", libFS: gpuLibFS,
+		files: []string{"derostorm_gpu.dll"},
 	}
+	// One candidate, where Linux has two. Windows has only ever had the ROCm 6
+	// line -- amdhip64_6.dll, which ships inside the Adrenalin driver -- so
+	// there is no second generation to fall back to.
 	hipBackend = &gpuBackend{
-		kind: "AMD HIP", libFS: hipLibFS, file: "gpulib/windows/derostorm_hip.dll",
+		kind: "AMD HIP", libFS: hipLibFS,
+		files: []string{"gpulib/windows/derostorm_hip.dll"},
 	}
 )
 

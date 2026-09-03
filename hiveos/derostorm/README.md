@@ -3,11 +3,12 @@
 A custom miner package. DeroStorm mines AstroBWTv3 for DERO on the CPU and on
 NVIDIA or AMD GPUs at the same time.
 
-> **AMD support is new in 1.7.0 and untested on real hardware.** Nobody working
-> on DeroStorm has an AMD card. If you run one, please report what happens —
-> working or not, fast or slow — at
-> <https://github.com/Notoriousjoshyb/DEROSTORM/issues>. NVIDIA rigs are
-> unaffected by this release.
+> **AMD support ships in the binaries from 1.7.1, and has never mined.** The
+> hash it produces has been checked against the CPU on a real AMD GPU and
+> matches exactly; a batch has never run, and there is no AMD hashrate figure
+> anywhere. If you run an AMD rig, please report what happens — working or not,
+> fast or slow — at <https://github.com/Notoriousjoshyb/DEROSTORM/issues>.
+> NVIDIA rigs are unaffected by this release.
 
 ## The one thing to know first
 
@@ -26,7 +27,7 @@ If you want pool mining, this is the wrong miner.
 |---|---|
 | Miner | Custom |
 | Miner name | `derostorm` |
-| Installation URL | wherever you host `derostorm-1.6.3.tar.gz` |
+| Installation URL | wherever you host `derostorm-1.7.1.tar.gz` |
 | Wallet and worker template | your DERO address, e.g. `dero1qy...` |
 | Pool URL | your derod getwork address, e.g. `10.0.0.5:10100` |
 | Extra config arguments | anything below |
@@ -119,8 +120,8 @@ mode on the cards.
   CUDA 13 dropped Pascal and Volta.
 - **AMD:** ROCm installed, for `libamdhip64`, and an RDNA card — RX 5000, 6000,
   7000 or 9000. Vega, Polaris and the MI cards are wave64 and are not supported.
-  Not every DeroStorm build carries the AMD kernels: one that does not reports
-  no AMD devices, and the main README says how to add them.
+  The kernels are in the binary from 1.7.1 on, for both ROCm 5 and ROCm 6; the
+  right one is picked at load.
 - `jq`, which HiveOS already has.
 - CPU-only mining works with no GPU present: add `--gpu=off`.
 

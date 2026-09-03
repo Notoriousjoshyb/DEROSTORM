@@ -53,7 +53,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$Version  = '1.7.0'
+$Version  = '1.7.1'
 $Pkg      = './cmd/derostorm'
 $BoundsPkg = 'github.com/deroproject/derohe/astrobwt/astrobwtv3'
 $LdFlags  = '-s -w'
@@ -157,9 +157,8 @@ $Embedded = @(
 
 # The AMD kernels, which are optional in a way the four above are not.
 #
-# They come from the same sources through hipcc instead of nvcc, and building
-# them needs ROCm or the AMD HIP SDK -- neither of which this machine has, and
-# neither of which most build machines have. go:embed takes the whole
+# They come from the same sources through a HIP compiler instead of nvcc, and
+# building them needs ROCm or the AMD HIP SDK. go:embed takes the whole
 # cmd\derostorm\gpulib\<goos> directory rather than the file, so a tree without
 # them still compiles and the finished miner simply reports no AMD devices. See
 # the long note in cmd\derostorm\gpu_backend.go.
@@ -167,9 +166,17 @@ $Embedded = @(
 # So missing is a build configuration and not an error. Stale is still an error,
 # and a worse one than for the NVIDIA libraries: nobody on this side has an AMD
 # card to notice with.
+#
+# Linux has two, and that is not a mistake. A HIP library links to the ROCm
+# runtime by soname -- libamdhip64.so.6 or .so.5 -- and a rig has one of those
+# installed, not both. No single build satisfies each, so both are built and
+# dlopen picks at run time. Only ROCm 6 can target RDNA 4, so a machine with
+# only the ROCm 5 toolchain produces a library that is correct and narrower.
+# Windows has one because Windows has only ever had the ROCm 6 line.
 $Optional = @(
-    @{ Path = 'cmd\derostorm\gpulib\windows\derostorm_hip.dll'; Script = 'gpu\buildlib_hip.bat'; What = 'HIP kernels (Windows)'; Needs = 'the AMD HIP SDK for Windows'; Sources = $GpuSources }
-    @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip.so'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux)'; Wsl = $true; Needs = 'ROCm'; Sources = $GpuSources }
+    @{ Path = 'cmd\derostorm\gpulib\windows\derostorm_hip.dll';  Script = 'gpu\buildlib_hip.bat'; What = 'HIP kernels (Windows)'; Needs = 'the AMD HIP SDK for Windows'; Sources = $GpuSources }
+    @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip6.so'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux, ROCm 6)'; Wsl = $true; Needs = 'ROCm 6'; Sources = $GpuSources }
+    @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip5.so'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux, ROCm 5)'; Wsl = $true; Needs = 'ROCm 5'; Sources = $GpuSources }
 )
 
 if ($Native) {
