@@ -199,6 +199,80 @@ wide, which is enough to say which source is lying.
 
 ---
 
+## Which devices am I mining on?
+
+Every hashing source gets its own row, so this is meant to be answerable at a
+glance rather than worked out. The CPU is one source and each GPU is another.
+
+### While it is mining
+
+The **DEVICES** panel is the answer. One row per source: a bar, that source's
+own hashrate, its share of the total, its temperature, and its watts.
+
+```
+  CPU    ███████░░░░░░░░     3.3 KH/s    2%   62°C
+  GPU 0  ███████████████   172.3 KH/s   98%   58°C   215W
+  GPU 1  ░░░░░░░░░░░░░░░       0  H/s    0%     --
+```
+
+The shares add to 100%, so a glance says whether a card is pulling its weight.
+The card's model name is not in the row — there is no width for it — but it is
+named once in the event log (`L`) when its worker starts.
+
+A row sitting at **0 H/s** is a source that is not mining. Why is in the event
+log, said once when it happened rather than repeated every frame: a card that
+could not be opened at start-up logs the reason and then keeps a quiet, idle row.
+
+A card that started, ran, and *then* stopped returning hashes is drawn in the
+error colour and marked **ailing**. That is the distinction worth having — a
+card that never started is obvious from the log, while one that dies four hours
+in is the single most expensive thing that can go quietly wrong on a rig.
+
+### Before it is mining, with no node
+
+```
+derostorm --bench --gpu=all
+```
+
+This needs no wallet and no node. It lists every device the drivers report,
+proves each one against the CPU, and then measures it. A device that cannot be
+opened says so instead of being skipped silently.
+
+### From a script or a rig manager
+
+```
+derostorm --gpu=all --stats-file stats.json
+```
+
+`stats.json` is rewritten every five seconds and carries one entry per source:
+
+```json
+{ "label": "GPU 0", "is_gpu": true, "index": 0, "hashrate": 172290.0, "ailing": false }
+{ "label": "GPU 1", "is_gpu": true, "index": 1, "hashrate": 0.0,      "ailing": true  }
+```
+
+### Two vendors in one machine
+
+Cards are numbered in one list, **NVIDIA first and then AMD**, so on a mixed rig
+`--gpu=0` is the first NVIDIA card. `--gpu=all` takes every card of either
+vendor; a comma-separated list takes exactly the ones you name.
+
+**An integrated Radeon will be detected and cannot mine.** Most AMD processors
+have one, and the miner counts it as a GPU because the driver reports it as one.
+It then fails at start-up with `create stream: out of memory`: an iGPU has no
+memory of its own, reports the host's as if it did, and will not hand any of it
+over. That is one error line and one idle row, and it costs nothing else — but
+if you would rather not see it, name the cards you mean:
+
+```
+derostorm --gpu=0
+```
+
+A one-compute-unit iGPU was never going to add anything measurable next to a
+real card.
+
+---
+
 ## Temperatures
 
 The **DEVICES** rows carry a temperature per source, coloured green below 65°C,
