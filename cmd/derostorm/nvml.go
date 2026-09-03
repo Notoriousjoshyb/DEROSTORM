@@ -21,6 +21,10 @@ package main
 // default numbers them fastest-first, so the two can disagree on a mixed rig.
 // main.go pins CUDA_DEVICE_ORDER=PCI_BUS_ID before anything opens a device,
 // which makes the two orderings the same one.
+//
+// Indices here are CUDA's, counted within NVIDIA cards alone. On a rig that
+// also has an AMD card the miner numbers every card in one list, and
+// gpu_sensors.go is what maps one numbering onto the other.
 
 import (
 	"fmt"
@@ -62,7 +66,8 @@ var (
 	nvmlMu      sync.Mutex
 )
 
-// openNVML loads the library and resolves a handle per device. It returns a
+// nvmlOpen loads the library and resolves a handle per device. The indices
+// are NVML's own, not the miner's: gpu_sensors.go translates. It returns a
 // short note for the event log when telemetry is unavailable, and "" when
 // everything came up.
 //
@@ -70,7 +75,7 @@ var (
 // this moment will not grow one later in the same run, and retrying a failing
 // load every two seconds is a good way to turn a missing feature into a
 // performance bug.
-func openNVML(devices []int) string {
+func nvmlOpen(devices []int) string {
 	if len(devices) == 0 {
 		return ""
 	}
@@ -140,7 +145,7 @@ func openNVML(devices []int) string {
 	return ""
 }
 
-func closeNVML() {
+func nvmlClose() {
 	nvmlMu.Lock()
 	defer nvmlMu.Unlock()
 	if nvmlReady && nvmlShutdown != nil {
@@ -149,10 +154,10 @@ func closeNVML() {
 	}
 }
 
-// readGPUSensors polls every device once. Each query is independent: a card
+// nvmlRead polls every device once. Each query is independent: a card
 // that will not report its fan speed still reports its temperature, so one
 // unsupported field must not cost the others.
-func readGPUSensors(devices []int) []GPUSensor {
+func nvmlRead(devices []int) []GPUSensor {
 	if len(devices) == 0 {
 		return nil
 	}

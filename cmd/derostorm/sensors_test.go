@@ -80,17 +80,18 @@ func TestSensorsPollsWithoutHardware(t *testing.T) {
 	}
 }
 
-// TestNVMLLive checks the binding against a real driver. Skipped where there is
-// no card, which includes every CI runner -- the point is to catch a wrong
+// TestGPUTelemetryLive checks the binding against a real driver -- NVML or
+// ROCm SMI, whichever this machine's first card needs. Skipped where there is
+// no card, which includes every CI runner: the point is to catch a wrong
 // signature on the machines that can catch it, not to demand a GPU.
-func TestNVMLLive(t *testing.T) {
+func TestGPUTelemetryLive(t *testing.T) {
 	if !GPUAvailable || GPUDeviceCount() == 0 {
-		t.Skip("no CUDA device on this machine")
+		t.Skip("no GPU on this machine")
 	}
-	if note := openNVML([]int{0}); note != "" {
-		t.Skipf("NVML not usable here: %s", note)
+	if note := openGPUTelemetry([]int{0}); note != "" {
+		t.Skipf("GPU telemetry not usable here: %s", note)
 	}
-	defer closeNVML()
+	defer closeGPUTelemetry()
 
 	got := readGPUSensors([]int{0})
 	if len(got) != 1 {

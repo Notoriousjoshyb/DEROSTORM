@@ -3,7 +3,22 @@
 Status: **the whole hash runs on the GPU, exactly, by two different routes.**
 Option B ships in the miner, in every build: the kernels live in a DLL that is
 embedded in the executable and bound at run time, so there is one binary and a
-machine with no NVIDIA card runs the same file and mines on the CPU.
+machine with no GPU runs the same file and mines on the CPU.
+
+**Two vendors, one set of kernels.** These same files go to `nvcc` for NVIDIA
+and to `hipcc` for AMD. `gpuapi.cuh` is the only file that knows which — about a
+hundred lines of renames, plus a ballot-built `__match_any_sync` and one piece
+of inline PTX that compiles out. There is no hipify step and no second copy of
+anything. `buildlib.bat`/`buildlib.sh` build the CUDA library;
+`buildlib_hip.bat`/`buildlib_hip.sh` build the AMD one, which is optional and
+needs ROCm.
+
+Every measured figure below is NVIDIA. Nobody has run these kernels on an AMD
+card yet, and the AMD numbers will be different — the sort is memory-bound and
+RDNA's cache hierarchy is not Ada's. The correctness claim is the one that
+carries over: `go test ./cmd/derostorm/ -run GPU` compares the GPU hash against
+the CPU through whichever backend is present, so an AMD card proves itself the
+same way this one did.
 
 Measured on an RTX 5080 (sm_120, 84 SMs, 16 GB) beside a Ryzen 7 9800X3D.
 

@@ -38,7 +38,7 @@ const (
 // runGPUBench measures one device across its block-count candidates and prints
 // the curve. Returns the best rate, or 0 if the device could not be measured.
 func runGPUBench(t *Theme, device int, batch int) float64 {
-	fmt.Printf("\n  %s\n\n", t.C(t.Accent+t.Bold, fmt.Sprintf("GPU %d · %s", device, GPUKind)))
+	fmt.Printf("\n  %s\n\n", t.C(t.Accent+t.Bold, fmt.Sprintf("GPU %d · %s", device, GPUDeviceKind(device))))
 
 	// Four blocks per SM is the mining default and the allocation ceiling.
 	g, err := NewGPUContext(device, batch, 0)

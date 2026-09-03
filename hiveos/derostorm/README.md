@@ -1,7 +1,13 @@
 # DeroStorm on HiveOS
 
 A custom miner package. DeroStorm mines AstroBWTv3 for DERO on the CPU and on
-NVIDIA GPUs at the same time.
+NVIDIA or AMD GPUs at the same time.
+
+> **AMD support is new in 1.7.0 and untested on real hardware.** Nobody working
+> on DeroStorm has an AMD card. If you run one, please report what happens —
+> working or not, fast or slow — at
+> <https://github.com/Notoriousjoshyb/DEROSTORM/issues>. NVIDIA rigs are
+> unaffected by this release.
 
 ## The one thing to know first
 
@@ -41,7 +47,9 @@ Passed to the miner verbatim, so every flag it has is reachable:
 --debug                   verbose logging to derostorm.log
 ```
 
-Leaving the box empty mines on every CPU thread and every NVIDIA card.
+Leaving the box empty mines on every CPU thread and every card, of either
+vendor. Cards are numbered NVIDIA first and then AMD, so on a mixed rig
+`--gpu=0` is the first NVIDIA card.
 
 ## What HiveOS shows
 
@@ -105,10 +113,14 @@ mode on the cards.
 
 ## Requirements
 
-- linux/amd64, up to 16 NVIDIA cards. There is no arm64 GPU build; see the main README.
-- An NVIDIA driver, for GPU mining. The CUDA runtime is linked in statically, so
-  nothing else has to be installed. Cards from Turing (RTX 20xx) up are covered,
-  including Blackwell; CUDA 13 dropped Pascal and Volta.
+- linux/amd64, up to 16 cards. There is no arm64 GPU build; see the main README.
+- **NVIDIA:** the display driver and nothing else. The CUDA runtime is linked in
+  statically. Cards from Turing (RTX 20xx) up are covered, including Blackwell;
+  CUDA 13 dropped Pascal and Volta.
+- **AMD:** ROCm installed, for `libamdhip64`, and an RDNA card — RX 5000, 6000,
+  7000 or 9000. Vega, Polaris and the MI cards are wave64 and are not supported.
+  Not every DeroStorm build carries the AMD kernels: one that does not reports
+  no AMD devices, and the main README says how to add them.
 - `jq`, which HiveOS already has.
 - CPU-only mining works with no GPU present: add `--gpu=off`.
 

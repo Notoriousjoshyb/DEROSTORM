@@ -52,9 +52,20 @@ if [[ -f "$_ds_file" ]]; then
     # Bus numbers let HiveOS line those arrays up with the cards it knows about.
     # CUDA ordinal order is not always HiveOS's order, and without this a
     # two-card rig can show each card's hashrate against the other one.
-    _ds_bus=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null |
-              awk -F: '{ printf "%d\n", strtonum("0x" $(NF-1)) }' |
-              jq -cRs 'split("\n") | map(select(length > 0) | tonumber)' 2>/dev/null)
+    #
+    # NVIDIA first and then AMD, because that is the order the miner numbers
+    # devices in -- see gpuDeviceList in cmd/derostorm/gpu_backend.go. The AMD
+    # half is read from sysfs rather than rocm-smi: rocm-smi is a ROCm
+    # component and a rig can be mining on the HIP runtime without it, while
+    # the amdgpu driver directory is there whenever the cards are. Sorting the
+    # BDFs gives PCI bus order, which is what HIP numbers by.
+    _ds_bus=$( { nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null |
+                   awk -F: '{ printf "%d\n", strtonum("0x" $(NF-1)) }'
+                 for _ds_d in $(ls -d /sys/bus/pci/drivers/amdgpu/0000:* 2>/dev/null | sort); do
+                   _ds_b=${_ds_d##*/}; _ds_b=${_ds_b#0000:}; _ds_b=${_ds_b%%:*}
+                   printf '%d\n' "0x$_ds_b"
+                 done
+               } | jq -cRs 'split("\n") | map(select(length > 0) | tonumber)' 2>/dev/null)
     [[ -z "$_ds_bus" || "$_ds_bus" == "null" ]] && _ds_bus="[]"
 
     # One per card or none at all. A mismatched array is worse than a missing

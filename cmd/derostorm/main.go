@@ -31,11 +31,13 @@ import (
 	"github.com/docopt/docopt-go"
 )
 
-const version = "1.6.3"
+const version = "1.7.0"
 
 const usage = `DeroStorm ` + version + `
-AstroBWTv3 miner for DERO. Mines on the CPU, and on NVIDIA GPUs as well when
-one is present. GPU support is CUDA, so AMD and Intel cards are not supported.
+AstroBWTv3 miner for DERO. Mines on the CPU, and on NVIDIA or AMD GPUs as well
+when one is present. NVIDIA needs the display driver and nothing else; AMD needs
+an RDNA card (RX 5000 or newer) and the HIP runtime. Intel cards are not
+supported.
 
 On first run DeroStorm asks a few questions and saves the answers next to the
 executable, so afterwards you can just start it with no arguments.
@@ -61,8 +63,9 @@ Options:
   --wallet-address=<addr>         Mining rewards go to this address.
   --daemon-rpc-address=<host:port>  derod getwork address.
   --mining-threads=<n>            Number of mining threads.
-  --gpu=<list>                    Also mine on these NVIDIA devices: 0, 0,1,
-                                  all or off. Overrides the saved setting.
+  --gpu=<list>                    Also mine on these devices: 0, 0,1, all or
+                                  off. NVIDIA cards are numbered first, then
+                                  AMD. Overrides the saved setting.
   --gpu-batch=<n>                 Nonces per GPU launch. Default: fill VRAM.
   --gpu-blocks=<n>                Resident blocks in the GPU suffix kernel.
                                   Default: four per SM (336 on a 5080).
@@ -467,7 +470,7 @@ func runBench(t *Theme, maxThreadsWanted int, gpus []int, gpuBatch int,
 		if GPUAvailable && GPUDeviceCount() > 0 {
 			fmt.Printf("\n  %s\n", t.C(t.Dim, fmt.Sprintf(
 				"%d %s device(s) present but not benchmarked — add --gpu=all",
-				GPUDeviceCount(), GPUKind)))
+				GPUDeviceCount(), GPUKind())))
 		}
 	case !GPUAvailable:
 		fmt.Printf("\n  %s\n", t.C(t.Warn, "this build has no GPU support"))
@@ -697,8 +700,11 @@ func (w *rateWindow) mean() float64 {
 }
 
 // parseGPUList turns the --gpu argument into device indices. "all" takes every
-// device the driver reports, "off" and "none" disable the GPU, and anything
+// device the drivers report, "off" and "none" disable the GPU, and anything
 // else is a comma-separated list of indices.
+//
+// One list covers both vendors: NVIDIA cards are numbered first and AMD after,
+// so on a mixed rig --gpu=0 is the first NVIDIA card. See gpu_backend.go.
 func parseGPUList(v string) ([]int, error) {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "off", "none", "no", "0000-off":
@@ -706,7 +712,7 @@ func parseGPUList(v string) ([]int, error) {
 	case "all":
 		n := GPUDeviceCount()
 		if n == 0 {
-			return nil, fmt.Errorf("no CUDA device found")
+			return nil, fmt.Errorf("no GPU found")
 		}
 		// Trim to what the nonce tagging can address. "all" used to mean
 		// literally every device the driver reported, which on a rig with more

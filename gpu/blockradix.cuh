@@ -115,6 +115,7 @@
 
 #pragma once
 #include <cstdint>
+#include "gpuapi.cuh"
 #include "prof.cuh"
 
 // Threads per block, i.e. threads per hash. Overridable from the compiler line
@@ -212,11 +213,9 @@ struct BlockRadixScratch {
 // launch and to cudaFuncSetAttribute.
 #define BR_SHARED_BYTES ((int)sizeof(BlockRadixScratch))
 
-__device__ __forceinline__ unsigned laneMaskLt() {
-    unsigned m;
-    asm("mov.u32 %0, %%lanemask_lt;" : "=r"(m));
-    return m;
-}
+// Lanes below mine. The body is in gpuapi.cuh because CUDA reads it from a
+// special register and HIP has to build it.
+__device__ __forceinline__ unsigned laneMaskLt() { return dsgLaneMaskLt(); }
 
 // Zeroes the parts of the scratch that must start clean. Call once per block
 // before any other function here.
@@ -243,7 +242,7 @@ __device__ __forceinline__ void scanBins(BlockRadixScratch* sh)
     if (tid < BR_BINS) {
         v = sh->tileTot[tid];
         for (int off = 1; off < 32; off <<= 1) {   // inclusive scan in the warp
-            const int y = __shfl_up_sync(0xffffffffu, v, off);
+            const int y = DSG_SHFL_UP(v, off);
             if (lane >= off) v += y;
         }
         if (lane == 31) sh->warpScan[warp] = v;
@@ -344,7 +343,13 @@ __device__ void blockRadixPass(const uint64_t* in, uint64_t* out,
         // below, not the match. That is the irreducible read of a radix pass:
         // one word per element per pass. Fewer passes is the only lever on it,
         // and 9-bit digits (four passes instead of five) measured flat too.
-        const unsigned same = __match_any_sync(0xffffffffu, d);
+        // Dead lanes carry d = -1, which is not a digit; BR_BINS is the first
+        // value that is not one either, so it groups them together in exactly
+        // BR_BITS + 1 bits and the match needs no wider key than that. The
+        // narrowing is what makes the AMD ballot construction in dsgMatchAnyBits
+        // affordable, and it changes nothing on NVIDIA.
+        const unsigned same = dsgMatchAnyBits(live ? (unsigned)d : (unsigned)BR_BINS,
+                                              BR_BITS + 1);
         const int rankInWarp = __popc(same & laneMaskLt());
         const int isLeader   = (rankInWarp == 0);
         const int warpCount  = __popc(same);
@@ -393,11 +398,11 @@ __device__ void blockRadixPass(const uint64_t* in, uint64_t* out,
 
                 int inc = run;                     // inclusive scan of run
                 for (int off = 1; off < 32; off <<= 1) {
-                    const int y = __shfl_up_sync(0xffffffffu, inc, off);
+                    const int y = DSG_SHFL_UP(inc, off);
                     if (lane >= off) inc += y;
                 }
                 sh->tileStart[b] = carry + inc - run;
-                carry += __shfl_sync(0xffffffffu, inc, 31);
+                carry += DSG_SHFL(inc, DSG_WAVE - 1);
             }
         }
         __syncthreads();
@@ -407,7 +412,7 @@ __device__ void blockRadixPass(const uint64_t* in, uint64_t* out,
         // tileStart together.
         int preInTile = 0;
         if (live && isLeader) preInTile = sh->warpCnt[warp][d];
-        preInTile = __shfl_sync(0xffffffffu, preInTile, leaderLane);
+        preInTile = DSG_SHFL(preInTile, leaderLane);
 #else
         for (int b = tid; b < BR_BINS; b += BR_BLOCK) {
             int run = 0;
@@ -425,7 +430,7 @@ __device__ void blockRadixPass(const uint64_t* in, uint64_t* out,
         // scanBins, which is why there is no second one here.
         int preInTile = 0;
         if (live && isLeader) preInTile = sh->warpCnt[warp][d];
-        preInTile = __shfl_sync(0xffffffffu, preInTile, leaderLane);
+        preInTile = DSG_SHFL(preInTile, leaderLane);
 
         // ---- 3. stage the tile in digit order
         scanBins(sh);
@@ -506,7 +511,7 @@ __device__ int blockScanFlags(int32_t* f, int n, BlockRadixScratch* sh)
         int x = (i < n) ? f[i] : 0;
 
         for (int off = 1; off < 32; off <<= 1) {
-            const int y = __shfl_up_sync(0xffffffffu, x, off);
+            const int y = DSG_SHFL_UP(x, off);
             if (lane >= off) x += y;
         }
         if (lane == 31) sh->warpScan[warp] = x;
@@ -547,7 +552,7 @@ __device__ void blockScanMax(int32_t* a, int n, BlockRadixScratch* sh)
         int x = (i < n) ? a[i] : -1;
 
         for (int off = 1; off < 32; off <<= 1) {
-            const int y = __shfl_up_sync(0xffffffffu, x, off);
+            const int y = DSG_SHFL_UP(x, off);
             if (lane >= off && y > x) x = y;
         }
         if (lane == 31) sh->warpScan[warp] = x;

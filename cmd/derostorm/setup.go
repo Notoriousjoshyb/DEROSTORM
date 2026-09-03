@@ -129,8 +129,8 @@ func RunSetup(theme *Theme, preferred, path string, existing *Config, flagTestne
 		}
 	case GPUAvailable:
 		s.note("")
-		s.note("No " + GPUKind + " GPU found — mining on the CPU.")
-		s.note("AMD and Intel GPUs are not supported.")
+		s.note("No " + GPUKind() + " GPU found — mining on the CPU.")
+		s.note("Intel GPUs are not supported; AMD needs an RDNA card, RX 5000 or newer.")
 	}
 
 	// ---- 1. network ------------------------------------------------------

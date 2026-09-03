@@ -53,7 +53,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$Version  = '1.6.3'
+$Version  = '1.7.0'
 $Pkg      = './cmd/derostorm'
 $BoundsPkg = 'github.com/deroproject/derohe/astrobwt/astrobwtv3'
 $LdFlags  = '-s -w'
@@ -137,7 +137,7 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 # WSL instead. That is a build-time dependency only -- once the file exists,
 # embedding it in a GOOS=linux cross-build is no different from embedding the
 # DLL, which is the reason these bindings avoid cgo (see
-# cmd/derostorm/gpu_cuda.go).
+# cmd/derostorm/gpu_backend.go).
 #
 # Sources is what each one is compiled from, and it is there for the staleness
 # check below rather than for the build. It lists only what the library itself
@@ -153,6 +153,23 @@ $Embedded = @(
     @{ Path = 'cmd\derostorm\libderostorm_gpu.so'; Script = 'gpu/buildlib.sh';    What = 'CUDA kernels (Linux)';   Wsl = $true; Needs = 'a Linux CUDA toolkit'; Sources = $GpuSources }
     @{ Path = 'cmd\derostorm\derostorm_sa.dll';    Script = 'native\build.bat';   What = 'descriptor suffix sort (Windows)'; Sources = $SaSources }
     @{ Path = 'cmd\derostorm\libderostorm_sa.so';  Script = 'native/buildlib.sh'; What = 'descriptor suffix sort (Linux)'; Wsl = $true; Needs = 'gcc'; Sources = $SaSources }
+)
+
+# The AMD kernels, which are optional in a way the four above are not.
+#
+# They come from the same sources through hipcc instead of nvcc, and building
+# them needs ROCm or the AMD HIP SDK -- neither of which this machine has, and
+# neither of which most build machines have. go:embed takes the whole
+# cmd\derostorm\gpulib\<goos> directory rather than the file, so a tree without
+# them still compiles and the finished miner simply reports no AMD devices. See
+# the long note in cmd\derostorm\gpu_backend.go.
+#
+# So missing is a build configuration and not an error. Stale is still an error,
+# and a worse one than for the NVIDIA libraries: nobody on this side has an AMD
+# card to notice with.
+$Optional = @(
+    @{ Path = 'cmd\derostorm\gpulib\windows\derostorm_hip.dll'; Script = 'gpu\buildlib_hip.bat'; What = 'HIP kernels (Windows)'; Needs = 'the AMD HIP SDK for Windows'; Sources = $GpuSources }
+    @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip.so'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux)'; Wsl = $true; Needs = 'ROCm'; Sources = $GpuSources }
 )
 
 if ($Native) {
@@ -177,6 +194,36 @@ if ($Native) {
 
         if ($code -ne 0) { throw "$($lib.Script) failed with exit code $code" }
     }
+
+    # The AMD kernels, only where a toolchain to build them exists. A machine
+    # without ROCm is the normal case and not a failure: the miner builds and
+    # mines without them on everything except AMD, so this says so and moves on.
+    foreach ($lib in $Optional) {
+        $have = if ($lib.Wsl) {
+            & wsl.exe -- bash -lc 'command -v hipcc >/dev/null 2>&1 || [ -x /opt/rocm/bin/hipcc ]' 2>$null
+            $LASTEXITCODE -eq 0
+        } else {
+            $hip = if ($env:HIP_PATH) { $env:HIP_PATH } else { 'C:\Program Files\AMD\ROCm\6.2' }
+            Test-Path (Join-Path $hip 'bin\hipcc.exe')
+        }
+        if (-not $have) {
+            Write-Host "skipping $($lib.What) - no $($lib.Needs) here" -ForegroundColor DarkYellow
+            continue
+        }
+        Write-Host "building $($lib.What)" -ForegroundColor Cyan
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        if ($lib.Wsl) {
+            $repo = (& wsl.exe wslpath -a "$PSScriptRoot") -replace "`0", ''
+            & wsl.exe -- bash -lc "cd '$repo' && sh $($lib.Script) 2>&1" |
+                ForEach-Object { Write-Host "    $($_ -replace "`0", '')" -ForegroundColor DarkGray }
+        } else {
+            & cmd /c "$($lib.Script) 2>&1" | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        }
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = $prev
+        if ($code -ne 0) { throw "$($lib.Script) failed with exit code $code" }
+    }
 }
 
 foreach ($lib in $Embedded) {
@@ -185,6 +232,14 @@ foreach ($lib in $Embedded) {
                else          { "run $($lib.Script), or .\build.ps1 -Native" }
         throw "$($lib.Path) is missing - $how"
     }
+}
+
+# Said once, so a release cut without AMD support is a choice and not something
+# a miner discovers three days later.
+$MissingOptional = @($Optional | Where-Object { -not (Test-Path $_.Path) })
+if ($MissingOptional) {
+    $names = ($MissingOptional | ForEach-Object { $_.What }) -join ', '
+    Write-Host "no AMD support in this build - $names not present" -ForegroundColor DarkYellow
 }
 
 # Present is not the same as current, and the difference has already shipped
@@ -198,7 +253,7 @@ foreach ($lib in $Embedded) {
 # a timestamp comparison and it will occasionally fire on a file that changed
 # nothing -- editing gpu\prof.cuh, which compiles out of the shipped kernel, is
 # the usual one. Rebuilding is cheap and shipping the wrong kernels is not.
-foreach ($lib in $Embedded) {
+foreach ($lib in ($Embedded + ($Optional | Where-Object { Test-Path $_.Path }))) {
     $built = (Get-Item $lib.Path).LastWriteTimeUtc
     $newer = Get-ChildItem -Path $lib.Sources -File -ErrorAction SilentlyContinue |
              Where-Object { $_.LastWriteTimeUtc -gt $built } |
@@ -258,7 +313,7 @@ if ($All) {
 
 
 Write-Host ''
-foreach ($lib in $Embedded) {
+foreach ($lib in ($Embedded + ($Optional | Where-Object { Test-Path $_.Path }))) {
     $kb = [math]::Round((Get-Item $lib.Path).Length / 1KB)
     Write-Host ("  embedded {0,-24} {1} KB" -f $lib.What, $kb) -ForegroundColor DarkGray
 }

@@ -114,7 +114,7 @@ const sensorInterval = 2 * time.Second
 func NewSensors(devices []int) *Sensors {
 	s := &Sensors{closed: make(chan struct{})}
 
-	note := openNVML(devices)
+	note := openGPUTelemetry(devices)
 	s.note = note
 
 	s.poll(devices)
@@ -124,7 +124,7 @@ func NewSensors(devices []int) *Sensors {
 		for {
 			select {
 			case <-s.closed:
-				closeNVML()
+				closeGPUTelemetry()
 				return
 			case <-t.C:
 				s.poll(devices)

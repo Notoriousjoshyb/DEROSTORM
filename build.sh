@@ -41,7 +41,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION=1.6.3
+VERSION=1.7.0
 PKG=./cmd/derostorm
 BOUNDS_PKG=github.com/deroproject/derohe/astrobwt/astrobwtv3
 LDFLAGS="-s -w"
@@ -103,6 +103,10 @@ mkdir -p "$OUTDIR"
 #                   libderostorm_sa.so   native/buildlib.sh   (built on Linux)
 #   everything else nothing
 #
+# The AMD kernels are the exception and check_optional_embedded handles them
+# separately: building them needs ROCm, most machines have none, and a miner
+# without them simply has no AMD support. Missing is fine; stale is not.
+#
 # Checking all three whatever the target is what an earlier version did, and it
 # stopped macOS building at all: a Mac needs none of them -- gpu_other.go and
 # sa_other.go cover that build and embed nothing -- so the check failed on files
@@ -163,6 +167,37 @@ EOF
   [ "$missing" -eq 0 ] || exit 1
 }
 
+# The AMD library, which may legitimately not be there.
+#
+# go:embed takes the whole gpulib/<goos> directory rather than the file, so a
+# tree without it still compiles -- see cmd/derostorm/gpu_backend.go. That makes
+# absence a build configuration and not an error: the finished miner reports no
+# AMD devices, exactly as it would on a machine with no AMD card.
+#
+# What is still an error is a stale one. The reasoning is check_embedded's, and
+# it bites harder here: nobody on this side of the build has an AMD card to
+# notice with.
+check_optional_embedded() {
+  local goos="$1" goarch="$2" path="" how=""
+  case "$goos/$goarch" in
+    windows/*)   path="cmd/derostorm/gpulib/windows/derostorm_hip.dll"
+                 how="gpu\buildlib_hip.bat, on Windows with the AMD HIP SDK" ;;
+    linux/amd64) path="cmd/derostorm/gpulib/linux/libderostorm_hip.so"
+                 how="gpu/buildlib_hip.sh, on Linux with ROCm" ;;
+    *)           return 0 ;;
+  esac
+  [ -f "$path" ] || return 0
+  local src stale=""
+  for src in gpu/derostorm_gpu.cu gpu/derostorm_gpu.h gpu/*.cuh gpu/*.inc; do
+    [ -f "$src" ] || continue
+    [ "$src" -nt "$path" ] && stale="$stale $src"
+  done
+  if [ -n "$stale" ]; then
+    echo "$path is older than the source it is built from ($(echo $stale | cut -c1-120)) -- rebuild it with $how" >&2
+    exit 1
+  fi
+}
+
 # The host's own libraries are checked before the tests, not with the first
 # target, because `go test ./cmd/derostorm/` compiles that package for the host
 # and therefore embeds them too. Checking per target only was enough to give a
@@ -191,6 +226,15 @@ if [ "$NATIVE" -eq 1 ]; then
     linux)
       echo "building CUDA kernels (Linux)"
       sh gpu/buildlib.sh
+      # The AMD kernels only if this machine can: ROCm is a large install and
+      # most build machines have none. Skipping is not a failure -- the miner
+      # builds and mines without them, on everything but AMD.
+      if command -v hipcc >/dev/null 2>&1 || [ -x /opt/rocm/bin/hipcc ]; then
+        echo "building HIP kernels (Linux)"
+        sh gpu/buildlib_hip.sh
+      else
+        echo "no hipcc found -- skipping the AMD kernels (this build will have no AMD support)"
+      fi
       echo "building descriptor suffix sort (Linux)"
       sh native/buildlib.sh
       ;;
@@ -201,6 +245,7 @@ if [ "$NATIVE" -eq 1 ]; then
 fi
 
 check_embedded "$(go env GOOS)" "$(go env GOARCH)"
+check_optional_embedded "$(go env GOOS)" "$(go env GOARCH)"
 
 if [ "$SKIP_TESTS" -eq 0 ]; then
   echo "running tests..."
@@ -213,6 +258,7 @@ build() {
   [ "$goos" = "windows" ] && name="${name}.exe"
 
   check_embedded "$goos" "$goarch"
+  check_optional_embedded "$goos" "$goarch"
   echo "building ${name}"
 
   # -B on amd64 and nowhere else; see the note at the top of this file. Empty

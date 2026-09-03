@@ -25,7 +25,7 @@ func gpuTestContext(t *testing.T) *GPUContext {
 		t.Skip("no GPU support in this build")
 	}
 	if GPUDeviceCount() == 0 {
-		t.Skip("no CUDA device")
+		t.Skip("no GPU on this machine")
 	}
 	// A small batch and a modest block count keep the test quick and its VRAM
 	// footprint small enough to run beside a miner.
@@ -49,7 +49,7 @@ func testWork() []byte {
 
 func TestGPUDeviceInfo(t *testing.T) {
 	if !GPUAvailable || GPUDeviceCount() == 0 {
-		t.Skip("no CUDA device")
+		t.Skip("no GPU on this machine")
 	}
 	// Must not open the device or allocate: the setup wizard calls this while
 	// the user is still answering questions.

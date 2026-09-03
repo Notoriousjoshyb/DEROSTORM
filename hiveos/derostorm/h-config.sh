@@ -60,7 +60,14 @@ if [[ "$EXTRA" != *--mining-threads* ]]; then
     *--gpu=off*|*--gpu=none*|*--gpu=no*)
       NGPU=0 ;;
     *--gpu=all*|*)
-      NGPU=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -c .) ;;
+      # Both vendors, because the miner mines on both and reserves a feeder
+      # thread per card either way. nvidia-smi comes with the NVIDIA driver;
+      # the AMD side is counted from sysfs rather than rocm-smi, which is a
+      # ROCm component and not always installed on a rig that is nonetheless
+      # mining happily on the HIP runtime.
+      NGPU=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -c .)
+      NAMD=$(ls -d /sys/bus/pci/drivers/amdgpu/0000:* 2>/dev/null | grep -c .)
+      NGPU=$(( NGPU + NAMD )) ;;
   esac
   if [[ "$EXTRA" =~ --gpu=([0-9]+(,[0-9]+)*) ]]; then
     NGPU=$(echo "${BASH_REMATCH[1]}" | tr ',' '

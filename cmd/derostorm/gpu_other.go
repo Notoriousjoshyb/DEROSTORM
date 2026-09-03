@@ -2,17 +2,18 @@
 
 package main
 
-// The fallback for builds with no CUDA library to embed: macOS, and Linux on
+// The fallback for builds with no GPU library to embed: macOS, and Linux on
 // anything but amd64.
 //
 // macOS is not a packaging gap but a dead end. Apple dropped NVIDIA driver
-// support in 10.14 and Apple Silicon never had it, so there is no CUDA to bind
-// to on any Mac made since 2018; a GPU path there would be Metal and a rewrite
-// of gpu/*.cuh, not a loader. Linux arm64 is only missing a build -- see
-// gpu_cuda_linux.go.
+// support in 10.14 and Apple Silicon never had it, and AMD's ROCm has never
+// targeted macOS either, so there is nothing on any Mac made since 2018 for
+// either backend to bind to; a GPU path there would be Metal and a rewrite of
+// gpu/*.cuh, not a loader. Linux arm64 is only missing a build -- see
+// gpu_backend_linux.go.
 //
-// Shapes match gpu_cuda.go exactly so engine.go and gpu_worker.go need no build
-// tags of their own, and so these builds still type-check every call site
+// Shapes match gpu_backend.go exactly so engine.go and gpu_worker.go need no
+// build tags of their own, and so these builds still type-check every call site
 // rather than letting the two drift apart unnoticed.
 
 import "errors"
@@ -21,9 +22,12 @@ import "errors"
 const GPUAvailable = false
 
 // GPUKind names the hardware this would support, for messages to the user.
-const GPUKind = "NVIDIA CUDA"
+func GPUKind() string { return "NVIDIA CUDA and AMD HIP" }
 
-var errNoGPUHere = errors.New("this build has no GPU support: NVIDIA CUDA needs Windows, or Linux on amd64")
+// GPUDeviceKind has no device to name.
+func GPUDeviceKind(device int) string { return "" }
+
+var errNoGPUHere = errors.New("this build has no GPU support: it needs Windows, or Linux on amd64")
 
 // GPUDeviceCount is always zero here.
 func GPUDeviceCount() int { return 0 }
@@ -31,7 +35,7 @@ func GPUDeviceCount() int { return 0 }
 // GPUDeviceInfo has nothing to describe.
 func GPUDeviceInfo(device int) string { return "" }
 
-// GPUContext is the same handle as gpu_cuda.go's, with nothing behind it.
+// GPUContext is the same handle as gpu_backend.go's, with nothing behind it.
 type GPUContext struct{}
 
 func NewGPUContext(device, batch, blocks int) (*GPUContext, error) { return nil, errNoGPUHere }
@@ -39,6 +43,7 @@ func NewGPUContext(device, batch, blocks int) (*GPUContext, error) { return nil,
 func (g *GPUContext) Close()              {}
 func (g *GPUContext) Batch() int          { return 0 }
 func (g *GPUContext) Name() string        { return "" }
+func (g *GPUContext) Kind() string        { return "" }
 func (g *GPUContext) Blocks() int         { return 0 }
 func (g *GPUContext) MaxBlocks() int      { return 0 }
 func (g *GPUContext) SMs() int            { return 0 }

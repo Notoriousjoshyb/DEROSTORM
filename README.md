@@ -1,8 +1,21 @@
 # DeroStorm
 
-An AstroBWTv3 miner for DERO. Mines on the CPU and, when an NVIDIA card is
-present, on the GPU as well. Full-screen themed console, guided first-run
+An AstroBWTv3 miner for DERO. Mines on the CPU and, when an NVIDIA or AMD card
+is present, on the GPU as well. Full-screen themed console, guided first-run
 setup.
+
+> **AMD support is new in 1.7.0 and has not been tested on an AMD card.**
+> Nobody working on DeroStorm owns one. The kernels are the same kernels the
+> NVIDIA build has run for months and they compile for RDNA, but *compiles* is
+> not *runs*, and no hashrate figure anywhere in this file is an AMD figure.
+>
+> If you have an RX 5000, 6000, 7000 or 9000, please
+> [open an issue](https://github.com/Notoriousjoshyb/DEROSTORM/issues) —
+> whether it works or not. Wrong hashes, a card that is not detected, a launch
+> failure, or a hashrate that looks low for the card: all of it is useful, and
+> low-and-working is as worth reporting as broken. Say which card, which driver
+> or ROCm version, and what `derostorm --bench --gpu=all` and
+> `go test ./cmd/derostorm/ -run GPU` printed. See *Which cards* below.
 
 The proof-of-work output is bit-for-bit identical to the reference
 implementation — every optimisation here is a faster route to the same 32 bytes,
@@ -81,7 +94,7 @@ Run it. There is nothing to configure first.
 derostorm
 ```
 
-On the first run it asks five questions — network, wallet address, node, threads, theme — and saves the answers to `derostorm.json` **next to the executable**. If an NVIDIA card is present it names it and asks a sixth: whether to mine on it as well. Every run after that starts straight into mining.
+On the first run it asks five questions — network, wallet address, node, threads, theme — and saves the answers to `derostorm.json` **next to the executable**. If a GPU is present it names the card and asks a sixth: whether to mine on it as well. Every run after that starts straight into mining.
 
 To change any of it later:
 
@@ -189,20 +202,33 @@ that shows you the reading.
 
 ### GPU — always works
 
-Read from **NVML**, the management library inside the NVIDIA display driver. It
-is loaded at run time by name, exactly as the CUDA kernels are, so a machine
-with a working card always has it and a machine without one simply gets no
-telemetry instead of a miner that will not start. Only the read-only queries are
-bound — nothing here can change a clock, a fan or a power limit.
+Read from **NVML** on NVIDIA and **ROCm SMI** on AMD. Both are loaded at run
+time by name, exactly as the mining kernels are, so a machine without one simply
+gets no telemetry instead of a miner that will not start. Only the read-only
+queries are bound — nothing here can change a clock, a fan or a power limit.
 
 That gives temperature, power draw against the enforced limit, fan speed,
 utilisation, memory use and core clock. The panel shows temperature and watts;
 the watts are also what `GPU EFF` divides by.
 
+The two differ in how reliably they are there. NVML ships **inside the NVIDIA
+display driver**, so any machine that can mine on an NVIDIA card can also be
+asked about it. ROCm SMI ships with **ROCm**, not with the driver — which on
+Linux comes to the same thing, since the AMD kernels need ROCm anyway, but on
+Windows it does not: Adrenalin carries the HIP runtime and not ROCm SMI. So a
+Windows AMD rig usually mines happily and shows dashes in the temperature
+column. That costs the column and nothing else.
+
 On a rig with unlike cards, CUDA numbers devices fastest-first while NVML numbers
 them by PCI bus, so the two would disagree about which card is "GPU 1".
 DeroStorm sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before opening anything, which
-makes the two the same numbering. Set it yourself to override.
+makes the two the same numbering. Set it yourself to override. HIP and ROCm SMI
+both number by PCI bus already, so the AMD side needs no equivalent.
+
+On a rig with **both** vendors, DeroStorm numbers every card in one list —
+NVIDIA first, then AMD — so `--gpu=0` is the first NVIDIA card and the AMD ones
+follow. Each vendor's telemetry library still sees only its own, and
+`cmd/derostorm/gpu_sensors.go` is the translation between the two numberings.
 
 ### CPU — reads whatever monitor you already have
 
@@ -279,8 +305,8 @@ derostorm [options]
                                     hashrate and block interval. Default: the
                                     getwork host with the port two higher.
   --mining-threads=<n>              Override the saved thread count.
-  --gpu=<list>                      Mine on these NVIDIA devices: 0, 0,1,
-                                    all or off.
+  --gpu=<list>                      Mine on these devices: 0, 0,1, all or
+                                    off. NVIDIA cards first, then AMD.
   --gpu-batch=<n>                   Nonces per GPU launch.
   --gpu-blocks=<n>                  Resident blocks in the GPU suffix kernel.
                                     Default: measure it while mining.
@@ -368,20 +394,66 @@ Targets built by `--all`: `windows/amd64`, `linux/amd64`, `linux/arm64`, `darwin
 | `windows/amd64` | yes | |
 | `linux/amd64` | yes | |
 | `linux/arm64` | no | no `.so` is built for it — see below; the kernels are portable, so this is a missing build rather than a missing port |
-| `darwin/*` | no | Apple dropped NVIDIA driver support in macOS 10.14 and Apple Silicon never had it, so there is no CUDA on any Mac made since 2018 |
+| `darwin/*` | no | Apple dropped NVIDIA driver support in macOS 10.14 and Apple Silicon never had it, and ROCm has never targeted macOS, so there is nothing on any Mac made since 2018 for either backend to bind to |
 
 Every other build mines on the CPU and says so; nothing fails.
 
-GPU mining is CUDA, so it means NVIDIA. The library carries a cubin for every
-architecture CUDA 13 still supports — `sm_75` (RTX 20xx) through `sm_120`
-(RTX 50xx) — plus PTX, so a card newer than the toolkit compiles at load
-instead of failing. Pascal and older were dropped by CUDA 13 itself and mine on
-the CPU. AMD and Intel cards would need a port to HIP or Vulkan: the kernels
-assume a 32-thread warp throughout `gpu/blockradix.cuh`, so that is a rewrite
-of the sort, not a recompile.
+### Which cards
 
-Only the NVIDIA display driver is needed at run time. The CUDA runtime is
-linked into the embedded library, so there is no toolkit to install.
+Two backends, built from **one set of kernels**. `gpu/derostorm_gpu.cu` and the
+headers beside it go to `nvcc` for NVIDIA and to `hipcc` for AMD;
+`gpu/gpuapi.cuh` is the only file that knows which, and it is about a hundred
+lines of renames. There is no hipify step and no second copy of the miner to
+fall out of step.
+
+**NVIDIA — CUDA.** The library carries a cubin for every architecture CUDA 13
+still supports — `sm_75` (RTX 20xx) through `sm_120` (RTX 50xx) — plus PTX, so a
+card newer than the toolkit compiles at load instead of failing. Pascal and
+older were dropped by CUDA 13 itself and mine on the CPU. Only the display
+driver is needed at run time: the CUDA runtime is linked into the embedded
+library, so there is no toolkit to install.
+
+**AMD — HIP, RDNA only, and untested.** `gfx1010` and `gfx1012` (RX 5000),
+`gfx1030`–`gfx1036` (RX 6000), `gfx1100`–`gfx1103` (RX 7000) and
+`gfx1200`/`gfx1201` (RX 9000).
+
+Untested is meant literally: this has never been run on an AMD card. What *is*
+known is that the kernels are unchanged for NVIDIA — 512 real vectors still hash
+identically, and five interleaved benchmark rounds put the port at 98,548 H/s
+against 98,683 before it, which is inside the run-to-run spread. What is not
+known is anything at all about how they behave on RDNA. The sort is memory-bound
+and RDNA's cache hierarchy is not Ada's, so the hashrate could land anywhere.
+
+**Please report what you see**, working or not, at
+[the issue tracker](https://github.com/Notoriousjoshyb/DEROSTORM/issues). A card
+that mines correctly but slowly is a bug worth filing — the block count, the
+batch size and the radix width were all swept on NVIDIA hardware and none of
+those answers is likely to be the right one here. Include the card, the driver
+or ROCm version, and the output of both checks in
+`cmd/derostorm/gpulib/README.md`.
+Vega, Polaris and the CDNA MI cards are **not** supported and will not be: they
+are wave64, and the block radix sort's shared-memory layout is 32 lanes wide
+throughout `gpu/blockradix.cuh`. `gpu/gpuapi.cuh` turns a wave64 build into a
+compile error rather than a wrong hash.
+
+Two things about AMD are worth knowing before filing a bug:
+
+- **A card missing from the list does not JIT.** CUDA ships PTX alongside its
+  cubins and the driver compiles it for an unknown card; AMD code objects are
+  final and there is no portable form to fall back on. A gfx target that is not
+  in `gpu/buildlib_hip.sh` reports "no kernel image is available for execution"
+  and the miner falls back to the CPU. Adding one is a line in that list and a
+  rebuild.
+- **The AMD library is not in every build.** Building it needs ROCm or the AMD
+  HIP SDK, which the machine cutting releases does not have, so a build made
+  without one embeds no AMD kernels and reports no AMD devices — the same thing,
+  to the miner, as a machine with no AMD card. `cmd/derostorm/gpulib/README.md`
+  says how to put it in.
+
+At run time AMD needs the HIP runtime: on Windows that ships inside the
+Adrenalin driver, and on Linux it means ROCm (`libamdhip64`) installed.
+
+**Intel** would need a third port, to SYCL or Vulkan, and nobody has done it.
 
 #### What Linux arm64 would take
 
@@ -474,6 +546,12 @@ once and the copies under `cmd/derostorm/` are what `go:embed` picks up from
 then on. After that an ordinary build needs neither a C toolchain nor CUDA, and
 they only need rebuilding when their sources change.
 
+A fifth and sixth are **optional**: the AMD kernels, one per platform. They are
+the same source as the CUDA pair through `hipcc` instead of `nvcc`, they need
+ROCm or the AMD HIP SDK to build, and a tree without them still compiles — see
+*Which cards* above and `cmd/derostorm/gpulib/README.md`. Everything below is
+about the four required ones unless it says otherwise.
+
 **Which ones you need depends on the target, not on your machine**, and for some
 targets the answer is none:
 
@@ -482,6 +560,13 @@ targets the answer is none:
 | `windows/amd64` | `derostorm_gpu.dll` and `derostorm_sa.dll` |
 | `linux/amd64` | `libderostorm_gpu.so` and `libderostorm_sa.so` |
 | `linux/arm64`, `darwin/amd64`, `darwin/arm64` | **nothing** |
+
+and, to add AMD support, optionally:
+
+| Target | Optional |
+| --- | --- |
+| `windows/amd64` | `gpulib\windows\derostorm_hip.dll` |
+| `linux/amd64` | `gpulib/linux/libderostorm_hip.so` |
 
 So building for macOS needs no GPU, no CUDA and no libraries: `./build.sh` on a
 Mac produces a working CPU miner from a clean clone. `build.sh` checks only what
@@ -498,14 +583,26 @@ gpu\buildlib.bat         # CUDA kernels  -> cmd\derostorm\derostorm_gpu.dll
 gpu/buildlib.sh          # CUDA kernels  -> cmd\derostorm\libderostorm_gpu.so   (run under Linux)
 native\build.bat         # suffix sort   -> cmd\derostorm\derostorm_sa.dll
 native/buildlib.sh       # suffix sort   -> cmd\derostorm\libderostorm_sa.so    (run under Linux)
+
+gpu\buildlib_hip.bat     # HIP kernels   -> cmd\derostorm\gpulib\windows\derostorm_hip.dll
+gpu/buildlib_hip.sh      # HIP kernels   -> cmd/derostorm/gpulib/linux/libderostorm_hip.so  (run under Linux)
 ```
+
+The two HIP scripts are the optional pair. `-Native` runs them when it finds a
+toolchain and names the ones it skipped when it does not, so a build with no AMD
+support is something you are told about rather than something a miner discovers
+later.
 
 Each script copies its result into `cmd\derostorm\` itself, because doing that
 by hand is how a stale library gets shipped. Both build scripts refuse to build
 if a copy is missing, since `go:embed` fails with no hint as to the cause.
 
 The CUDA halves need the toolkit and a host compiler — MSVC on Windows, gcc on
-Linux; the suffix-sort halves need only the host compiler, MSVC or gcc.
+Linux; the suffix-sort halves need only the host compiler, MSVC or gcc. The HIP
+halves need ROCm (`hipcc`) on Linux or the AMD HIP SDK on Windows, which is a
+separate download from the Adrenalin driver. Neither needs an AMD card: the
+compiler targets whatever `gfx` list the script names, not the machine it runs
+on.
 
 The two `.sh` scripts are the odd ones, because a compiler targets the host it
 runs on: a Linux `.so` cannot be produced from the Windows toolkit, whatever
@@ -527,6 +624,11 @@ which is the whole reason the GPU binding avoids cgo.
 gpu\vectors.bin` is the one that matters: it runs 512 real vectors through the
 whole GPU hash and compares every byte against the CPU, then reports the block
 count curve. Run it after any kernel change.
+
+It is CUDA-only. There is no AMD equivalent, so a kernel change has to be
+checked twice: `hash_parallel_test` against an NVIDIA card, and
+`go test ./cmd/derostorm/ -run GPU` on a machine with an AMD one — that suite
+runs the same comparison against the CPU through whichever backend is present.
 
 ### Running the tests
 
@@ -2080,10 +2182,12 @@ derostorm/
 │   ├── termdiag*.go        --termdiag: what each source says the size is
 │   ├── termprobe*.go       asks the terminal for a bigger window
 │   ├── affinity.go         CPU-slot → logical-CPU map
-│   ├── gpu_cuda.go         binds the CUDA library and drives it
-│   ├── gpu_cuda_windows.go   embeds the .dll, finds symbols with LoadLibrary
-│   ├── gpu_cuda_linux.go     embeds the .so, finds symbols with dlopen
+│   ├── gpu_backend.go      binds the CUDA and HIP libraries and drives them
+│   ├── gpu_backend_windows.go embeds the .dlls, finds symbols with LoadLibrary
+│   ├── gpu_backend_linux.go   embeds the .sos, finds symbols with dlopen
 │   ├── gpu_other.go        the no-GPU build: macOS, and Linux off amd64
+│   ├── gpu_sensors.go      which telemetry library to ask about which card
+│   ├── rocmsmi.go          AMD temperature, power, fan, clocks
 │   ├── gpu_worker.go       the GPU mining worker
 │   ├── gpu_tune.go         measures the suffix kernel's block count
 │   ├── gpu_bench.go        --bench for the GPU
@@ -2115,8 +2219,10 @@ derostorm/
 │   ├── build.bat           builds the Windows .dll
 │   ├── buildlib.sh         builds the Linux .so
 │   └── libsais/            upstream libsais, unmodified (Apache-2.0)
-├── gpu/                    the CUDA kernels and their test harnesses
+├── gpu/                    the GPU kernels and their test harnesses
 │   ├── derostorm_gpu.cu    the three kernels and the C API
+│   ├── gpuapi.cuh          the only file that knows CUDA from HIP
+│   ├── buildlib_hip.bat / buildlib_hip.sh  the same kernels, through hipcc
 │   ├── stage1.cuh          the 256-way state machine, thread per hash
 │   ├── desc.cuh            the descriptor suffix sort, block per hash
 │   ├── sa_doubling.cuh     suffix array by prefix doubling, block per hash

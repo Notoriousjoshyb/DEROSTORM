@@ -55,7 +55,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cuda_runtime.h>
+#include "gpuapi.cuh"
 
 #include "stage1.cuh"
 #include "sa_doubling.cuh"
@@ -372,7 +372,7 @@ __global__ __launch_bounds__(BR_BLOCK) void suffix_kernel(
         int32_t* out = saOut + (size_t)h * ASTRO_MAX_TEXT;
 
 #if DESC_PREFETCH_TEXT
-#if DESC_PREFETCH_L2
+#if DESC_PREFETCH_L2 && DSG_HAVE_L2_PREFETCH
         for (int i = (int)threadIdx.x * DESC_PREFETCH_STRIDE; i < n; i += BR_BLOCK * DESC_PREFETCH_STRIDE) {
             asm volatile("prefetch.global.L2 [%0];" :: "l"(text + i));
         }
@@ -474,8 +474,9 @@ extern "C" DSG_API int dsg_device_info(int device, char* buf, int len)
         setErr("cudaGetDeviceProperties", e);
         return DSG_ERR_NO_DEVICE;
     }
-    snprintf(buf, (size_t)len, "%s, %.0f GB, %d SMs",
-             prop.name, prop.totalGlobalMem / 1073741824.0, prop.multiProcessorCount);
+    snprintf(buf, (size_t)len, "%s, %.0f GB, %d %s",
+             prop.name, prop.totalGlobalMem / 1073741824.0,
+             prop.multiProcessorCount, DSG_UNIT_PLURAL);
     return DSG_OK;
 }
 
@@ -514,24 +515,48 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
 
     // Shared memory beyond 48 KB has to be asked for explicitly, and it is a
     // per-function attribute, so this must happen before the first launch.
-    if ((e = cudaFuncSetAttribute(suffix_kernel,
+    //
+    // Only asked for when it is actually needed. At the shipped BR_BLOCK=256
+    // the scratch is under 7 KB and the call is a no-op on NVIDIA -- but AMD's
+    // limit is the 64 KB of LDS a workgroup gets and cannot be raised, so on a
+    // card where the request is meaningless it is also refused. Skipping it
+    // below the 48 KB line keeps both happy and still fails loudly on a
+    // wide-block build that genuinely needs more than a device will give.
+    if (BR_SHARED_BYTES > 48 * 1024 &&
+        (e = cudaFuncSetAttribute((const void*)suffix_kernel,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   BR_SHARED_BYTES)) != cudaSuccess) {
         setErr("shared memory limit", e);
         return DSG_ERR_STATE;
     }
-    if ((e = cudaFuncSetCacheConfig(suffix_kernel,
-                                   cudaFuncCachePreferShared)) != cudaSuccess) {
+    // A hint, not a requirement. NVIDIA honours it; AMD has no configurable
+    // L1/LDS split and answers "not supported", which is not a reason to
+    // refuse to mine, so the AMD build only asks.
+    e = cudaFuncSetCacheConfig((const void*)suffix_kernel, cudaFuncCachePreferShared);
+#if !DSG_HIP
+    if (e != cudaSuccess) {
         setErr("cache config", e);
         return DSG_ERR_STATE;
     }
+#endif
 
     dsg_context* c = (dsg_context*)calloc(1, sizeof(dsg_context));
     if (!c) { snprintf(g_err, sizeof(g_err), "out of host memory"); return DSG_ERR_ALLOC; }
     c->device = device;
     c->sms = prop.multiProcessorCount;
+#if DSG_HIP
+    // gcnArchName is the whole target string, "gfx1100:sramecc-:xnack-" and
+    // the like. Only the gfx part names the architecture, so the feature
+    // suffixes are cut off.
+    char arch[32];
+    snprintf(arch, sizeof(arch), "%s", prop.gcnArchName);
+    for (char* q = arch; *q; q++) if (*q == ':') { *q = 0; break; }
+    snprintf(c->name, sizeof(c->name), "%s (%s, %d CUs)",
+             prop.name, arch, prop.multiProcessorCount);
+#else
     snprintf(c->name, sizeof(c->name), "%s (sm_%d%d, %d SMs)",
              prop.name, prop.major, prop.minor, prop.multiProcessorCount);
+#endif
 
     const size_t perBlock = (size_t)ASTRO_MAX_TEXT * SAD_BYTES_PER_SYMBOL;
     const size_t perChunkHash = (size_t)ASTRO_MAX_TEXT          // text
@@ -656,6 +681,15 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
         if ((e = cudaEventCreateWithFlags(&c->bank[b].drained,
                                           cudaEventDisableTiming)) != cudaSuccess) {
             setErr("cudaEventCreate", e); dsg_free(c); return DSG_ERR_ALLOC;
+        }
+        // Recorded once here, on an empty stream, so `sorted` is never waited
+        // on before it has been recorded at all. CUDA treats that case as no
+        // wait, which is what the first chunk of a run wants; HIP's answer is
+        // less clearly documented, and an already-complete event means the same
+        // thing to both without depending on either. Costs one record per bank,
+        // once.
+        if ((e = cudaEventRecord(c->bank[b].sorted, c->bank[b].stream)) != cudaSuccess) {
+            setErr("cudaEventRecord", e); dsg_free(c); return DSG_ERR_ALLOC;
         }
     }
 
