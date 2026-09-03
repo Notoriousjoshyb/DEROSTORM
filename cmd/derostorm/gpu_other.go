@@ -32,6 +32,9 @@ var errNoGPUHere = errors.New("this build has no GPU support: it needs Windows, 
 // GPUDeviceCount is always zero here.
 func GPUDeviceCount() int { return 0 }
 
+// GPUBackendStatus has one thing to say and it is the same every time.
+func GPUBackendStatus() []string { return []string{errNoGPUHere.Error()} }
+
 // GPUDeviceInfo has nothing to describe.
 func GPUDeviceInfo(device int) string { return "" }
 

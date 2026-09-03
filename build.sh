@@ -41,7 +41,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION=1.7.2
+VERSION=1.7.3
 PKG=./cmd/derostorm
 BOUNDS_PKG=github.com/deroproject/derohe/astrobwt/astrobwtv3
 LDFLAGS="-s -w"
@@ -182,10 +182,11 @@ check_optional_embedded() {
   case "$goos/$goarch" in
     windows/*)   paths="cmd/derostorm/gpulib/windows/derostorm_hip.dll"
                  how="gpu\buildlib_hip.bat, on Windows with the AMD HIP SDK" ;;
-    # Two, because a HIP library names the ROCm runtime it links to by soname
-    # and a rig has one generation installed, not both. Whichever ones are here
-    # get checked; neither is required.
-    linux/amd64) paths="cmd/derostorm/gpulib/linux/libderostorm_hip6.so
+    # One per ROCm generation, because a HIP library names the runtime it links
+    # to by soname and a rig has one generation installed, not three. Whichever
+    # ones are here get checked; none is required.
+    linux/amd64) paths="cmd/derostorm/gpulib/linux/libderostorm_hip7.so
+cmd/derostorm/gpulib/linux/libderostorm_hip6.so
 cmd/derostorm/gpulib/linux/libderostorm_hip5.so"
                  how="gpu/buildlib_hip.sh, on Linux with ROCm" ;;
     *)           return 0 ;;
@@ -236,11 +237,17 @@ if [ "$NATIVE" -eq 1 ]; then
       # The AMD kernels only if this machine can: ROCm is a large install and
       # most build machines have none. Skipping is not a failure -- the miner
       # builds and mines without them, on everything but AMD.
-      if command -v hipcc >/dev/null 2>&1 || [ -x /opt/rocm/bin/hipcc ]; then
+      #
+      # amdclang++ counts as well as hipcc, and has to: ROCm 6 deprecated the
+      # hipcc wrapper and ROCm 7 on Arch ships amdclang++ without it, so a
+      # hipcc-only test skipped the AMD kernels on exactly the machines that
+      # could build the newest ones. This mirrors buildlib_hip.sh's own search.
+      if [ -n "${DSG_HIPCC:-}" ] || [ -x /opt/rocm/bin/amdclang++ ] ||
+         command -v hipcc >/dev/null 2>&1 || [ -x /opt/rocm/bin/hipcc ]; then
         echo "building HIP kernels (Linux)"
         sh gpu/buildlib_hip.sh
       else
-        echo "no hipcc found -- skipping the AMD kernels (this build will have no AMD support)"
+        echo "no HIP compiler found -- skipping the AMD kernels (this build will have no AMD support)"
       fi
       echo "building descriptor suffix sort (Linux)"
       sh native/buildlib.sh

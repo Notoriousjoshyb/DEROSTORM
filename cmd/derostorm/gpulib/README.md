@@ -4,6 +4,7 @@ The miner embeds one GPU library per vendor. NVIDIA's sits beside this
 directory (`derostorm_gpu.dll`, `libderostorm_gpu.so`). AMD's goes in here:
 
     windows/derostorm_hip.dll       built by gpu\buildlib_hip.bat
+    linux/libderostorm_hip7.so      built by gpu/buildlib_hip.sh  (ROCm 7)
     linux/libderostorm_hip6.so      built by gpu/buildlib_hip.sh  (ROCm 6)
     linux/libderostorm_hip5.so      built by gpu/buildlib_hip.sh  (ROCm 5)
 
@@ -12,21 +13,27 @@ All of them come from the same source as the NVIDIA library —
 instead of `nvcc`. `gpu/gpuapi.cuh` is the only file that knows which compiler
 it is talking to.
 
-### Why Linux has two
+### Why Linux has one per ROCm generation
 
-A HIP library links to the ROCm runtime by soname: `libamdhip64.so.6` for
-ROCm 6, `libamdhip64.so.5` for ROCm 5. A rig has one of those installed, not
-both, and no single build satisfies each — a `.so.5` library will not load on a
-ROCm 6 rig and the reverse is equally true.
+A HIP library links to the ROCm runtime by soname: `libamdhip64.so.7` for
+ROCm 7, `.so.6` for ROCm 6, `.so.5` for ROCm 5. A rig has one of those
+installed, not three, and no single build satisfies each — a `.so.5` library
+will not load on a ROCm 6 rig and the reverse is equally true.
 
-So both are built, `gpu_backend_linux.go` carries both names, and `dlopen`
-decides: whichever one the rig can resolve is the one that runs. ROCm 6 is tried
-first, because it is the current line and the only one that can target RDNA 4.
+So one is built per generation and `dlopen` decides: whichever one the rig can
+resolve is the one that runs. The highest number is tried first, because that is
+the current line and the newest cards need it.
 
 `buildlib_hip.sh` names its output after the runtime it actually linked
 against, read back out of the finished ELF. Building on a machine with only one
-ROCm produces one of the two, which is a perfectly good library for every rig on
+ROCm produces one of them, which is a perfectly good library for every rig on
 that generation.
+
+`gpu_backend_linux.go` reads the list out of this directory rather than spelling
+the names out, and that is not tidiness. Until 1.7.3 it named `hip6` and `hip5`
+in Go, so a ROCm 7 rig — Arch ships only `libamdhip64.so.7` — resolved neither
+and got the same silence as a machine with no AMD card. ROCm 8 will need a
+build here and nothing else.
 
 Windows has one file because Windows has only ever had the ROCm 6 line —
 `amdhip64_6.dll`, which ships inside the Adrenalin driver.
@@ -55,16 +62,18 @@ gpu\buildlib_hip.bat         # Windows -> gpulib\windows\derostorm_hip.dll
 Each script copies its result into place itself. Then build the miner as usual
 (`./build.sh` or `.\build.ps1`); it picks the library up from here.
 
-On Linux, ROCm 6 from AMD's own repository is the one to have — it is the
-current runtime and the only toolchain that can target RDNA 4. ROCm 5 is three
-packages from Ubuntu 24.04's universe if that is all you can get:
+On Linux, ROCm 7 is the current runtime — Arch carries it in `extra`, and AMD's
+own repository has it for the distributions it supports. ROCm 6 is the same
+story a generation back and also targets RDNA 4. ROCm 5 is three packages from
+Ubuntu 24.04's universe if that is all you can get:
 
 ```
 apt-get install hipcc libamdhip64-dev rocm-device-libs-17
 ```
 
-`DSG_HIPCC` picks the compiler when a machine has both, which is how the
-shipped pair is built.
+`DSG_HIPCC` picks the compiler when a machine has more than one, which is how
+the shipped set is built. Some ROCm 7 packagings ship `amdclang++` and no
+`hipcc` at all; the script looks for both.
 
 The script offers each `gfx` target to the compiler before using it and builds
 only the ones it accepts, so an older ROCm produces a narrower library rather
@@ -122,8 +131,11 @@ What to report if something goes wrong:
 
 - **"no kernel image is available for execution"** — the card's `gfx` target is
   not in the build. `rocminfo | grep gfx` says which it is.
-- **No devices at all, with an AMD card present** — either this directory had no
-  library when the miner was built, or the HIP runtime is not installed.
+- **No devices at all, with an AMD card present** — the build had no library
+  for this rig's ROCm generation, or the HIP runtime is not installed. From
+  1.7.3 `--gpu=all` says which: the error carries what each backend reported,
+  and an unresolved `libamdhip64.so.N` names the generation that is missing.
+  `ls /opt/rocm/lib/libamdhip64.so.*` says which one the rig has.
 - **A wrong hash** — the interesting one. `gpu/gpuapi.cuh` has a
   `DSG_BYTE_PERM_FALLBACK` switch (build with `-DDSG_BYTE_PERM_FALLBACK=1`) that
   replaces the one intrinsic whose AMD semantics were taken on trust with a slow

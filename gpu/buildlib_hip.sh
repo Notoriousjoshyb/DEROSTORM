@@ -9,8 +9,11 @@
 # Needs ROCm. It does not need an AMD card: the compiler targets whatever
 # architectures it is asked for, not the machine it runs on.
 #
-#   ROCm 6, from AMD's own repository (repo.radeon.com), gives amdclang++ and
-#   can target RDNA 4. This is the one to have.
+#   ROCm 7 is the current line -- Arch's `extra` carries it, and AMD's own
+#   repository (repo.radeon.com) has it for the distributions it supports. It
+#   gives amdclang++ and no hipcc at all on some packagings.
+#
+#   ROCm 6, also from repo.radeon.com, gives amdclang++ and can target RDNA 4.
 #
 #   ROCm 5, which on Ubuntu 24.04 is three packages from universe --
 #   `apt-get install hipcc libamdhip64-dev rocm-device-libs-17` -- gives hipcc
@@ -18,17 +21,22 @@
 #
 # # Why the output is named after the runtime
 #
-# A HIP library links to the ROCm runtime by soname: libamdhip64.so.6 for
-# ROCm 6, .so.5 for ROCm 5. A mining rig has one of those installed, not both,
-# and no single build satisfies each -- a .so.5 library will not load on a
-# ROCm 6 rig and the reverse is equally true.
+# A HIP library links to the ROCm runtime by soname: libamdhip64.so.7 for
+# ROCm 7, .so.6 for ROCm 6, .so.5 for ROCm 5. A mining rig has one of those
+# installed, not three, and no single build satisfies each -- a .so.5 library
+# will not load on a ROCm 6 rig and the reverse is equally true.
 #
 # So the library is named for the runtime it actually ended up linked against,
 # read back out of the finished ELF rather than assumed from the compiler.
-# cmd/derostorm/gpu_backend_linux.go carries both names and lets dlopen pick:
-# whichever one the rig can resolve is the one that runs. Building on a machine
-# with only one ROCm produces one of them, which is a perfectly good library
-# for every rig on that generation.
+# cmd/derostorm/gpu_backend_linux.go then scans the directory and tries the
+# highest major first: whichever one the rig can resolve is the one that runs.
+# Building on a machine with only one ROCm produces one of them, which is a
+# perfectly good library for every rig on that generation.
+#
+# The scan is newer than the naming, and the gap between them is a shipped bug:
+# 1.7.2 spelled hip6 and hip5 out in Go, so ROCm 7 rigs got a build that named
+# its output correctly and a miner that never looked for it. Nothing here needs
+# changing for ROCm 8 -- only a machine that has it.
 #
 # Run from the repository root:  gpu/buildlib_hip.sh
 set -e
@@ -81,6 +89,30 @@ fi
 ROCMOPT=""
 if [ -d "$ROCM_PATH/lib/llvm" ]; then
     ROCMOPT="--rocm-path=$ROCM_PATH"
+fi
+
+# And the HIP headers from that same ROCm, ahead of the system ones.
+#
+# --rocm-path alone is not enough. clang adds the ROCm headers with -idirafter,
+# which puts them AFTER /usr/include -- so on a machine that also has Ubuntu's
+# libamdhip64-dev, every HIP build picks up ROCm 5.7's hip_runtime.h no matter
+# which compiler ran. That machine is this one: the ROCm 5 packages are here to
+# build the hip5 library.
+#
+# It was invisible until ROCm 7, because clang 19 still defined the
+# __AMDGCN_WAVEFRONT_SIZE the 5.7 header reads and the build merely produced a
+# library from the wrong headers. clang 22 dropped the macro, so the same
+# mismatch became:
+#
+#   /usr/include/hip/amd_detail/amd_hip_runtime.h:86:
+#       error: use of undeclared identifier '__AMDGCN_WAVEFRONT_SIZE'
+#
+# -isystem goes ahead of the system directories, which is the ordering wanted.
+# Skipped when ROCM_PATH is /usr -- that is the ROCm 5 build, where those same
+# headers are the right ones, and -isystem /usr/include reorders the C++
+# standard library underneath itself.
+if [ "$ROCM_PATH" != "/usr" ] && [ -f "$ROCM_PATH/include/hip/hip_runtime.h" ]; then
+    ROCMOPT="$ROCMOPT -isystem $ROCM_PATH/include"
 fi
 
 # ---------------------------------------------------------------------------
@@ -184,6 +216,36 @@ if [ -z "$MAJOR" ]; then
     echo "cannot tell which ROCm runtime $TMPLIB links to" >&2
     rm -f "$TMPLIB"
     exit 1
+fi
+
+# The ROCm the compiler came from is also baked into the library as a RUNPATH,
+# by clang's HIP toolchain, and that is a build-machine path in a file meant for
+# other people's rigs.
+#
+# Usually it is harmless and even right: a ROCm installed the ordinary way puts
+# the compiler under /opt/rocm, so the RUNPATH is /opt/rocm/lib, which is the
+# symlink every rig has. It is wrong the moment the toolchain lives anywhere
+# else -- _local/rocm7.sh unpacks one into a staging tree, and the library came
+# out asking for /opt/rocm7/root/opt/rocm-7.2.4/lib.
+#
+# A path that does not exist on the rig is skipped and the loader falls through
+# to ldconfig, so such a library still works. It is normalised anyway, because
+# "works because the wrong path happens to be absent" is not a property to ship
+# on purpose, and because the same file then comes out of any build machine.
+#
+# patchelf is one small package (`apt-get install patchelf`) and is only needed
+# when the toolchain is somewhere unusual, so its absence is a warning and not
+# an error -- the library is functional either way.
+RUNPATH=$(readelf -d "$TMPLIB" 2>/dev/null |
+          sed -n 's/.*R\(UN\)\?PATH.*\[\(.*\)\]/\2/p' | head -1)
+if [ -n "$RUNPATH" ] && [ "$RUNPATH" != "/opt/rocm/lib" ]; then
+    if command -v patchelf >/dev/null 2>&1; then
+        patchelf --set-rpath /opt/rocm/lib "$TMPLIB"
+        echo "runpath: $RUNPATH -> /opt/rocm/lib"
+    else
+        echo "warning: this library asks for $RUNPATH, which is this build"
+        echo "         machine's path. install patchelf to normalise it."
+    fi
 fi
 
 OUT="cmd/derostorm/gpulib/linux/libderostorm_hip${MAJOR}.so"

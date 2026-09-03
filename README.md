@@ -16,6 +16,12 @@ setup.
 > memory to run a batch, so **no hashrate figure anywhere in this file is an AMD
 > figure** and nobody has watched an AMD card mine for a minute, let alone a day.
 >
+> **On Linux, use 1.7.3 or later.** 1.7.1 and 1.7.2 look for a ROCm 6 or ROCm 5
+> library and nothing else, so a rig on ROCm 7 — which has only
+> `libamdhip64.so.7` — finds no AMD device and says so as if no card were there.
+> 1.7.3 carries a ROCm 7 library and picks whichever generation the rig can
+> actually load.
+>
 > If you have an RX 5000, 6000, 7000 or 9000, please
 > [open an issue](https://github.com/Notoriousjoshyb/DEROSTORM/issues) —
 > whether it works or not. Wrong hashes, a card that is not detected, a launch
@@ -547,11 +553,19 @@ Two things about AMD are worth knowing before filing a bug:
   devices — the same thing, to the miner, as a machine with no AMD card.
   `cmd/derostorm/gpulib/README.md` says how to put them in.
 
-- **Linux carries two AMD libraries.** A HIP library names the ROCm runtime it
-  links to by soname, and a rig has one generation installed, not both, so the
-  binary holds a ROCm 6 build and a ROCm 5 build and `dlopen` picks whichever
-  the rig can resolve. Only the ROCm 6 one covers RDNA 4. Windows has one,
-  because Windows has only ever had the ROCm 6 line.
+- **Linux carries one AMD library per ROCm generation.** A HIP library names
+  the ROCm runtime it links to by soname, and a rig has one generation
+  installed, not three, so the binary holds a ROCm 7, ROCm 6 and ROCm 5 build
+  and `dlopen` picks whichever the rig can resolve, highest first. ROCm 6 and up
+  cover RDNA 4. Windows has one, because Windows has only ever had the ROCm 6
+  line.
+
+  ROCm 7 joined the set in **1.7.3**. Before it, the try-list was two names
+  written into `gpu_backend_linux.go`, so a ROCm-7-only rig — Arch ships only
+  `libamdhip64.so.7` — resolved neither and reported no AMD devices. The list is
+  read out of the embedded directory now, so the next generation is a build and
+  not a code change. If a card still does not appear, `derostorm --gpu=all` now
+  says what each backend reported rather than only "no GPU found".
 
 At run time AMD needs the HIP runtime: on Windows that ships inside the
 Adrenalin driver, and on Linux it means ROCm (`libamdhip64`) installed.
@@ -669,7 +683,7 @@ and, to add AMD support, optionally:
 | Target | Optional |
 | --- | --- |
 | `windows/amd64` | `gpulib\windows\derostorm_hip.dll` |
-| `linux/amd64` | `gpulib/linux/libderostorm_hip.so` |
+| `linux/amd64` | `gpulib/linux/libderostorm_hip<N>.so`, one per ROCm generation |
 
 So building for macOS needs no GPU, no CUDA and no libraries: `./build.sh` on a
 Mac produces a working CPU miner from a clean clone. `build.sh` checks only what
@@ -688,7 +702,7 @@ native\build.bat         # suffix sort   -> cmd\derostorm\derostorm_sa.dll
 native/buildlib.sh       # suffix sort   -> cmd\derostorm\libderostorm_sa.so    (run under Linux)
 
 gpu\buildlib_hip.bat     # HIP kernels   -> cmd\derostorm\gpulib\windows\derostorm_hip.dll
-gpu/buildlib_hip.sh      # HIP kernels   -> cmd/derostorm/gpulib/linux/libderostorm_hip.so  (run under Linux)
+gpu/buildlib_hip.sh      # HIP kernels   -> cmd/derostorm/gpulib/linux/libderostorm_hip<N>.so  (run under Linux)
 ```
 
 The two HIP scripts are the optional pair. `-Native` runs them when it finds a

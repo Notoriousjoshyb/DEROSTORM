@@ -53,7 +53,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$Version  = '1.7.2'
+$Version  = '1.7.3'
 $Pkg      = './cmd/derostorm'
 $BoundsPkg = 'github.com/deroproject/derohe/astrobwt/astrobwtv3'
 $LdFlags  = '-s -w'
@@ -167,14 +167,26 @@ $Embedded = @(
 # and a worse one than for the NVIDIA libraries: nobody on this side has an AMD
 # card to notice with.
 #
-# Linux has two, and that is not a mistake. A HIP library links to the ROCm
-# runtime by soname -- libamdhip64.so.6 or .so.5 -- and a rig has one of those
-# installed, not both. No single build satisfies each, so both are built and
-# dlopen picks at run time. Only ROCm 6 can target RDNA 4, so a machine with
-# only the ROCm 5 toolchain produces a library that is correct and narrower.
-# Windows has one because Windows has only ever had the ROCm 6 line.
+# Linux has one per ROCm generation, and that is not a mistake. A HIP library
+# links to the ROCm runtime by soname -- libamdhip64.so.7, .so.6 or .so.5 --
+# and a rig has one of those installed, not three. No single build satisfies
+# each, so one is built per generation and dlopen picks at run time. Only ROCm 6
+# and up can target RDNA 4, so a machine with only the ROCm 5 toolchain produces
+# a library that is correct and narrower. Windows has one because Windows has
+# only ever had the ROCm 6 line.
+#
+# ROCm 7 is on the list because leaving it off is what shipped 1.7.2 with no AMD
+# support on a ROCm 7 rig: buildlib_hip.sh already names its output after the
+# runtime it linked against, so such a build produced libderostorm_hip7.so and
+# nothing looked for it.
+#
+# Each generation needs its own toolchain and one machine rarely has more than
+# one, so -Native runs buildlib_hip.sh once per script -- for whichever ROCm is
+# default there. DSG_HIPCC is how a machine with several builds the rest; see
+# gpu/buildlib_hip.sh.
 $Optional = @(
     @{ Path = 'cmd\derostorm\gpulib\windows\derostorm_hip.dll';  Script = 'gpu\buildlib_hip.bat'; What = 'HIP kernels (Windows)'; Needs = 'the AMD HIP SDK for Windows'; Sources = $GpuSources }
+    @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip7.so'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux, ROCm 7)'; Wsl = $true; Needs = 'ROCm 7'; Sources = $GpuSources }
     @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip6.so'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux, ROCm 6)'; Wsl = $true; Needs = 'ROCm 6'; Sources = $GpuSources }
     @{ Path = 'cmd\derostorm\gpulib\linux\libderostorm_hip5.so'; Script = 'gpu/buildlib_hip.sh';  What = 'HIP kernels (Linux, ROCm 5)'; Wsl = $true; Needs = 'ROCm 5'; Sources = $GpuSources }
 )
@@ -205,16 +217,23 @@ if ($Native) {
     # The AMD kernels, only where a toolchain to build them exists. A machine
     # without ROCm is the normal case and not a failure: the miner builds and
     # mines without them on everything except AMD, so this says so and moves on.
-    foreach ($lib in $Optional) {
+    # Grouped by script: the three Linux entries are three possible outputs of
+    # one build, not three builds. Running it once per entry built the same
+    # library three times over.
+    foreach ($group in $Optional | Group-Object Script) {
+        $lib = $group.Group[0]
         $have = if ($lib.Wsl) {
-            & wsl.exe -- bash -lc 'command -v hipcc >/dev/null 2>&1 || [ -x /opt/rocm/bin/hipcc ]' 2>$null
+            # amdclang++ as well as hipcc: ROCm 6 deprecated the hipcc wrapper
+            # and ROCm 7 on Arch ships without it, so a hipcc-only test skips
+            # the AMD kernels on the machines that build the newest ones.
+            & wsl.exe -- bash -lc '[ -n "$DSG_HIPCC" ] || [ -x /opt/rocm/bin/amdclang++ ] || command -v hipcc >/dev/null 2>&1 || [ -x /opt/rocm/bin/hipcc ]' 2>$null
             $LASTEXITCODE -eq 0
         } else {
             $hip = if ($env:HIP_PATH) { $env:HIP_PATH } else { 'C:\Program Files\AMD\ROCm\6.2' }
             Test-Path (Join-Path $hip 'bin\hipcc.exe')
         }
         if (-not $have) {
-            Write-Host "skipping $($lib.What) - no $($lib.Needs) here" -ForegroundColor DarkYellow
+            Write-Host "skipping $($lib.What) - no HIP compiler here" -ForegroundColor DarkYellow
             continue
         }
         Write-Host "building $($lib.What)" -ForegroundColor Cyan

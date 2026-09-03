@@ -14,6 +14,10 @@ package main
 
 import (
 	"embed"
+	"path"
+	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/ebitengine/purego"
 )
@@ -39,24 +43,84 @@ var (
 		kind: "NVIDIA CUDA", libFS: gpuLibFS,
 		files: []string{"libderostorm_gpu.so"},
 	}
-	// Two AMD libraries, not one, and this is the reason.
+	// However many AMD libraries the build has, newest ROCm first.
 	//
-	// A HIP library links against the ROCm runtime by soname:
-	// libamdhip64.so.6 for ROCm 6 and libamdhip64.so.5 for ROCm 5. A rig has
-	// one of those installed, not both, and there is no build that satisfies
-	// each -- so both are built and dlopen decides. ROCm 6 is tried first
-	// because it is the current line and the only one that can target RDNA 4.
+	// A HIP library links against the ROCm runtime by soname --
+	// libamdhip64.so.7 for ROCm 7, .so.6 for ROCm 6, .so.5 for ROCm 5. A rig
+	// has one of those installed, not three, and there is no build that
+	// satisfies each -- so one is built per generation and dlopen decides.
 	//
-	// Neither is required. A binary built with neither has no AMD support and
-	// says so by reporting no devices.
+	// The list is read out of the embedded directory rather than written here,
+	// and that is the point. It used to be two names spelled out in this file,
+	// which is how ROCm 7 rigs ended up with no AMD support in 1.7.2: the
+	// library naming already followed the runtime (gpu/buildlib_hip.sh reads
+	// the soname back out of the finished ELF), so a ROCm 7 build produced
+	// libderostorm_hip7.so that nothing ever looked for. Scanning means the
+	// next generation needs a build and not a code change.
+	//
+	// Neither ordering nor presence is required. A binary built with none has
+	// no AMD support and says so by reporting no devices.
 	hipBackend = &gpuBackend{
 		kind: "AMD HIP", libFS: hipLibFS,
-		files: []string{
-			"gpulib/linux/libderostorm_hip6.so",
-			"gpulib/linux/libderostorm_hip5.so",
-		},
+		files: hipLibFiles(),
 	}
 )
+
+// hipLibDir is the directory embedded above, and the one hipLibFiles scans.
+const hipLibDir = "gpulib/linux"
+
+// hipLibFiles lists the embedded AMD libraries, highest ROCm major first.
+//
+// Highest first because that is the generation a new rig has and the only one
+// that can target the newest cards -- the older builds are the fallback, in the
+// order a machine is likely to be on. Anything in the directory that is not a
+// libderostorm_hip<major>.so is ignored, which is what keeps the README beside
+// them from being tried as a library.
+func hipLibFiles() []string {
+	ents, err := hipLibFS.ReadDir(hipLibDir)
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(ents))
+	for _, e := range ents {
+		if !e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	return hipLibOrder(names)
+}
+
+// hipLibOrder is the naming rule on its own, split out from the directory read
+// so a test can state it without a build that has the libraries in it.
+func hipLibOrder(names []string) []string {
+	type lib struct {
+		major int
+		name  string
+	}
+	var libs []lib
+	for _, n := range names {
+		rest, ok := strings.CutPrefix(n, "libderostorm_hip")
+		if !ok {
+			continue
+		}
+		rest, ok = strings.CutSuffix(rest, ".so")
+		if !ok {
+			continue
+		}
+		major, err := strconv.Atoi(rest)
+		if err != nil {
+			continue
+		}
+		libs = append(libs, lib{major, n})
+	}
+	sort.Slice(libs, func(i, j int) bool { return libs[i].major > libs[j].major })
+
+	files := make([]string, 0, len(libs))
+	for _, l := range libs {
+		files = append(files, path.Join(hipLibDir, l.name))
+	}
+	return files
+}
 
 // nvmlLibName is the NVIDIA Management Library, which sensors.go asks for GPU
 // temperature and power. The versioned soname is deliberate: plain

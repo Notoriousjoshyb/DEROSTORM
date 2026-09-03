@@ -31,7 +31,7 @@ import (
 	"github.com/docopt/docopt-go"
 )
 
-const version = "1.7.2"
+const version = "1.7.3"
 
 const usage = `DeroStorm ` + version + `
 AstroBWTv3 miner for DERO. Mines on the CPU, and on NVIDIA or AMD GPUs as well
@@ -712,7 +712,13 @@ func parseGPUList(v string) ([]int, error) {
 	case "all":
 		n := GPUDeviceCount()
 		if n == 0 {
-			return nil, fmt.Errorf("no GPU found")
+			// With what each backend had to say about it. "no GPU found" on
+			// its own reads as "no card", and the commonest cause on AMD is
+			// not that: it is a rig whose ROCm generation has no matching
+			// library in the build, which dlopen reports as a missing
+			// libamdhip64.so.N. See GPUBackendStatus.
+			return nil, fmt.Errorf("no GPU found (%s)",
+				strings.Join(GPUBackendStatus(), "; "))
 		}
 		// Trim to what the nonce tagging can address. "all" used to mean
 		// literally every device the driver reported, which on a rig with more

@@ -83,16 +83,22 @@ type gpuBackend struct {
 	libFS embed.FS
 
 	// Candidate libraries inside libFS, best first. Usually one; the AMD side
-	// carries two, because a HIP library links against the ROCm runtime by
-	// soname -- libamdhip64.so.6 or .so.5 -- and a rig has one of those, not
-	// both. There is no build that satisfies each, so both are built and the
-	// first that loads wins. Trying is the only way to ask: the question is
-	// whether this machine's dynamic loader can resolve the file, and that is
-	// what dlopen answers.
+	// on Linux carries one per ROCm generation, because a HIP library links
+	// against the ROCm runtime by soname -- libamdhip64.so.7, .so.6 or .so.5 --
+	// and a rig has one of those, not three. There is no build that satisfies
+	// each, so one is built per generation and the first that loads wins.
+	// Trying is the only way to ask: the question is whether this machine's
+	// dynamic loader can resolve the file, and that is what dlopen answers.
 	files []string
 
 	once sync.Once
 	err  error
+
+	// Which candidate actually bound, base name only. Kept for the status
+	// line: on the AMD side the answer names the ROCm generation this rig is
+	// on, which is the one thing a report about a card that will not appear
+	// has to say.
+	loaded string
 
 	// The library's entry points, as declared in gpu/derostorm_gpu.h. A C int
 	// is int32 on both platforms; dsg_context* is opaque and never dereferenced
@@ -228,7 +234,7 @@ func (b *gpuBackend) load() error {
 				b.err = fmt.Errorf("cannot load the %s library: %w", b.kind, err)
 				continue
 			}
-			sym, b.err = s, nil
+			sym, b.err, b.loaded = s, nil, path.Base(file)
 			break
 		}
 		if sym == nil {
@@ -339,6 +345,31 @@ func gpuDeviceList() []gpuDevice {
 // GPUDeviceCount is how many devices the drivers report, across both vendors.
 // Zero is not an error: it just means this machine mines on the CPU.
 func GPUDeviceCount() int { return len(gpuDeviceList()) }
+
+// GPUBackendStatus is one line per vendor saying what happened when its library
+// was loaded, for the message a user sees when they asked for a GPU and got
+// none.
+//
+// Without it the only symptom of a rig whose ROCm generation has no matching
+// build is "no GPU found", which reads as "no card" and is indistinguishable
+// from one. The load error names the runtime soname the dynamic loader could
+// not resolve, which is the whole diagnosis.
+func GPUBackendStatus() []string {
+	gpuDeviceList() // every backend has been asked by the time this returns
+	out := make([]string, 0, len(gpuBackends))
+	for _, b := range gpuBackends {
+		switch {
+		case errors.Is(b.err, errLibAbsent):
+			out = append(out, b.kind+": no library in this build")
+		case b.err != nil:
+			out = append(out, b.kind+": "+b.err.Error())
+		default:
+			out = append(out, fmt.Sprintf("%s: %d device(s) via %s",
+				b.kind, b.deviceCount(), b.loaded))
+		}
+	}
+	return out
+}
 
 // GPUKind names the hardware this build supports, for messages to the user.
 // When cards are actually present it names what they are, so a rig with one

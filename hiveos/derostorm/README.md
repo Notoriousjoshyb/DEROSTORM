@@ -27,7 +27,7 @@ If you want pool mining, this is the wrong miner.
 |---|---|
 | Miner | Custom |
 | Miner name | `derostorm` |
-| Installation URL | wherever you host `derostorm-1.7.2.tar.gz` |
+| Installation URL | wherever you host `derostorm-1.7.3.tar.gz` |
 | Wallet and worker template | your DERO address, e.g. `dero1qy...` |
 | Pool URL | your derod getwork address, e.g. `10.0.0.5:10100` |
 | Extra config arguments | anything below |
@@ -120,8 +120,9 @@ mode on the cards.
   CUDA 13 dropped Pascal and Volta.
 - **AMD:** ROCm installed, for `libamdhip64`, and an RDNA card — RX 5000, 6000,
   7000 or 9000. Vega, Polaris and the MI cards are wave64 and are not supported.
-  The kernels are in the binary from 1.7.1 on, for both ROCm 5 and ROCm 6; the
-  right one is picked at load.
+  The kernels are in the binary from 1.7.1 on, for ROCm 5, ROCm 6 and — from
+  1.7.3 — ROCm 7; the right one is picked at load. **A ROCm 7 rig needs 1.7.3**:
+  before it, only ROCm 6 and ROCm 5 were looked for, so the card was not found.
 - `jq`, which HiveOS already has.
 - CPU-only mining works with no GPU present: add `--gpu=off`.
 
