@@ -31,6 +31,19 @@ func naiveSA(t []byte) []int32 {
 	return sa
 }
 
+func TestBlockDiffCountsEveryChangedByte(t *testing.T) {
+	var a, b [blockSize]byte
+	for differing := range blockSize + 1 {
+		clear(b[:])
+		for i := range differing {
+			b[i] = 1
+		}
+		if got := blockDiff(a[:], b[:]); got != differing {
+			t.Fatalf("%d changed bytes: got %d", differing, got)
+		}
+	}
+}
+
 func TestSuffixArrayMatchesNaive(t *testing.T) {
 	var cases [][]byte
 	for n := 1; n <= 80; n++ {
@@ -44,6 +57,19 @@ func TestSuffixArrayMatchesNaive(t *testing.T) {
 		ones[i] = 0xff
 	}
 	cases = append(cases, ones)
+	// Exact one- through four-block inputs exercise every local run path.
+	runBase := make([]byte, blockSize)
+	rand.Read(runBase)
+	for blocks := 1; blocks <= 4; blocks++ {
+		input := make([]byte, blocks*blockSize)
+		for g := range blocks {
+			copy(input[g*blockSize:], runBase)
+			if g != 0 {
+				input[g*blockSize+g*37] ^= byte(0x40 + g)
+			}
+		}
+		cases = append(cases, input)
+	}
 	// A long near-copy text, which is what stage 1 actually produces.
 	long := make([]byte, 256*8+17)
 	for i := range long {

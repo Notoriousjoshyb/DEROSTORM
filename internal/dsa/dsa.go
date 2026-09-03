@@ -9,6 +9,7 @@ package dsa
 
 import (
 	"encoding/binary"
+	"math/bits"
 	"sync"
 )
 
@@ -33,8 +34,8 @@ type desc struct {
 	packed uint32
 }
 
-func off(d desc) uint32 { return d.packed >> lenBits }
-func dlen(d desc) uint32 { return d.packed & lenMask }
+func off(d desc) uint32       { return d.packed >> lenBits }
+func dlen(d desc) uint32      { return d.packed & lenMask }
 func pack(o, n uint32) uint32 { return (o << lenBits) | n }
 
 type scratch struct {
@@ -238,6 +239,74 @@ func columnStepKeys(order, keys, tmp []uint32, blocks uint32) {
 func emitRun(t []byte, n int, first, blocks uint32, s *scratch, arenaLen, descLen *int) bool {
 	descRoom := s.dcap
 	base := first * blockSize
+	// One- and two-block runs occur in about 44% of real stage-1 texts' runs.
+	// Keep their complete ordering state in locals instead of initializing the
+	// runMax-sized order/key scratch and two blockSize-sized column masks.
+	if blocks == 1 {
+		if *descLen+blockSize > descRoom {
+			return false
+		}
+		key := key32(t, n, int(base)+blockSize-1)
+		keyShift := uint32(8 * (keyBytes - 1))
+		for rel := blockSize - 1; rel >= 0; rel-- {
+			s.desc[*descLen] = desc{key: key, packed: pack(uint32(*arenaLen), 1)}
+			s.arena[*arenaLen] = base + uint32(rel)
+			*arenaLen++
+			*descLen++
+			if rel != 0 {
+				key = uint32(t[int(base)+rel-1])<<keyShift | key>>8
+			}
+		}
+		return true
+	}
+	// Stable prepend ordering for two blocks is one bit: unequal new bytes
+	// decide the order, while equal bytes preserve the preceding order.
+	if blocks == 2 {
+		if *descLen+2*blockSize > descRoom {
+			return false
+		}
+		b0, b1 := base, base+blockSize
+		key0 := key32(t, n, int(b0)+blockSize-1)
+		key1 := key32(t, n, int(b1)+blockSize-1)
+		swapped := suffixLess(t, n, b1+blockSize-1, b0+blockSize-1)
+		keyShift := uint32(8 * (keyBytes - 1))
+
+		for rel := blockSize - 1; rel >= 0; rel-- {
+			first, second := b0, b1
+			firstKey, secondKey := key0, key1
+			if swapped {
+				first, second = second, first
+				firstKey, secondKey = secondKey, firstKey
+			}
+			arenaOff := uint32(*arenaLen)
+			s.arena[*arenaLen] = first + uint32(rel)
+			*arenaLen++
+			s.arena[*arenaLen] = second + uint32(rel)
+			*arenaLen++
+
+			length := uint32(1)
+			if firstKey == secondKey {
+				length = 2
+			}
+			s.desc[*descLen] = desc{key: firstKey, packed: pack(arenaOff, length)}
+			*descLen++
+			if firstKey != secondKey {
+				s.desc[*descLen] = desc{key: secondKey, packed: pack(arenaOff+1, 1)}
+				*descLen++
+			}
+
+			if rel != 0 {
+				col := rel - 1
+				c0, c1 := t[int(b0)+col], t[int(b1)+col]
+				key0 = uint32(c0)<<keyShift | key0>>8
+				key1 = uint32(c1)<<keyShift | key1>>8
+				if c0 != c1 {
+					swapped = c1 < c0
+				}
+			}
+		}
+		return true
+	}
 	order := s.order
 
 	for i := uint32(0); i < blocks; i++ {
@@ -366,10 +435,14 @@ func sortDesc(a, b []desc, count int) []desc {
 
 func blockDiff(a, b []byte) int {
 	diff := 0
-	for i := 0; i < blockSize && diff <= runSplit; i++ {
-		if a[i] != b[i] {
-			diff++
-		}
+	for i := 0; i < blockSize; i += 8 {
+		x := binary.LittleEndian.Uint64(a[i:]) ^ binary.LittleEndian.Uint64(b[i:])
+		// Collapse each non-zero byte to its low bit without allowing shifts to
+		// cross byte boundaries, then count all eight comparisons at once.
+		x = (x | x>>4) & 0x0f0f0f0f0f0f0f0f
+		x = (x | x>>2) & 0x0303030303030303
+		x = (x | x>>1) & 0x0101010101010101
+		diff += bits.OnesCount64(x)
 	}
 	return diff
 }
@@ -410,11 +483,21 @@ retry:
 		g += length
 	}
 
-	for p := fullBlocks * blockSize; p < n; p++ {
-		s.desc[descLen] = desc{key: key32(text, n, p), packed: pack(uint32(arenaLen), 1)}
-		s.arena[arenaLen] = uint32(p)
-		descLen++
-		arenaLen++
+	// Walk the tail backwards so each descriptor key reuses the preceding
+	// key's trailing bytes instead of loading the same bytes again.
+	tail := fullBlocks * blockSize
+	if tail < n {
+		key := key32(text, n, n-1)
+		keyShift := uint32(8 * (keyBytes - 1))
+		for p := n - 1; p >= tail; p-- {
+			s.desc[descLen] = desc{key: key, packed: pack(uint32(arenaLen), 1)}
+			s.arena[arenaLen] = uint32(p)
+			descLen++
+			arenaLen++
+			if p != tail {
+				key = uint32(text[p-1])<<keyShift | key>>8
+			}
+		}
 	}
 	if arenaLen != n {
 		return false
@@ -429,8 +512,19 @@ retry:
 		if i+1 == descLen || ds[i+1].key != d0.key {
 			src := s.arena[off(d0):]
 			ln := int(dlen(d0))
-			for z := 0; z < ln; z++ {
-				sa[out+z] = int32(src[z])
+			// Short lengths are unpredictable and dominate unique-key groups.
+			// Four straight stores avoid one loop branch per group. Overwrites
+			// are repaired by the next group; arena slack and the output guard
+			// keep both sides in bounds.
+			if ln <= 4 && out+4 <= n {
+				sa[out] = int32(src[0])
+				sa[out+1] = int32(src[1])
+				sa[out+2] = int32(src[2])
+				sa[out+3] = int32(src[3])
+			} else {
+				for z := 0; z < ln; z++ {
+					sa[out+z] = int32(src[z])
+				}
 			}
 			out += ln
 			i++

@@ -22,6 +22,17 @@ setup.
 > 1.7.3 carries a ROCm 7 library and picks whichever generation the rig can
 > actually load.
 >
+> **1.8.1 improves the CPU suffix sort on every target.** Tail descriptor keys
+> now reuse the bytes already loaded by the preceding key. Cross-compiled
+> macOS and Linux/arm64 builds also compare run boundaries eight bytes at a
+> time and remove the unpredictable loop from the common singleton scatter.
+> On the portable descriptor benchmark this is **2,432 → 2,762 sorts/s,
+> +13.6%**; the native Windows/Linux sort is **42,109 → 43,107 texts/s,
+> +2.4%**. Linux/amd64 under WSL measured **32.20 → 32.87 KH/s** at 15 threads.
+> Windows whole-hash throughput was flat inside run noise, and no Mac hardware
+> was available, so neither is given a made-up end-to-end gain. Run
+> `derostorm --bench --gpu=off` to measure the release on your CPU.
+>
 > **1.8.0 builds on AMD-only rigs.** The CUDA library is optional like the HIP
 > one, so a machine with no NVIDIA toolkit builds a miner with no NVIDIA
 > support instead of failing. `0` threads runs the GPU alone, for a separate

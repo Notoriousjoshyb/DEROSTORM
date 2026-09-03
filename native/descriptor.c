@@ -739,6 +739,7 @@ static inline void emit_ord_plus(uint32_t* dst, const uint32_t* order,
 #endif
 }
 
+
 static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
                     uint32_t blocks, Scratch* s,
                     size_t* arena_len, size_t* desc_len)
@@ -1171,7 +1172,9 @@ retry:
         g += len;
     }
 
-    /* The tail past the last whole block: one descriptor per suffix. */
+    /* The tail past the last whole block: one descriptor per suffix. Emitting
+     * backwards lets each key inherit its trailing bytes from the preceding
+     * key, replacing one unaligned four-byte load per suffix with one byte. */
     if (desc_len + (n - (size_t)full_blocks * DSA_BLOCK) > s->desc_cap) {
         const size_t full = desc_bound(n);
         if (s->desc_cap >= full) return -3;
@@ -1179,11 +1182,18 @@ retry:
         if (!s) return -2;
         goto retry;
     }
-    for (size_t p = (size_t)full_blocks * DSA_BLOCK; p < n; p++) {
-        Desc* d = &s->desc[desc_len++];
-        d->key = key32(t, n, p);
-        d->packed = desc_pack((uint32_t)arena_len, 1);
-        s->arena[arena_len++] = (uint32_t)p;
+    const size_t tail = (size_t)full_blocks * DSA_BLOCK;
+    if (tail < n) {
+        uint32_t key = key32(t, n, n - 1);
+        const uint32_t key_shift = 8u * (DSA_KEY_BYTES - 1);
+        for (size_t p = n; p-- > tail;) {
+            Desc* d = &s->desc[desc_len++];
+            d->key = key;
+            d->packed = desc_pack((uint32_t)arena_len, 1);
+            s->arena[arena_len++] = (uint32_t)p;
+            if (p != tail)
+                key = ((uint32_t)t[p - 1] << key_shift) | (key >> 8);
+        }
     }
 
     if (arena_len != n) return -4;   /* every suffix exactly once */
