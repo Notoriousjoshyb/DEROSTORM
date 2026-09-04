@@ -107,7 +107,7 @@ func (e *gpuMismatch) Error() string {
 
 // RunGPUMiner drives one CUDA device until stop or quit is closed. batch is the
 // nonces per launch; 0 lets the library size it from free VRAM. blocks pins the
-// suffix kernel's resident block count; 0 measures it (see gpu_tune.go).
+// suffix kernel's grid-block count; 0 uses the runtime ceiling (see gpu_tune.go).
 func (e *Engine) RunGPUMiner(device, batch, blocks int, stop <-chan struct{}) {
 	if device < 0 || device >= maxGPUs {
 		e.post(LogError, "gpu", "device %d is out of range", device)
@@ -118,7 +118,6 @@ func (e *Engine) RunGPUMiner(device, batch, blocks int, stop <-chan struct{}) {
 	// be allowed to migrate between them mid-batch.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-
 
 	g, err := NewGPUContext(device, batch, blocks)
 	if err != nil {

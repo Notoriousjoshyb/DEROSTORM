@@ -31,6 +31,7 @@ type ScratchData struct {
 	data     [MAX_LENGTH + 64]uint8
 	sa       [MAX_LENGTH]int32
 	sa_bytes *[(MAX_LENGTH) * 4]uint8
+	digest   [32]byte
 	// lms and satmp belong to the built-in suffix sort and to nothing else:
 	// lms is the LMS-substring index side buffer, bounded by len(text) across
 	// the whole recursion stack, and satmp is the freq/bucket workspace, sized

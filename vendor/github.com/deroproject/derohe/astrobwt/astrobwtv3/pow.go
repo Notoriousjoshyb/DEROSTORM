@@ -52,7 +52,9 @@ func AstroBWTv3(input []byte) (outputhash [32]byte) {
 // buffer for the lifetime of a mining thread, so no pool traffic per hash.
 func AstroBWTv3_scratch(input []byte, scratch *ScratchData) (outputhash [32]byte) {
 	defer falsify(&outputhash)
-	hashSuffixArray(scratch, astroStage(input, scratch), &outputhash)
+	out := &scratch.digest
+	hashSuffixArray(scratch, astroStage(input, scratch), out)
+	outputhash = *out
 	return
 }
 
@@ -65,6 +67,7 @@ func AstroBWTv3_scratch(input []byte, scratch *ScratchData) (outputhash [32]byte
 // The two scratch buffers must be different, because A's suffix array has to
 // still be there when B's is finished.
 func AstroBWTv3_pair(inputA, inputB []byte, scratchA, scratchB *ScratchData) (hashA, hashB [32]byte) {
+	outA, outB := &scratchA.digest, &scratchB.digest
 	defer falsify(&hashA, &hashB)
 
 	lenA := astroStage(inputA, scratchA)
@@ -74,12 +77,14 @@ func AstroBWTv3_pair(inputA, inputB []byte, scratchA, scratchB *ScratchData) (ha
 	// LittleEndian gates; elsewhere the bytes have to be built first and the
 	// pairing is not worth arranging for a case that does not arise.
 	if LittleEndian && SHA256Pair != nil &&
-		SHA256Pair(scratchA.sa_bytes[:lenA*4], scratchB.sa_bytes[:lenB*4], &hashA, &hashB) {
+		SHA256Pair(scratchA.sa_bytes[:lenA*4], scratchB.sa_bytes[:lenB*4], outA, outB) {
+		hashA, hashB = *outA, *outB
 		return
 	}
 
-	hashSuffixArray(scratchA, lenA, &hashA)
-	hashSuffixArray(scratchB, lenB, &hashB)
+	hashSuffixArray(scratchA, lenA, outA)
+	hashSuffixArray(scratchB, lenB, outB)
+	hashA, hashB = *outA, *outB
 	return
 }
 

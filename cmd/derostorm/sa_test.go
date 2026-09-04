@@ -150,6 +150,43 @@ func TestDecliningSorterFallsBackToTheBuiltIn(t *testing.T) {
 	}
 }
 
+// The result digest lives in ScratchData so it can be passed to the native
+// bridge without escaping. A panic must still falsify the named return values,
+// not merely the scratch copy: an all-zero returned hash can satisfy easy test
+// targets and would undo the safety property of the recover path.
+func TestHashPanicFalsifiesReturnedDigests(t *testing.T) {
+	sa := astrobwtv3.Pool.Get().(*astrobwtv3.ScratchData)
+	sb := astrobwtv3.Pool.Get().(*astrobwtv3.ScratchData)
+	defer astrobwtv3.Pool.Put(sa)
+	defer astrobwtv3.Pool.Put(sb)
+
+	marker := "deliberate suffix-sort panic"
+	panicSorter := func([]byte, []int32) bool { panic(marker) }
+	work := make([]byte, block.MINIBLOCK_SIZE)
+	work[0] = 1
+	zero := [32]byte{}
+	before := astrobwtv3.RecoveredPanics
+
+	withSuffixSort(t, panicSorter, func() {
+		if got := astrobwtv3.AstroBWTv3_scratch(work, sa); got == zero {
+			t.Fatal("single hash returned an unfalsified zero digest after panic")
+		}
+	})
+	withSuffixSort(t, panicSorter, func() {
+		gotA, gotB := astrobwtv3.AstroBWTv3_pair(work, work, sa, sb)
+		if gotA == zero || gotB == zero {
+			t.Fatal("paired hash returned an unfalsified zero digest after panic")
+		}
+	})
+
+	if got := astrobwtv3.RecoveredPanics - before; got != 2 {
+		t.Fatalf("recovered panic count = %d, want 2", got)
+	}
+	if astrobwtv3.LastPanic != marker {
+		t.Fatalf("last recovered panic = %v, want %q", astrobwtv3.LastPanic, marker)
+	}
+}
+
 // The paired hash must give exactly the hashes the single one gives.
 //
 // The pairing only reschedules the final SHA-256, so if this ever disagrees the

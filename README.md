@@ -22,6 +22,78 @@ setup.
 > 1.7.3 carries a ROCm 7 library and picks whichever generation the rig can
 > actually load.
 >
+> **1.8.5 is +6.2% on the RTX 5080 and removes the Windows CPU hot-path
+> allocations.** The descriptor MSD histogram now packs two sixteen-bit
+> counters per word, so an 11-bit digit fits in 4.1 KB of shared memory. The
+> column walk then reuses the radix scratch whose lifetime has ended, reducing
+> the kernel's static shared memory from 10,064 to 1,168 bytes.
+>
+> On Blackwell, a five-block launch bound trades some local traffic for another
+> resident block and wins in the complete miner. The library asks the runtime
+> for the occupancy of the image actually loaded and allocates one queued row
+> beyond it: 504 grid blocks on the 84-SM 5080. Against the 199.88 KH/s starting
+> benchmark, the best production-shaped run is **212.27 KH/s**. Going farther
+> to 672 blocks gives the gain back.
+>
+> On Windows, the native suffix-sort and paired-SHA entry points now use the
+> platform ABI directly instead of a general-purpose FFI bridge, while the
+> result buffers live in each mining thread's existing scratch allocation. The
+> paired-hash hot loop is **0 heap allocations per hash**; interleaved whole-hash A/B
+> runs averaged **39,344 -> 39,830 H/s (+1.2%)** at 15 threads. The GPU output
+> still matches the CPU exactly over all 512 test vectors.
+>
+> It also repairs the two GPU test tools. `gpu\hash_parallel_test.cu` and
+> `gpu\prof\prof.cu` were building their suffix kernel without the shipped
+> occupancy bound, so both were measuring a 64-register four-block image while
+> the miner runs a 48-register five-block one; the harness reads 181,963 H/s
+> with the bound against 141,423 without it. And `gpu\desc_test.exe` -- the
+> correctness check for the GPU suffix sort -- had been failing every launch
+> with `invalid argument` since the MSD bucket table landed, because it raised
+> the shared-memory opt-in to less than it then asked for. No kernel changed;
+> what changed is that measuring one now means something.
+>
+> **1.8.3 is +6.3%.** Four changes, and the first one is on both devices.
+>
+> *Carry "every block of this run has the same key" as a state* instead of
+> asking the constant-column mask about it one column at a time. It is stronger
+> than the mask -- keys can agree without three constant columns proving it --
+> and while it holds, the run's keys are copies of one register, so a constant
+> column slides the register and touches neither the key array nor the text per
+> block. About 70% of columns are constant.
+>
+> Then three on the GPU. *The step that places every suffix stops binary
+> searching for the descriptor that owns it* and reads a painted byte map
+> instead, in shared memory that step already had spare. *The column walk's
+> order table holds a block index in sixteen bits*, not a text position in
+> thirty-two, which halves the shared traffic of the hottest loop in the kernel.
+> And *the block-wide scan takes four elements a thread*, so the scan over
+> ~19,700 descriptors is 19 passes instead of 77.
+>
+> Interleaved `--bench --gpu=0`, three rounds each: **CPU 36,750 → 39,920 H/s
+> (+8.6%)**, **RTX 5080 188,896 → 198,832 H/s (+5.3%)**, **together 224.5 →
+> 238.7 KH/s (+6.3%)**. The CPU sort alone is **50,566 → 57,138 texts/s at 15
+> threads (+13.0%)**.
+>
+> Against 1.8.1, two releases back and one session earlier, that is **CPU
+> +15.3%, GPU +9.9%, together +10.9%** on this machine.
+
+> **1.8.2 is +4.5% on this machine, on both devices.** Two changes, one each
+> side.
+>
+> The CPU arena stores a block index rather than a text position, which lets
+> columns that share an order share one arena slice instead of writing their own
+> — about 70% of columns, and all 256 of a one-block run. The GPU sorts its
+> descriptors most significant digit first, in one pass, where it used to sort
+> them least significant digit first in four: MSD needs no stability, and
+> stability was what the whole per-tile ranking machinery existed for.
+>
+> Interleaved `--bench --gpu=0`, two rounds each, on a Ryzen 7 9800X3D and an
+> RTX 5080: **CPU 34,627 → 36,964 H/s (+6.7%)**, **RTX 5080 180,862 → 187,929
+> H/s (+3.9%)**, **together 215.3 → 224.9 KH/s (+4.5%)**. The CPU sort alone
+> is **46,965 → 51,627 texts/s at 15 threads (+9.9%)** on `native\sabench.exe`.
+> Both changes are checked against libsais and against the CPU over the same 512
+> real texts; the suffix array is unique, so identical output is the proof.
+
 > **1.8.1 improves the CPU suffix sort on every target.** Tail descriptor keys
 > now reuse the bytes already loaded by the preceding key. Cross-compiled
 > macOS and Linux/arm64 builds also compare run boundaries eight bytes at a
@@ -411,8 +483,9 @@ derostorm [options]
   --gpu=<list>                      Mine on these devices: 0, 0,1, all or
                                     off. NVIDIA cards first, then AMD.
   --gpu-batch=<n>                   Nonces per GPU launch.
-  --gpu-blocks=<n>                  Resident blocks in the GPU suffix kernel.
-                                    Default: measure it while mining.
+  --gpu-blocks=<n>                  Grid blocks in the GPU suffix kernel.
+                                    Default: runtime occupancy ceiling
+                                    (504 on an RTX 5080).
   --theme=<name>                    cyber, default, copper, aurora, ember
                                     or mono.
   --tui                             Force the full-screen console. Already the
@@ -809,13 +882,17 @@ otherwise. Everything in this section except the *Before* columns and the
 *What does not help* experiments comes from `derostorm --bench`, which needs no
 node and no wallet, so you can reproduce it on your own machine in a minute.
 
-Headline, all of it at once, re-measured on 2026-09-02 at 1.6.3:
+Headline, all of it at once. Each of the 1.8.x columns is one half of an
+interleaved pair -- two binaries built from one tree and run alternately in one
+session -- so 1.8.1 against 1.8.2 and 1.8.2 against 1.8.3 are each a fair
+comparison, taken on different days. The older columns were taken on their own
+days and are not comparable to them or to one another.
 
-| | H/s at 1.6.3 | at 1.6.2 | at 1.5.8 | at 1.5.6 | at 1.5.5 | at 1.5.0 | at 1.4.0 |
+| | H/s at 1.8.3 | at 1.8.2 | at 1.8.1 | at 1.6.3 | at 1.6.2 | at 1.5.8 | at 1.5.6 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| CPU, 15 threads | 32,850 – 33,010 | 32,470 | 33,000 | 32,940 | 32,640 | 34,293 | 33,700 – 34,500 |
-| RTX 5080, `--bench` | **178,290 – 179,500** | 164,950 | 142,400 | 128,000 | 119,463 | 100,640 | 91,870 |
-| together, `--bench` sum | **211,310 – 212,350** | 197,800 | 175,400 | 160,900 | | | |
+| CPU, 15 threads | **39,877 – 39,920** | 35,623 – 36,750 | 34,442 – 34,627 | 32,850 – 33,010 | 32,470 | 33,000 | 32,940 |
+| RTX 5080, `--bench` | **197,663 – 198,832** | 187,143 – 188,896 | 170,712 – 180,862 | 178,290 – 179,500 | 164,950 | 142,400 | 128,000 |
+| together, `--bench` sum | **237,540 – 238,740** | 223,640 – 224,520 | 205,340 – 215,300 | 211,310 – 212,350 | 197,800 | 175,400 | 160,900 |
 | together, real mining path | not measured | 202,870 | not measured | 159,000 – 159,500 | 153,900 – 154,700 | 130,400 – 131,800 | 124,700 – 125,400 |
 
 **Reference machine: Ryzen 7 9800X3D (8C/16T, DDR5-6000 CL30) + RTX 5080.**
@@ -893,9 +970,9 @@ useful half: the walk's imbalance, the kernel's shared-memory footprint, the
 descriptor counter's atomic and the scatter's binary search were each measured
 and each is not what limits this kernel.
 
-1.5.2 onwards no longer sweeps the block count — it sits at four blocks per SM
-(336 on a 5080), so no figure here is diluted by a tuning sweep in the first
-twelve seconds.
+From 1.5.2 through 1.8.3 the miner no longer swept the block count — it sat at
+four blocks per SM (336 on a 5080), so no figure in those rows is diluted by a
+tuning sweep in the first twelve seconds.
 
 The CPU row is 1.3k lower than at 1.5.0 and the CPU did not get slower: nothing
 on that path has changed since the descriptor compare at 1.5.3, which measured
@@ -1206,7 +1283,83 @@ re-run since — it is upstream code and does not move. *Now* is `--bench` on
 1.5.5. The intermediate figures this table used to carry (1,875 H/s and
 18.03 KH/s) were the state before the descriptor suffix sort landed.
 
-Three changes.
+**"Every block has the same key" is a state, not a question.** *(1.8.3, +13.0%
+on the whole sort at 15 threads.)*
+
+The walk keeps one key per block of the run, slides them all one byte per
+column, and splits them into groups. There was already a table saying which
+columns could skip the split -- where the next three columns are constant across
+the run, every block has the same three bytes there, so there is exactly one
+group and the scan can only prove it the long way. 91% of columns are like that.
+
+Carrying the answer instead of looking it up is stronger and cheaper. Stronger,
+because keys can agree without three constant columns proving it: the scan
+itself answers the question every time it runs, so its answer is kept rather
+than thrown away. Cheaper, because of what the state licenses:
+
+- While the keys are all equal, `blocks` of them in memory are copies of one
+  register. A constant column prepends the same byte to all of them, so it
+  slides *the register* and leaves the array alone.
+- A constant column needs **one** text read, not one per block. The slide read
+  `t[order[x]+col]` for every block on every column, constant or not, and about
+  70% of columns are constant. That read was the largest single item in the
+  walk.
+
+The state can only change at a column that is not constant, and that is the one
+column that has to read per block anyway. So the common column costs a shift, an
+OR and one byte of text.
+
+`native\sabench.exe`, three interleaved rounds:
+
+|  | 1 thread | 15 threads |
+|---|---:|---:|
+| the constant-column table | 6,229 | 50,566 |
+| the state | **6,754 (+8.4%)** | **57,138 (+13.0%)** |
+
+In the miner, five interleaved rounds at fifteen threads: **36,774 → 39,868
+H/s, +8.4%.** The same change on the GPU is in the GPU section; it was measured
+there first.
+
+**The arena holds a block index, and columns that share an order share a
+slice.** *(1.8.2, +9.9% on the whole sort at 15 threads.)*
+
+The arena is where the column walk parks its answer: for every (run, column) it
+writes that column's blocks, in suffix order, and a descriptor points at the
+slice. That is one word per suffix — 277 KB a text — written once by the walk
+and read once by the merge, and until 1.8.2 it held a text *position*.
+
+Positions were the problem. Every position carries its column in the low eight
+bits, so consecutive columns of the same run write different numbers even when
+the order is identical, and it is identical most of the time: about 70% of
+columns are constant across their run, and a constant column prepends the same
+byte to every suffix and cannot reorder anything.
+
+A block index does not carry the column. `position = block * 256 + column`, the
+column is the same for every position in one descriptor, and the descriptor has
+a spare byte for it — a three-byte key leaves the top eight bits of `Desc.key`
+unused, and the radix sort already only orders the low twenty-four. So the
+column moves into the descriptor, the arena narrows to `uint16`, and a column
+whose order has not moved points at the slice the previous column wrote.
+
+Both halves matter and the second is much the larger:
+
+|  | 1 thread | 15 threads |
+|---|---:|---:|
+| positions, one slice per column | 5,657 | 46,965 |
+| block indices, one slice per column | 5,742 (+1.5%) | 46,495 (-1.0%) |
+| block indices, slices shared | **6,260 (+10.7%)** | **51,627 (+9.9%)** |
+
+`native\sabench.exe`, three interleaved rounds each. Narrowing the arena on its
+own is a wash — it halves the bytes but pays a shift and an OR per position, and
+at fifteen threads that is a loss. It is worth having because it is what makes
+sharing possible, and sharing is what removes the writes: a one-block run goes
+from 256 arena slices to one.
+
+In the miner, at fifteen threads, three interleaved rounds: **34,627 → 36,964
+H/s, +6.7%.** The whole hash is not the sort, so the sort's 9.9% arrives as
+6.7%.
+
+Three changes before it.
 
 **A suffix sort that knows how the text was made.** This is the large one, and
 it replaces libsais on the fast path rather than tuning it.
@@ -1350,6 +1503,138 @@ to carry was the gain from the packed-key change described below; the rest came
 from the block-count sweep, the stage-1 work after it, the byte-load session at
 1.4.0, the merge described next, the batch pipeline and coalesced scatter at
 1.5.4 and 1.5.5, and the overlapped stage 1 at 1.5.6.
+
+**"Every block has the same key" is a state, not a question.** *(1.8.3, +1.5%.)*
+
+The column walk is 53% of the kernel once the sort stops being. Its per-column
+work is: write the arena slice if the order moved, split the run's keys into
+groups and emit a descriptor per group, then slide every key one byte.
+
+Two things collapse if the walk knows that all of the run's keys are equal. The
+split is skipped -- one group, one descriptor, no scan of `len` keys out of
+shared memory. And the slide is one register: equal keys stay equal when the
+same byte goes on the front of all of them, which is exactly what a constant
+column does, and 70% of columns are constant.
+
+It arrived in two steps and the second is the one that pays. The first read the
+answer off the constant-column mask -- three constant columns in a row mean
+every block has the same three bytes there -- which is one AND of the mask
+against itself shifted by one and two, computed once per task: **188,229 →
+191,141, +1.5%**. Carrying the state instead subsumes that, because the mask
+implies the state and not the other way round, and adds the slide: **188,334 →
+193,800** on one set and 190,862 → 192,931 on another, on a day the card would
+not hold still. The isolated kernel is steadier and agrees: 165,000 arrays a
+second with neither, 168,000 with the mask, 174,500 with the state.
+
+**The step that places every suffix stops searching for who owns it.**
+*(1.8.3, +1.5%.)*
+
+Step 5a walks the sorted descriptors in windows of 256, reads each window into
+shared memory, and then writes every output position the window covers -- about
+1,460 of them. To write position `q` it has to know which descriptor owns it,
+and it found out with a binary search over the window: eight *dependent* shared
+loads, ~70,000 times a hash.
+
+An earlier note here says a coarse index for that search measured null. That was
+true of a kernel whose sort was four radix passes and whose expand phase was a
+fifth of the size it is now. Ablating the search -- taking the first descriptor
+of the window instead of the owning one, which is wrong but timed -- now takes
+the phase from **312M cycles to 204M**, so it is a third of it.
+
+So paint the answer instead. Each descriptor writes its own index into a byte
+per output position it covers, and `q` reads one byte. One write per position
+against eight reads, and no extra shared memory: `s_beg`, `s_aof` and `s_key`
+take 3 KB of the 6.8 KB `BlockRadixScratch`, which is finished with by the time
+step 5a runs, and the map lives in the rest. A window whose span will not fit
+falls back to the search. **191,835 → 194,696.**
+
+**The walk's order table is sixteen bits.** *(1.8.3, +1.4%.)* It is read twice a
+column -- once as an address, `t[ord[x]+col]`, and once as the arena's block
+index, `ord[x]>>8`. A block index gives both: the address is `(ord[x]<<8)+col`,
+which the address unit folds in for free. Half the shared traffic of the hottest
+loop in the kernel, and 2.2 KB of the shared budget the MSD sort's bucket table
+competes for. **194,961 → 197,687.**
+
+**The block-wide scan takes four elements a thread.** *(1.8.3, +0.4%.)* The
+offset scan runs over every descriptor, and the tile was one element per thread,
+so ~19,700 descriptors took 77 passes and each pass costs three
+`__syncthreads()` and a serial walk over the per-warp totals on thread 0. The
+work is one add per element; the barriers are not. Four elements a thread makes
+it 19 passes, and a thread's four are consecutive so its loads and stores are
+one 16-byte access each. **199,542 → 200,297**, and eight elements a thread is
+worse than four (198,521).
+
+**The descriptor sort is one MSD pass, not four LSD ones.** *(1.8.2, +3.9%.)*
+
+The largest single thing in the suffix kernel was the sort. Skipping it
+entirely — a deliberately wrong answer, timed only to find the ceiling — took
+the kernel from **122,000 suffix arrays a second to 180,000**, so it was about a
+third of the wall time. `gpu/blockradix.cuh` had already concluded that only
+*fewer passes* would move it, and had measured every way of getting fewer while
+staying LSD and found each one a loss: eight-bit digits cost a block per SM
+(-12%), and a narrower key pays for the pass with collisions that cost more (see
+`DESC_GBITS` in *What does not help*).
+
+LSD needs four passes because it needs every pass to be **stable** — that is
+what makes the earlier digits survive the later ones — and stability is what the
+per-tile `__match_any_sync` rank, the warp-by-digit matrix, the leader walk and
+the digit cursors are all there for. Those five phases were 17% of the kernel on
+their own.
+
+MSD needs no stability at all. The top digit partitions the descriptors into
+buckets that are already in their final order relative to each other, and what
+happens inside a bucket is that bucket's own business. So: one shared histogram,
+one scan, one scatter, and then the ~19,700 descriptors sit in 1,024 buckets of
+about twenty.
+
+Ordering inside a bucket is where the first attempt went wrong. One thread per
+bucket, insertion sorting twenty elements, measured **123,000 H/s against
+181,000** — worse than the sort it replaced. Twenty elements is nothing, but an
+insertion sort *reads and writes the element it walks past*, and those are
+global memory, so a bucket is ~45 **dependent** round trips and one thread owns
+all of them. Counting instead makes every read independent: one thread per
+descriptor, each asking how many of its bucket-mates come before it and writing
+itself there once. Same answer, no chain — **177,900 H/s**.
+
+The last 5% was shared memory, and it did not show up in the profile at all.
+The profiler runs two blocks per SM, where nothing competes; the miner runs
+four, where the table decides. The kernel already holds 12 KB of static shared
+and 6.8 KB of radix scratch, so a 2,048-bucket table leaves **three** blocks
+resident and a 1,024-bucket one leaves four. A block per SM is worth 13% here
+and the wider digit is worth 3%, so the narrower table wins:
+
+| digit | buckets | shared | at 1 block/SM | at 4 blocks/SM |
+|---|---:|---:|---:|---:|
+| LSD, 4 passes | — | 6.8 KB | 77,907 | 181,736 |
+| 10 bits | 1,024 | 10.9 KB | 88,617 | **188,088** |
+| 11 bits | 2,048 | 15.1 KB | 88,898 | 177,900 |
+| 12 bits | 4,096 | 23.3 KB | 91,288 | 144,780 |
+
+Three interleaved `--bench --gpu=0` rounds each. **A phase table that cannot see
+occupancy will send you the wrong way**: at two blocks per SM the twelve-bit
+digit is the fastest of the four, and at four blocks it is the slowest by 20%.
+`gpu/prof/prof.exe` now takes `DSG_PROF_BLOCKS` for exactly this.
+
+What it gives up is the staged, coalesced scatter, which `blockradix.cuh`
+measures at about 5%. Three passes are worth more than that.
+
+The bucket cap is a guard and not a case. One thread counts a bucket, so a
+pathologically large one is quadratic in a length nothing bounds; past
+`DESC_MSD_MAX` the sort declines and prefix doubling does the hash, exactly as
+it does when a key group needs more boundary words than the scratch holds. Keys
+are three bytes of stage-1 output and 1,024 buckets hold twenty on average, so
+it has not fired on any of the 512 vectors.
+
+**The constant-column table is two registers, not sixty-four bytes.** *(1.8.2,
++0.5%.)* The column walk builds one byte per column saying whether that column
+is the same in every block of the run, then reads it once per column. A 64-byte
+array indexed by a loop variable is *thread-local memory*, which is global
+memory with a per-thread address: `ptxas` reported a 64-byte stack frame, on 256
+threads of 336 blocks. A chunk is exactly 64 columns, so the same table is one
+`uint64`, and the read becomes a shift and an AND. Stack frame 64 → 8 bytes,
+registers unchanged at 64, and the hashrate moved +0.5% — three of four
+interleaved pairs, which is at the edge of what this card can resolve, but the
+`ptxas` line is not ambiguous about what changed.
 
 **The collision scan was a second pass over words the scatter had already
 read.** Step 5a places every position: it walks the sorted descriptors in
@@ -1792,6 +2077,221 @@ buffer nothing touches is never in cache.
 
 ### What does not help
 
+**1.8.5: six more, and two of the tools were lying.**
+
+*Both GPU test harnesses were measuring a kernel the miner does not run.*
+`gpu\hash_parallel_test.cu` and `gpu\prof\prof.cu` declared their suffix
+kernel `__launch_bounds__(BR_BLOCK)` with no occupancy argument, so nvcc gave it
+as many registers as it wanted -- 64, four blocks per SM -- while
+`derostorm_gpu.cu` ships `__launch_bounds__(BR_BLOCK, DSG_SUFFIX_OCC)`, which is
+48 registers and five blocks on Blackwell. Adding the shipped bound to both took
+the harness from **141,423 to 181,963 H/s** and the suffix kernel from 105.1 to
+73.2 ms, which is most of the gap between the harness and the miner. Every A/B
+run on either tool before this was on the wrong image, and register pressure is
+exactly what several of the answers below turn on, so this had to be fixed
+before anything else was believed.
+
+*And `gpu\desc_test.exe` could not run at all.* Its launches ask for
+`DESC_LAUNCH_SHARED`, which is the radix scratch plus the MSD sort's bucket
+table, but its two `cudaFuncSetAttribute` calls raised the dynamic-shared opt-in
+to `BR_SHARED_BYTES` alone. The request was 4.1 KB over the limit and every
+launch returned `invalid argument`, from the MSD bucket table landing until now.
+The correctness test for the GPU suffix sort was reporting a CUDA error instead
+of an answer.
+
+*Counting the seed's ranks over the upper triangle only is not the fix either.*
+1.8.3 measured the counted rank at 17% worse than the insertion sort and blamed
+the comparison count. Half of those comparisons are the same question twice --
+`(i,j)` and `(j,i)` have one answer between them -- so the triangle is the
+counted rank at half the work. On the corrected harness at 336 blocks:
+**73.2 ms insertion sort, 96.0 counted, 95.9 triangle.** Half the comparisons
+and the same time, so the comparison count was never what cost. What costs is
+where the counters live: `len` reaches 45, so they have to be a shared-memory
+array, and the insertion sort keeps its state in registers. Left in as
+`DESC_SEED_RANK=2`.
+
+*Ordering the walk's tasks by run length cannot collect the imbalance.* The
+profiler puts the walk's slowest thread at 1.96x the average and the walk at 52%
+of the kernel, so a quarter of the kernel is lanes waiting. A warp executes the
+union of its lanes, tasks are numbered `run * DESC_CHUNKS + chunk`, and the eight
+runs a warp holds are consecutive in the text -- which says nothing about their
+lengths, and 44% of runs are one or two blocks against a mean of 4.34. Sorting
+runs by length before numbering them puts eight similar runs in each warp, and a
+model of the measured length distribution said it should cut warp-cycles 38.6%.
+It does not. Scattering with an atomic, so runs of one length come out in
+whatever order the atomic serves them, measures **83.2 ms against 73.2**. Made
+stable, with the text order kept inside each length class, it measures 73.1 ms at
+two buckets, 75.2 at three, 75.7 at four, 80.6 at eight and 82.9 at sixty-four --
+two buckets is inside the noise and every finer split is worse. The whole curve
+is the locality it spends, not the divergence it saves: runs that are neighbours
+in the text read neighbouring bytes, and that is worth more than the idle lanes.
+Left in as `DESC_TASK_SORT`, at 0, because the next person will otherwise build
+it again.
+
+*The wide text loads do not want `__ldg` either.* 1.8.3 measured the walk's
+per-block byte through the read-only cache as no change. This is the same
+question for `descLoadBE32` and `descLoadBE64`, which are every seed comparison
+and every merge comparison: **75.9 ms against 73.2**, three rounds each, every
+round the same to a tenth of a millisecond. The read-only path is for data with
+no reuse, and this text is nothing but reuse -- a run's blocks are read again on
+every one of its 64 columns, by four lanes at once. Left in as `DESC_LDG`, at 0.
+
+*The knobs are still where they were, swept a third time on the corrected
+harness.* `DESC_SPLIT` at 96, 128, 192 and 224 against 160; `DESC_CHUNKS` 2;
+`DESC_WIDE_STEP` 128 and 256; `DESC_MERGE_WIDE` 16, 32 and 128;
+`DSG_SUFFIX_OCC` 4 and 6; `DESC_MSD_BITS` 10 and 12. Everything but the two
+known losses -- `DESC_CHUNKS` 2 at 93.5 ms and `DSG_SUFFIX_OCC` 6 at 80.0 --
+landed between 73.1 and 75.9 against a reference that itself moves 73.1 to 74.7
+between runs. `DESC_MSD_BITS` 12 looked like a 1% gain on first pass and
+measured 73.68 against 73.75 over four interleaved rounds, which is nothing.
+
+*On the CPU, the merge's singleton group is 37% of the sort and neither its read
+nor its write is any of it.* `native\sabench.exe` with the group's body removed
+entirely measures **9,157 texts/s against 6,711**. Removing only the arena read
+measures 6,793; removing only the masked store measures 6,669. Taking either one
+away leaves the loop exactly as fast and taking both away is worth a third,
+which is a throughput limit and not a latency one. That is why every other shape
+of the store measures the same: the lane mask from a compare instead of the
+table is 6,685/6,696, and AVX-512's masked store -- one instruction where AVX2's
+`VPMASKMOVD` is microcoded on every AMD part to date -- is 6,836/6,811, at best
+1-2% and needing a second code path and a runtime dispatch to ship. Left in as
+`DSA_MABLATE` and `DSA_MSTYLE`. The 37% is real and unexplained, and it is the
+largest single thing known about the CPU sort that nobody has collected.
+
+**1.8.3: eight more.**
+
+*Counting the seed's ranks instead of insertion sorting them costs 17%.* The
+walk's seed is an insertion sort of the run's blocks by suffix, and its
+comparisons are a chain: the next one depends on how the last came out. That is
+the shape that had just been fixed in the MSD sort's buckets, where counting
+ranks instead -- every block asking how many others sort before it -- turned 45
+dependent global round trips into independent ones and was worth 45%. The same
+change here measured **157,113 against 189,167**. The difference is what a
+comparison costs: a bucket's is one 16-bit register compare, and the seed's is a
+192-byte sweep through global memory that holds most of the register file while
+it runs. Three times as many of those do not overlap, they queue. Left in as
+`DESC_SEED_RANK`, at 0.
+
+*The walk's per-block byte does not want `__ldg`.* One load per block per
+non-constant column, at addresses 256 bytes apart, through the read-only cache
+rather than the ordinary path: **172,500 against 173,000 arrays a second**, no
+change. Not kept.
+
+*Rewriting the arena only when the order actually moves is free.* A column that
+is not constant is not the same thing as a column that reorders -- the byte it
+prepends can differ between blocks and still arrive in the order they were
+already in -- and the insertion sort knows which. Testing that instead of the
+weaker condition is strictly less memory traffic and measured +0.3% on the bench
+and nothing on the isolated kernel. Kept, as `DESC_DIRTY_MOVED`, because less
+work is less work; recorded here because it is not a gain anyone should expect
+to see.
+
+*And the knobs are all still where they were, swept twice.* Early in the
+session, `DESC_WIDE_STEP` at 128 and 256 against 192 and `DESC_MERGE_WIDE` at 32
+against 64 measured 187,943 / 189,041 / 188,593 against 188,551 -- inside ±0.3%.
+Swept again at the end, after four changes had moved the balance a long way:
+`DESC_CHUNKS` 2 and 8 measure **163,789 and 174,503** against 199,021, five
+blocks per SM measures 196,994, `DESC_MERGE_WIDE` 32 and 16 measure 199,189 and
+**190,821**, the merge's eight-byte opening step measures 199,305, and the text
+prefetch at strides 32 and 128 measures 199,654 and 199,345 against 199,181.
+Everything except the two clear losses is inside the noise this card produces in
+one afternoon, and nothing moved.
+
+*Two of those are worth stating as findings rather than as sweeps.*
+`DESC_CHUNKS` was expected to want *fewer* pieces once the per-column work got
+cheaper -- fewer pieces means fewer seed sorts, and the seed is the walk's
+remaining lump. It does not: two pieces is 18% slower, so the 128-column
+dependency chain still costs more than the seeds it saves. And the descriptor
+counter's shared atomic was expected to start hurting once the uniform state
+made the lanes converge on it, thirty-two at a time on one address. It does
+not -- it was measured aggregated earlier in the session at -1.3%, and nothing
+about the walk's cost is that atomic.
+
+**1.8.2: six more, on both devices.** All GPU figures are three or four
+interleaved `--bench --gpu=0` rounds at 336 blocks against a baseline built from
+the same tree in the same session; CPU figures are `native\sabench.exe`, three
+rounds.
+
+*Sorting the walk's tasks by run length costs 6.5%.* The column walk is one
+thread per (run, chunk), and the run's length picks which of three paths that
+thread takes — length 1, length 2, or the general one. In run order a warp holds
+eight consecutive runs of unrelated lengths, so it executes all three paths one
+after another and then waits on its longest lane; Nsight had already put the
+walk at 16.1 active threads of 32. Grouping the runs by length first is cheap (a
+counting sort over 64 buckets) and nothing depends on the order, because
+descriptors are radix sorted afterwards with every tie broken by comparison. It
+measured **168,359 against 180,100**, and `prof.exe` says why: the walk's
+thread imbalance went from 1.93x to **3.88x**. Concentrating the long runs in
+one warp does not shorten the block, it lengthens the warp that now holds all of
+them, and the seven warps that finish early have nothing to do. *Divergence was
+spreading the work, not wasting it.*
+
+*And warp-aggregating the descriptor counter does not rescue it.* The obvious
+follow-up: if the lanes converge, the shared atomic they all take converges too,
+and thirty-two lanes on one address serialise thirty-two ways. Aggregating it
+made the pair **worse** — 165,255 — and aggregation alone reproduced the -1.1%
+this file already recorded, at **177,729 against 180,100**. So the atomic is not
+what the walk costs either, converged or not.
+
+*Five-block occupancy did not help the 1.8.3 kernel.* `__launch_bounds__` pinned
+four blocks per SM, and Nsight reported `Block Limit Registers` 4 against
+`Block Limit Shared Mem` 5, which read like a block left on the table. Asking
+for five or six made `ptxas` spill: **176,827 and 176,495 against 181,615**.
+Asking for three cost 13% (157,643), which is the number that made the MSD sort's
+shared-memory budget worth taking seriously. The packed histogram and scratch
+lifetime changes in 1.8.5 changed that resource trade, so it was measured again;
+five blocks now win on Blackwell.
+
+*An eighteen-bit sort key costs 4.9%.* The radix sort orders 24 bits in four
+passes of six; eighteen would be three. The key stays three bytes for grouping,
+the sort orders the top eighteen, and a key group is then the descriptors
+agreeing on eighteen bits rather than twenty-four — so the merge's comparisons
+start at byte two instead of byte three. The pass is real and the profile shows
+it: the radix machinery went **36.4% → 27.3%** of the kernel. It is spent twice
+over on collisions, and not where expected — the merge itself barely moved (2.0%
+→ 2.3%) while *finding* the groups went **7.2% → 15.4%**, because the per-thread
+merge of small groups is paid per group and there are ten times as many of them.
+**172,787 against 181,733.** Opening those comparisons with a narrow eight-byte
+step first, which should pay when the third byte usually decides, changed
+nothing: **172,331**. The knob is `DESC_GBITS`, left in at 24.
+
+*Re-sweeping `DESC_CHUNKS` and `BR_BITS` confirms both.* Everything around them
+has moved since they were last set, so they were swept again: `DESC_CHUNKS` 2
+measures **168,984** against 4's 180,725, and `BR_BITS` 5 and 7 measure
+**179,245** and **172,959**. Both are still where they were.
+
+*On the CPU, AVX-512 buys nothing here — and an AVX-512 build is not safe.*
+`VPMASKMOVD`, the AVX2 masked store the merge issues once per key group, is
+microcoded on AMD; the AVX-512 form takes its mask in a `k` register and is one
+uop. Swapping it measured **5,788 against 5,794 texts/s** — a tie. Building the
+*whole* library at `/arch:AVX512` measured +3.2% before the compact arena landed
+and a tie after it, because what it was speeding up was the arena stores the
+arena reuse then stopped making. And it is not free to try: an `/arch:AVX512`
+build of `derostorm_sa.dll` **fails its own `dsa_probe` self-test** on the
+ten-byte string, so the miner refuses it and falls back to the portable Go sort.
+The `__AVX512BW__` 64-byte comparison sweep in `suffix_less_from` has never been
+exercised by a shipped build; if you want an AVX-512 library, that is where to
+look first.
+
+*And the same arena change in the portable Go sort is worth nothing.* The C sort
+gains 10.7% on one thread from holding block indices and sharing arena slices,
+so the obvious next step was `internal/dsa`, which is what macOS and arm64 run.
+It measured **2,945 sorts/s against 2,987** — flat, and on the wrong side of
+flat. The reason is arithmetic: the Go sort is 2.1x slower than the C one
+overall, so the arena writes it removes are half the share of the total they
+were, and the shift, the OR and the bounds check that every position now pays to
+put the column back are the rest of it. Not kept, and not kept on a machine that
+cannot measure the target either: the change is neutral here and unmeasured on
+Apple silicon, which is not a reason to ship it.
+
+*And the merge's masked store is still the right shape.* With the arena narrowed
+the trade might have moved, so all four were measured again: masked
+(**6,254**), one unconditional 32-byte store advancing by `len`
+(**6,312**, and 6,392 without the guard that keeps the last groups inside `sa`),
+sixteen bytes for `len <= 4` (**5,595**), and the exact width by `switch`
+(**4,235**). The wide store leads by 0.9% on one thread and ties at fifteen,
+which is where mining runs. Not kept.
+
 **1.6.3: four things that are not what limits the GPU kernel.** Each had a
 mechanism behind it and each measured flat or negative, three interleaved
 `--bench --gpu=0` rounds at 336 blocks. They are here because knowing what does
@@ -2183,9 +2683,9 @@ consensus-critical path. Left alone.
   mining has the getwork socket, the console, and the thread that feeds a GPU.
   Ask for the last one with `--mining-threads=16` if the machine is doing
   nothing else.
-- **Four GPU suffix blocks per SM** is the default (336 on a 5080). Pin it with
-  `--gpu-blocks=<n>` if you would rather a different count; past that the curve
-  is flat or down.
+- **The GPU grid comes from the loaded kernel's runtime occupancy.** The default
+  is one queued row beyond physical occupancy: 504 blocks on the RTX 5080 used
+  here. Pin it with `--gpu-blocks=<n>` if you would rather use a smaller count.
 - Threads are pinned to CPUs automatically, spreading over physical cores before
   using SMT siblings.
 - **Faster RAM is not worth buying for this.** See *What does not help* above:
@@ -2224,7 +2724,14 @@ total. The difference is the processor.
 ### Profiling the GPU further
 
 `gpu/prof/` gives phase shares without any special permission — see the GPU
-section above. What it cannot give is *why* a phase is slow, and for that Nsight
+section above.
+
+**Set `DSG_PROF_BLOCKS=504` before you believe a share on this RTX 5080.** The
+harness runs two blocks per SM by default, while the production Blackwell image
+keeps five resident rows and one queued row. A phase's cost changes with that
+occupancy, so the block count the number is for is part of the number.
+
+What `gpu/prof/` cannot give is *why* a phase is slow, and for that Nsight
 Compute needs a driver permission:
 
 > NVIDIA Control Panel → Desktop → Developer settings → *Manage GPU Performance

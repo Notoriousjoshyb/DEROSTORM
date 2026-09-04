@@ -20,7 +20,7 @@
 // gpu/hash_parallel_test.exe check each against 512 real CPU vectors.
 //
 // The batch is processed in chunks. The suffix kernel's blocks loop over a
-// chunk and reuse their scratch, so resident blocks and batch size are
+// chunk and reuse their scratch, so grid blocks and batch size are
 // independent; what scales with the chunk is the text and suffix array held
 // between kernels, at ~346 KB per hash.
 //
@@ -36,8 +36,8 @@
 // card's VRAM actually holds) read 82.5 KH/s against 76.4 at 8,192. batch=0
 // now sizes from free VRAM, capped at DSG_BATCH_MAX so a 80 GB card does not
 // sit on a two-second job. An explicit --gpu-batch still wins if you want the
-// old latency. The suffix-block peak on that 5080 was 336, not 1252; pin
-// --gpu-blocks=336 there. Job latency is about 350 ms at 30,016 hashes.
+// old latency. The current Blackwell kernel peaks at 504 grid blocks on that
+// 5080. Job latency is about 350 ms at 30,016 hashes.
 //
 // Overlapping two chunks on two streams was tried, to hide the stage-1 and SHA
 // kernels behind the suffix kernel. It does not pay. Those two are 3% of GPU
@@ -46,8 +46,8 @@
 // 6.88 for one chunk of the same total size. The suffix kernels cannot overlap
 // each other anyway -- they share one scratch pool indexed by blockIdx.
 //
-// The resident block count is tuned at run time rather than fixed here. It used
-// to be capped at half a block per SM, on the reasoning that a bandwidth-bound
+// The grid-block ceiling is derived from runtime occupancy rather than fixed
+// here. It used to be capped at half a block per SM, on the reasoning that a bandwidth-bound
 // kernel gains nothing from more. Measured on an RTX 5080 that cap cost 16%:
 // 6151 H/s at 42 blocks against 7084 at 84 and 7114 at 336. The right number is
 // a property of the card, so dsg_set_blocks lets the caller sweep for it.
@@ -171,8 +171,8 @@ struct dsg_slot {
 struct dsg_context {
     int   device;
     int   batch;        // nonces per dsg_search call
-    int   blocks;       // resident suffix-kernel blocks, in use now
-    int   maxBlocks;    // resident suffix-kernel blocks allocated for
+    int   blocks;       // suffix-kernel grid blocks, in use now
+    int   maxBlocks;    // suffix-kernel grid blocks allocated for
     int   chunk;        // hashes in flight between kernels, per slot
     int   sms;          // SMs on the device, for the caller's tuning sweep
     char  name[256];
@@ -345,12 +345,19 @@ __global__ void stage1_kernel(const uint8_t* work, uint32_t nonceBase, int count
 // One atomicAdd per hash, by one thread of the block, against tens of
 // milliseconds of work per hash: the counter is not a bottleneck.
 //
-// __launch_bounds__ pins 4 resident blocks/SM: the kernel runs at 64 regs with
-// no spills (sm_120 ptxas), so 4x256-thread blocks fit the register file and
-// that is where the curve plateaus (336 on an 84-SM card). Deliberately NOT a
-// global -maxrregcount: that would also cap stage1_kernel, which is shared-
-// memory bound and must be free to take the registers it wants.
-__global__ __launch_bounds__(BR_BLOCK, 4) void suffix_kernel(
+// Blackwell trades registers for a fifth resident block: 48 registers and some
+// local traffic beat the 64-register/four-block image by about 4% in the full
+// miner. Older CUDA targets and HIP keep the measured four-block budget. This
+// is deliberately not a global -maxrregcount: stage1_kernel is shared-memory
+// bound and must remain free to take the registers it wants.
+#ifndef DSG_SUFFIX_OCC
+#if !DSG_HIP && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#define DSG_SUFFIX_OCC 5
+#else
+#define DSG_SUFFIX_OCC 4
+#endif
+#endif
+__global__ __launch_bounds__(BR_BLOCK, DSG_SUFFIX_OCC) void suffix_kernel(
         const uint8_t* texts, const int32_t* lens, int count,
         Pool pool, int32_t* saOut, int32_t* nextHash)
 {
@@ -528,10 +535,10 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     // card where the request is meaningless it is also refused. Skipping it
     // below the 48 KB line keeps both happy and still fails loudly on a
     // wide-block build that genuinely needs more than a device will give.
-    if (BR_SHARED_BYTES > 48 * 1024 &&
+    if (DESC_LAUNCH_SHARED > 48 * 1024 &&
         (e = cudaFuncSetAttribute((const void*)suffix_kernel,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  BR_SHARED_BYTES)) != cudaSuccess) {
+                                  DESC_LAUNCH_SHARED)) != cudaSuccess) {
         setErr("shared memory limit", e);
         return DSG_ERR_STATE;
     }
@@ -545,6 +552,22 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
         return DSG_ERR_STATE;
     }
 #endif
+
+    // Ask the runtime about the kernel actually loaded for this architecture.
+    // The Blackwell image is deliberately compiled for five blocks per SM;
+    // older CUDA images and the HIP build retain their measured four-block
+    // target. One queued block per SM beyond residency smooths the grid tail.
+    int activeBlocks = 0;
+    if ((e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+             &activeBlocks, (const void*)suffix_kernel,
+             BR_BLOCK, DESC_LAUNCH_SHARED)) != cudaSuccess) {
+        setErr("suffix-kernel occupancy", e);
+        return DSG_ERR_STATE;
+    }
+    if (activeBlocks < 1) {
+        snprintf(g_err, sizeof(g_err), "suffix-kernel occupancy is zero");
+        return DSG_ERR_STATE;
+    }
 
     dsg_context* c = (dsg_context*)calloc(1, sizeof(dsg_context));
     if (!c) { snprintf(g_err, sizeof(g_err), "out of host memory"); return DSG_ERR_ALLOC; }
@@ -589,13 +612,12 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     // The allocation, not the setting: enough that dsg_set_blocks has somewhere
     // to sweep past wherever the knee turns out to be.
     //
-    // Four 256-thread blocks fill an SM at 64 registers (the suffix kernel's
-    // count, with no spills). That is 4 * SMs = 336 on a 5080, and it is where
-    // the measured curve plateaus. Allocating twice full occupancy (1,344)
-    // used to let the mining sweep pick 672 or 1,252, both slower than 336
-    // under a display, and it spent ~2.5 GB on scratch the extra blocks never
-    // paid for. Those gigabytes now go to the batch.
-    const int plateau = prop.multiProcessorCount * 2048 / BR_BLOCK / 2;
+    // Allocate one queued block per SM beyond physical residency. On a 5080,
+    // five blocks are resident and the 504-block grid is ~0.25% faster than
+    // stopping at 420; going on to 672 gives the gain back. The extra grid row
+    // costs about 240 MB there, while the old two-occupancy allocation spent
+    // gigabytes on blocks that never paid for themselves.
+    const int plateau = prop.multiProcessorCount * (activeBlocks + 1);
     int want = blocks > 0 ? blocks : (plateau > 0 ? plateau : 1);
     c->maxBlocks = (int)(budget / 4 / perBlock);
     if (c->maxBlocks > want) c->maxBlocks = want;
@@ -720,7 +742,7 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     return DSG_OK;
 }
 
-// Changes the resident block count without reallocating. Values above what
+// Changes the grid-block count without reallocating. Values above what
 // dsg_init allocated for are refused: the scratch pool is indexed by blockIdx,
 // so a larger grid would run off the end of it.
 extern "C" DSG_API int dsg_set_blocks(dsg_context* ctx, int blocks)
@@ -821,7 +843,7 @@ static cudaError_t runChunk(dsg_context* c, const dsg_slot* sl,
     }
 #endif
 
-    suffix_kernel<<<c->blocks, BR_BLOCK, BR_SHARED_BYTES, st>>>(
+    suffix_kernel<<<c->blocks, BR_BLOCK, DESC_LAUNCH_SHARED, st>>>(
         c->bank[b].texts, c->bank[b].lens, count, pool,
         c->bank[b].sa, c->bank[b].next);
 
@@ -1044,7 +1066,7 @@ extern "C" DSG_API int dsg_hash_one(dsg_context* ctx,
     }
     stage1_kernel<<<1, S1_BLOCK, S1_BLOCK * S1_STRIDE>>>(ctx->slot[0].dWork, nonce, 1,
                                                          ctx->bank[0].texts, ctx->bank[0].lens);
-    suffix_kernel<<<1, BR_BLOCK, BR_SHARED_BYTES>>>(ctx->bank[0].texts, ctx->bank[0].lens,
+    suffix_kernel<<<1, BR_BLOCK, DESC_LAUNCH_SHARED>>>(ctx->bank[0].texts, ctx->bank[0].lens,
                                                     1, pool, ctx->bank[0].sa, ctx->bank[0].next);
     sha_one_kernel<<<1, 1>>>(ctx->bank[0].sa, ctx->bank[0].lens, ctx->dHashOne);
 

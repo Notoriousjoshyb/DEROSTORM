@@ -9,9 +9,9 @@ REM is the right target: building the six architectures the shipped library
 REM carries would cost six times the build for nothing. gpu\buildlib.bat is the
 REM one that has to run on someone else's card.
 set ARCH=native
-REM BR_BLOCK is option B's threads per hash. 1024 measured fastest; the
-REM sweep in gpu\sweep.bat rebuilds at other widths to check.
-set FLAGS=-O3 -arch=%ARCH% -diag-suppress 177 -DBR_BLOCK=1024
+REM Match the production library. The descriptor kernel is tuned and shipped
+REM at 256 threads per hash; using a different width tests a different kernel.
+set FLAGS=-O3 -arch=%ARCH% -diag-suppress 177 -DBR_BLOCK=256
 
 if "%1"=="" goto all
 nvcc %FLAGS% -o gpu\%1.exe gpu\%1.cu || exit /b 1

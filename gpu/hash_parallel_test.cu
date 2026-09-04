@@ -20,7 +20,7 @@
 // blocks loop over the batch and reuse their scratch, so the batch size and the
 // scratch are independent.
 //
-//   nvcc -O3 -arch=sm_120 -DBR_BLOCK=1024 -o gpu/hash_parallel_test.exe gpu/hash_parallel_test.cu
+//   nvcc -O3 -arch=sm_120 -DBR_BLOCK=256 -o gpu/hash_parallel_test.exe gpu/hash_parallel_test.cu
 //   gpu\hash_parallel_test.exe [vectors.bin]
 
 #include <cstdio>
@@ -101,7 +101,19 @@ __global__ void stage1_kernel(const uint8_t* inputs, int nvec, int batch,
 
 // One block per hash, looping over the batch so the scratch is reused. This is
 // what decouples the batch size from VRAM.
-__global__ __launch_bounds__(BR_BLOCK) void suffix_kernel(
+//
+// The occupancy bound has to be the shipped one. Without it nvcc gives this
+// kernel as many registers as it likes, which is a different image from the one
+// the miner runs, and an A/B measured here then says nothing about the miner.
+// derostorm_gpu.cu picks 5 on Blackwell and 4 elsewhere; this mirrors it.
+#ifndef HP_OCC
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#define HP_OCC 5
+#else
+#define HP_OCC 4
+#endif
+#endif
+__global__ __launch_bounds__(BR_BLOCK, HP_OCC) void suffix_kernel(
         const uint8_t* texts, const int32_t* lens, int batch,
         Pool pool, int32_t* saOut, int saStride)
 {
@@ -232,7 +244,7 @@ int main(int argc, char** argv)
     if (batch > 32768) batch = 32768;
     batch -= batch % S1_BLOCK;
     if (blocks < 1 || batch < S1_BLOCK) { printf("  not enough VRAM\n"); return 1; }
-    printf("  VRAM allows %d resident blocks and a batch of %d\n\n", blocks, batch);
+    printf("  VRAM allows %d grid blocks and a batch of %d\n\n", blocks, batch);
 
     uint8_t*  dIn = nullptr; uint8_t* dTexts = nullptr; uint8_t* dHash = nullptr;
     int32_t*  dLens = nullptr; int32_t* dSA = nullptr;

@@ -34,7 +34,6 @@ import (
 	"sync"
 
 	"github.com/deroproject/derohe/astrobwt/astrobwtv3"
-	"github.com/ebitengine/purego"
 	"github.com/notoriousjoshyb/derostorm/internal/dsa"
 	"golang.org/x/sys/cpu"
 )
@@ -104,7 +103,7 @@ func loadSA() error {
 				saErr = fmt.Errorf("suffix-sort library is missing %s: %w", b.name, err)
 				return
 			}
-			purego.RegisterFunc(b.fn, addr)
+			bindSAFunc(b.fn, addr)
 		}
 
 		// Prove it before trusting it with a hash. A library that is present but
@@ -126,8 +125,8 @@ func loadSA() error {
 		pairAddr, pairErr := sym("dsa_sha256_pair_go")
 		probeAddr, probeErr := sym("dsa_sha_probe")
 		if pairErr == nil && probeErr == nil {
-			purego.RegisterFunc(&dsaSHAPair, pairAddr)
-			purego.RegisterFunc(&dsaSHAProbe, probeAddr)
+			bindSAFunc(&dsaSHAPair, pairAddr)
+			bindSAFunc(&dsaSHAProbe, probeAddr)
 			if dsaSHAProbe() == 1 {
 				shaPairOK = true
 			}

@@ -53,7 +53,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$Version  = '1.8.1'
+$Version  = '1.8.5'
 $Pkg      = './cmd/derostorm'
 $BoundsPkg = 'github.com/deroproject/derohe/astrobwt/astrobwtv3'
 $LdFlags  = '-s -w'
@@ -208,6 +208,25 @@ $TargetOS = if ($All) { @('windows', 'linux', 'darwin') } else { @(go env GOOS) 
 $Needed   = @($Embedded | Where-Object { $TargetOS -contains $_.Goos })
 $Watched  = @($Optional | Where-Object { $TargetOS -contains $_.Goos })
 
+# The AMD HIP SDK root, or $null. HIP_PATH wins; otherwise the
+# highest-numbered version directory under the ROCm root, so a 7.2 install is
+# found without this file being edited for every ROCm release.
+function Get-HipPath {
+    $roots = @()
+    if ($env:HIP_PATH) { $roots += $env:HIP_PATH }
+    $base = 'C:\Program Files\AMD\ROCm'
+    if (Test-Path $base) {
+        $roots += @(Get-ChildItem -Path $base -Directory -ErrorAction SilentlyContinue |
+                    Sort-Object { try { [version]$_.Name } catch { [version]'0.0' } } -Descending |
+                    ForEach-Object { $_.FullName })
+    }
+    foreach ($r in $roots) {
+        if (Test-Path (Join-Path $r 'bin\clang++.exe')) { return $r }
+        if (Test-Path (Join-Path $r 'bin\hipcc.exe'))   { return $r }
+    }
+    return $null
+}
+
 if ($Native) {
     foreach ($lib in $Needed) {
         Write-Host "building $($lib.What)" -ForegroundColor Cyan
@@ -251,8 +270,16 @@ if ($Native) {
                     & wsl.exe -- bash -lc '[ -n "$DSG_HIPCC" ] || [ -x /opt/rocm/bin/amdclang++ ] || command -v hipcc >/dev/null 2>&1 || [ -x /opt/rocm/bin/hipcc ]' 2>$null
                     $LASTEXITCODE -eq 0
                 } else {
-                    $hip = if ($env:HIP_PATH) { $env:HIP_PATH } else { 'C:\Program Files\AMD\ROCm\6.2' }
-                    Test-Path (Join-Path $hip 'bin\hipcc.exe')
+                    # Discover the SDK the way gpuuildlib_hip.bat already does -- the
+                    # newest version directory under the ROCm root -- rather than naming
+                    # one. A hardcoded 6.2 here is what made a ROCm 7.2 machine report
+                    # "no the AMD HIP SDK for Windows" and build a CPU-only miner, while
+                    # the batch file beside it would have compiled fine.
+                    #
+                    # It probes clang++ because that is what buildlib_hip.bat invokes:
+                    # ROCm 6 deprecated the hipcc wrapper, so testing for hipcc asks a
+                    # question the build does not care about.
+                    $null -ne (Get-HipPath)
                 }
             }
             default {
@@ -281,6 +308,40 @@ if ($Native) {
         $code = $LASTEXITCODE
         $ErrorActionPreference = $prev
         if ($code -ne 0) { throw "$($lib.Script) failed with exit code $code" }
+    }
+}
+
+# go:embed takes the whole gpucuda\<goos> and gpulib\<goos> directory, not the
+# one file the loader asks for. That is deliberate -- it is what lets a tree
+# with no GPU library still compile -- and it means anything else dropped in
+# there is embedded too.
+#
+# Which is a 2 GB linker crash, not a big binary. Copying the ROCm bin
+# directory into gpulib\windows to "provide the runtime" is an easy mistake
+# (the runtime is not embedded; it comes from the Adrenalin driver), and
+# ROCm's rocblas.dll alone is over a gigabyte. Go's linker then dies with
+#
+#     too much data, last section SRODATA (2186756880, over 2e+09 bytes)
+#     pc-relative relocation ... address ... is too big
+#
+# which says nothing about the cause. So the strays are named here instead.
+$EmbedDirs = @(
+    @{ Dir = 'cmd\derostorm\gpucuda\windows'; Keep = 'derostorm_gpu.dll' }
+    @{ Dir = 'cmd\derostorm\gpucuda\linux';   Keep = 'libderostorm_gpu.so' }
+    @{ Dir = 'cmd\derostorm\gpulib\windows';  Keep = 'derostorm_hip.dll' }
+    @{ Dir = 'cmd\derostorm\gpulib\linux';    Keep = 'libderostorm_hip7.so|libderostorm_hip6.so|libderostorm_hip5.so' }
+)
+foreach ($e in $EmbedDirs) {
+    if (-not (Test-Path $e.Dir)) { continue }
+    $keep = @($e.Keep -split '\|') + @('README.md')
+    $stray = @(Get-ChildItem -Path $e.Dir -File -ErrorAction SilentlyContinue |
+               Where-Object { $keep -notcontains $_.Name })
+    if ($stray) {
+        $mb = [math]::Round((($stray | Measure-Object -Property Length -Sum).Sum) / 1MB, 1)
+        $names = ($stray | Select-Object -First 6 | ForEach-Object { $_.Name }) -join ', '
+        throw ("$($e.Dir) holds $($stray.Count) file(s) that are not the GPU library " +
+               "($mb MB: $names) - go:embed takes the whole directory, so these would be " +
+               "built into the binary. Delete them; only $($e.Keep -replace '\|', ' or ') belongs here.")
     }
 }
 

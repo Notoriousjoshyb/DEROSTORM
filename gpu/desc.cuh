@@ -171,6 +171,106 @@
 #define DESC_LEAD8 0
 #endif
 
+// The same opening step, but only for the comparisons that already skip a
+// shared key -- the merge's -- and not for the column walk's seed.
+//
+// Those two want opposite things. The seed compares near-copy blocks, so it
+// never separates in the first eight bytes and the opening is a wasted round
+// trip, which is why DESC_LEAD8 was removed. The merge separates there most of
+// the time, and the narrower the key that grouped it the more often: at
+// DESC_GBITS 18 a group shares two bytes, so the third usually decides. `from`
+// is a compile-time constant at both call sites, so this costs no branch.
+#ifndef DESC_LEAD_MERGE
+#define DESC_LEAD_MERGE 0
+#endif
+
+// Hand the longest runs to the lowest task numbers, so a warp's thirty-two lanes
+// hold runs of about one length.
+//
+// The walk gives one task to one thread and its cost is set by the run's length:
+// 15,687 cycles at length 1 against 2,676,696 at 45, and 44% of runs are length
+// 1 or 2. A warp executes the union of what its lanes do, so a warp holding one
+// long run pays that run's cost on all thirty-two lanes; the profiler reports
+// the walk's slowest thread at 1.96x the average for exactly this reason.
+//
+// Tasks are numbered (run * DESC_CHUNKS + chunk), so the four chunks of one run
+// already share a length and sit in one warp. What decides a warp's cost is the
+// eight runs it holds, and those are consecutive in the text -- which says
+// nothing about their lengths. Ordering runs by length before numbering them
+// puts the eight longest in warp 0 and the eight shortest in warp 7, and the
+// eight lanes of a warp then diverge only as far as neighbouring lengths do.
+//
+// It does not shorten the longest run and so does not shorten a block; what it
+// removes is the issue slots the short lanes were holding open while they
+// waited. At five resident blocks per SM those slots go to another block.
+//
+// A counting sort over DESC_TASK_BUCKETS buckets, done once per hash on ~62
+// runs. Lengths at or past the last bucket share it.
+//
+// The sort has to be stable, and the bucket count is what decides how much text
+// locality it spends. Runs are consecutive slices of the text, so runs that are
+// neighbours in the text read neighbouring bytes, and a warp whose eight runs
+// are neighbours reads eight nearby regions. Reordering them scatters that.
+// Measured: the first version scattered with an atomic, so runs of one length
+// came out in whatever order the atomic served them, and it cost 73.2 -> 83.2 ms
+// on the suffix kernel -- the locality was worth more than the divergence.
+// Keeping text order inside a bucket costs one serial pass over ~62 runs by one
+// thread, against a walk of ~665,000 cycles.
+//
+// Few buckets keep more of that locality than many: at DESC_TASK_BUCKETS 4 the
+// runs split into lengths 1, 2, 3 and 4-or-more, which is where the cost steps
+// (15,687 / 209,154 / 536,534 cycles), and inside each class the text order is
+// untouched.
+//
+// It is off, because none of that collected anything. Stable, on the suffix
+// kernel at 336 blocks, against 73.2/74.4/74.6 ms with it off: 73.1 at 2
+// buckets, 75.2 at 3, 75.7 at 4, 80.6 at 8, 82.9 at 64. Two buckets is inside
+// the noise and every finer split is worse, which puts the whole curve on the
+// locality it spends rather than on the divergence it saves.
+//
+// So the walk's 1.96x imbalance is not a scheduling problem. Reordering tasks
+// cannot collect it: a warp's cost is set by its longest run, and the only way
+// to reach the idle lanes is to give them part of a long run, which is the
+// variable split that costs more in repeated seeding than it saves. Left here
+// at 0 so the next person does not have to build it again to find that out.
+#ifndef DESC_TASK_SORT
+#define DESC_TASK_SORT 0
+#endif
+#ifndef DESC_TASK_BUCKETS
+#define DESC_TASK_BUCKETS 4
+#endif
+
+// Seed the column walk by counting ranks rather than by insertion sort; see
+// the note where it is done.
+//
+//   0  insertion sort, ~len*len/4 comparisons in a chain      73.2 ms
+//   1  every ordered pair, len*len, none of them dependent    96.0 ms
+//   2  the upper triangle, len*len/2, none of them dependent  95.9 ms
+//
+// Suffix kernel at 336 blocks, two interleaved rounds. 2 is 1 with half the
+// comparisons and it measures the same, which says the cost is not the
+// comparison count and not the chain: it is the rank counters, which have to
+// live in shared memory because len reaches 45. The insertion sort keeps its
+// state in registers and wins on that alone.
+#ifndef DESC_SEED_RANK
+#define DESC_SEED_RANK 0
+#endif
+
+// SCAFFOLDING: leave one thing out of the column walk and time what is left.
+// Every setting but 0 produces a wrong suffix array; the point is where the
+// walk's wall time goes, which the per-task table cannot say because a lane's
+// clock keeps running while the rest of its warp diverges.
+//   1  no descriptor store   2  no arena store
+//   3  no scattered text read on a non-constant column
+//   4  no seed sort (identity order)   5  no descriptor emitted at all
+//   6  the order never moves (no insertion sort on a non-constant column)
+//   7  step 5a takes the first descriptor of the window, not the owning one
+//   8  step 5a writes the column alone, without the arena's block index
+//   9  paint the owner map but do not read it
+#ifndef DESC_ABLATE
+#define DESC_ABLATE 0
+#endif
+
 #ifndef DESC_WIDE_STEP
 #if defined(DSG_HIP) && DSG_HIP
 // RDNA coalesces at 64 B lines and has less bandwidth to waste on read-ahead:
@@ -261,7 +361,36 @@ static_assert(DESC_CHUNKS * DESC_CHUNK_COLS == 256,
 #error "the compact descriptor arena requires DESC_KEY_BYTES=3"
 #endif
 #define DESC_KEY_DROP  8
-#define DESC_KEY_OF(k) ((uint32_t)(k) >> DESC_KEY_DROP)
+
+// Bits of the key the global sort actually orders by, and therefore the width
+// that decides a key group.
+//
+// The radix sort is four passes of six bits over the whole 24-bit key, and it
+// is the largest phase of this kernel -- the sort proper plus the tile phases
+// underneath it come to about a third. blockradix.cuh says plainly that only
+// fewer passes moves it, and eight-bit digits were measured a 12% loss because
+// 256 bins cost a block per SM.
+//
+// So narrow the key instead. Eighteen bits is three passes, not four. What it
+// costs is collisions: the descriptors sharing a group are the ones agreeing on
+// 18 bits rather than 24, so there are more groups holding more than one, and
+// the merge that resolves them by comparison grows. That merge is 2% of the
+// kernel against the radix's ~36%, so there is room.
+//
+// Two things follow and both are handled below. The walk groups a column's
+// blocks on this width too, which is not a cost but a saving -- a coarser key
+// merges neighbouring groups, so there are fewer descriptors to sort at all.
+// And a group now shares only DESC_CMP_FROM whole bytes, so the merge's
+// comparisons must start there rather than at DESC_KEY_BYTES.
+#ifndef DESC_GBITS
+#define DESC_GBITS 24
+#endif
+#ifndef DESC_NO_RADIX
+#define DESC_NO_RADIX 0
+#endif
+#define DESC_KEY_OF(k) ((uint32_t)(k) >> (32 - DESC_GBITS))
+// Whole bytes every descriptor in a key group is known to share.
+#define DESC_CMP_FROM (DESC_GBITS / 8)
 #define DESC_REL_OF(k) ((uint32_t)(k) & 255u)
 #define DESC_KEYREL(k, rel) (((uint32_t)(k) & 0xFFFFFF00u) | (uint32_t)(rel))
 // How a key group that collides on all four bytes is resolved.
@@ -314,6 +443,71 @@ static_assert(DESC_CHUNKS * DESC_CHUNK_COLS == 256,
 #define DESC_MERGE_WIDE 64
 #endif
 
+// Keep the constant-column table in two registers rather than a 64-byte
+// thread-local array; see the note where it is built.
+#ifndef DESC_COLMASK
+#define DESC_COLMASK 1
+#endif
+
+// Skip the per-column group scan where the constant-column mask already says
+// every block shares the key. Needs DESC_COLMASK, and DESC_KEY_BYTES == 3.
+#ifndef DESC_SAMEKEY
+#define DESC_SAMEKEY DESC_COLMASK
+#endif
+
+// Carry "every block of this run has the same key" as a state, rather than
+// rediscovering it from the constant-column mask each column.
+//
+// It subsumes DESC_SAMEKEY -- three constant columns mean every block has the
+// same three bytes there, so the mask implies the state but not the other way
+// round -- and it buys a second thing the mask cannot: while the keys are all
+// equal, `len` of them in shared memory are `len` copies of one register, so a
+// constant column slides the register and leaves the array alone. About 70% of
+// columns are constant, so that is most of the walk's shared traffic.
+//
+// The state only ever changes at a column that is not constant, which is the
+// one column that reads text per block anyway.
+#ifndef DESC_UNIFORM
+#define DESC_UNIFORM 1
+#endif
+
+// Rewrite the arena slice when the order actually moves, rather than whenever a
+// column is not constant. 0 restores the weaker test.
+#ifndef DESC_DIRTY_MOVED
+#define DESC_DIRTY_MOVED 1
+#endif
+
+// Answer "which descriptor owns this output position" from a painted byte map
+// rather than a binary search; see step 5a. The map is what is left of
+// BlockRadixScratch once step 5a's three window tables are carved out of it.
+#ifndef DESC_OWNER_MAP
+#define DESC_OWNER_MAP 1
+#endif
+
+// Hold the walk's order table as block indices in sixteen bits rather than as
+// text positions in thirty-two. 0 restores the old width, for A/B.
+#ifndef DESC_ORD16
+#define DESC_ORD16 1
+#endif
+#if DESC_ORD16
+typedef uint16_t DescOrd;
+#define DESC_ORD_POS(o)   (((int)(o)) << 8)
+#define DESC_ORD_VAL(blk) ((uint16_t)(blk))
+#else
+typedef int32_t DescOrd;
+#define DESC_ORD_POS(o)   ((int)(o))
+#define DESC_ORD_VAL(blk) ((int32_t)((blk) << 8))
+#endif
+#define DESC_OWN_CAP (BR_SHARED_BYTES - 3 * BR_BLOCK * (int)sizeof(int32_t))
+
+#if DESC_UNIFORM
+#undef  DESC_SAMEKEY
+#define DESC_SAMEKEY 0
+#endif
+#if DESC_SAMEKEY && !DESC_COLMASK
+#error "DESC_SAMEKEY reads col_mask, which DESC_COLMASK builds"
+#endif
+
 // Touch the whole text before the column walk's scattered loads. A PTX
 // L2 prefetch per 64-byte sector beat a coalesced byte touch by ~1% at 336
 // on a 5080, and a 64-byte stride beat 128 by a fraction more.
@@ -339,7 +533,83 @@ static_assert(DESC_CHUNKS * DESC_CHUNK_COLS == 256,
 #ifndef DESC_TEXT_CAP
 #define DESC_TEXT_CAP 70928
 #endif
-#define DESC_LAUNCH_SHARED (BR_SHARED_BYTES + ((DESC_TEXT_SHARED) ? DESC_TEXT_CAP : 0))
+// Sort the descriptors most significant digit first, in one pass, instead of
+// least significant digit first in four.
+//
+// The LSD sort in blockradix.cuh is the largest thing in this kernel: skipping
+// it entirely -- a deliberately wrong answer, timed only to find the ceiling --
+// takes the suffix sort from 122,000 arrays a second to 180,000, so it is about
+// a third of the wall time. blockradix.cuh says plainly that only fewer passes
+// moves it, and every way of getting fewer *while staying LSD* has been tried
+// and measured a loss: eight-bit digits cost a block per SM, and a narrower key
+// (DESC_GBITS) pays for the pass with collisions that cost more.
+//
+// MSD gets there from the other side. LSD needs four passes because it needs
+// every pass to be stable -- that is what makes the earlier digits survive --
+// and the stability is what the per-tile rank, the warp matrix, the leader walk
+// and the digit cursors are all for. MSD needs no stability at all: the top
+// digit partitions the descriptors into buckets that are already in their final
+// order relative to each other, and what happens inside a bucket is that
+// bucket's own business.
+//
+// So this is one histogram, one scan, one scatter, and then a small sort inside
+// each bucket -- which is nothing, because 2,048 buckets over ~19,700
+// descriptors is about ten each, and ranking those ten words in parallel costs
+// less than another full pass over the array would.
+//
+// What it gives up is the staged, coalesced scatter, which the note in
+// blockradix.cuh measures at about 5%. Three passes are worth more than that.
+//
+// The bucket cap is not a tuning knob. Parallel ranking is still quadratic in
+// a bucket length nothing bounds; past the
+// cap the sort declines and prefix doubling does the hash, exactly as it does
+// when a key group needs more boundary words than the scratch holds. Keys are
+// three bytes of stage-1 output and 2,048 buckets hold ten on average, so this
+// is a guard and not a case: it has not fired on any of the 512 vectors.
+#ifndef DESC_MSD
+#define DESC_MSD 1
+#endif
+#ifndef DESC_MSD_PACKED16
+#define DESC_MSD_PACKED16 1
+#endif
+// Eleven bits is the full-miner answer. Packing two counters per word gives it
+// the same 4 KB table an ordinary ten-bit histogram needs, while halving the
+// mean bucket length. Twelve bits doubles the table and shortens the buckets
+// again, but its longer scan measured slower under the five-block Blackwell
+// register budget.
+#ifndef DESC_MSD_BITS
+#if DESC_MSD_PACKED16
+#define DESC_MSD_BITS 11
+#else
+#define DESC_MSD_BITS 10
+#endif
+#endif
+#define DESC_MSD_BINS (1 << DESC_MSD_BITS)
+// What the digit leaves of the key, which must fit a uint16.
+#define DESC_MSD_LOWMASK ((1u << (32 - DESC_KEY_DROP - DESC_MSD_BITS)) - 1u)
+#if DESC_MSD_LOWKEY
+static_assert(32 - DESC_KEY_DROP - DESC_MSD_BITS <= 16,
+              "DESC_MSD_BITS must leave at most 16 bits of key");
+#endif
+#ifndef DESC_MSD_MAX
+#define DESC_MSD_MAX 512
+#endif
+// Rank on a narrow copy of the key rather than on the descriptor itself.
+#ifndef DESC_MSD_LOWKEY
+#define DESC_MSD_LOWKEY 1
+#endif
+// The bucket table sits past the radix scratch in the same dynamic allocation.
+// At eleven bits, two 16-bit counters share one 32-bit atomic word. The whole
+// table is therefore the same 4,100 bytes as 1,025 ordinary counters at ten
+// bits, preserving the occupancy budget while halving the mean bucket length.
+#if DESC_MSD_PACKED16
+#define DESC_MSD_WORDS ((DESC_MSD_BINS + 2) / 2)
+#define DESC_MSD_BYTES ((DESC_MSD) ? (int)(DESC_MSD_WORDS * sizeof(uint32_t)) : 0)
+#else
+#define DESC_MSD_BYTES ((DESC_MSD) ? (int)((DESC_MSD_BINS + 1) * sizeof(int32_t)) : 0)
+#endif
+
+#define DESC_LAUNCH_SHARED (BR_SHARED_BYTES + DESC_MSD_BYTES +                             ((DESC_TEXT_SHARED) ? DESC_TEXT_CAP : 0))
 
 // Place the sorted positions with one thread per output position instead of one
 // thread per descriptor.
@@ -463,13 +733,36 @@ struct DescScratch {
 // guarantees p+3 < n, so it reads at most four bytes past the text. Those bytes
 // are fetched and never selected, but they must be mapped, so the texts
 // allocation carries eight bytes of tail; see dsg_init.
+// Text words through the read-only data path.
+//
+// The text is written once by stage 1 and only read here, but nothing in the
+// signature says so: `t` is a plain const pointer that the compiler cannot
+// prove does not alias the arena, the descriptors or sa, so it issues ordinary
+// loads that go through L1 and are kept coherent. __ldg names the non-coherent
+// path explicitly.
+//
+// It is off, and reproducibly so: 75.9 ms against 73.2 on the suffix kernel at
+// 336 blocks, three interleaved rounds each, every round the same to a tenth of
+// a millisecond. The read-only path is for data with no reuse, and this text
+// has nothing but reuse -- a run's 256-byte blocks are read again on every one
+// of its 64 columns, by four lanes at once, and the seed's comparisons walk the
+// same bytes a second time. That is an L1 working set, and __ldg spends it.
+#ifndef DESC_LDG
+#define DESC_LDG 0
+#endif
+#if DESC_LDG
+#define DESC_LDW(p) __ldg(p)
+#else
+#define DESC_LDW(p) (*(p))
+#endif
+
 __device__ __forceinline__ uint32_t descLoadBE32(const uint8_t* t, int p)
 {
 #if DESC_WIDE_LOAD
     const uint8_t*  b = t + p;
     const uint32_t  m = (uint32_t)((uintptr_t)b & 3u);
     const uint32_t* w = (const uint32_t*)(b - m);
-    return __byte_perm(w[0], w[1], 0x0123u + 0x1111u * m);
+    return __byte_perm(DESC_LDW(w), DESC_LDW(w + 1), 0x0123u + 0x1111u * m);
 #else
     return ((uint32_t)t[p] << 24) | ((uint32_t)t[p + 1] << 16) |
            ((uint32_t)t[p + 2] << 8) | (uint32_t)t[p + 3];
@@ -488,8 +781,9 @@ __device__ __forceinline__ uint64_t descLoadBE64(const uint8_t* t, int p)
     const uint32_t  m = (uint32_t)((uintptr_t)b & 3u);
     const uint32_t* w = (const uint32_t*)(b - m);
     const uint32_t sel = 0x0123u + 0x1111u * m;
-    const uint32_t lo = __byte_perm(w[0], w[1], sel);
-    const uint32_t hi = __byte_perm(w[1], w[2], sel);
+    const uint32_t w0 = DESC_LDW(w), w1 = DESC_LDW(w + 1), w2 = DESC_LDW(w + 2);
+    const uint32_t lo = __byte_perm(w0, w1, sel);
+    const uint32_t hi = __byte_perm(w1, w2, sel);
     return ((uint64_t)lo << 32) | (uint64_t)hi;
 }
 #endif
@@ -560,7 +854,7 @@ __device__ __forceinline__ bool descSuffixLessFrom(const uint8_t* t, int n,
     // one two-word step first, then the wide loop for the tail, issues fewer
     // loads on the common path without giving up in-flight loads on the long
     // ones.
-    if (DESC_LEAD8 && i + 8 <= m) {
+    if ((DESC_LEAD8 || (DESC_LEAD_MERGE && from > 0)) && i + 8 <= m) {
 #if DESC_LOAD64
         const uint64_t wa = descLoadBE64(t, a + i);
         const uint64_t wb = descLoadBE64(t, b + i);
@@ -626,6 +920,61 @@ __device__ __forceinline__ bool descSuffixLess(const uint8_t* t, int n, int a, i
     return descSuffixLessFrom(t, n, a, b, 0);
 }
 
+#if DESC_MSD && DESC_MSD_PACKED16
+// Two logical uint16 bucket cursors in one physical uint32. Adding/subtracting
+// 1 or 1<<16 with a 32-bit shared atomic is exact while neither half can wrap;
+// the descriptor-count guard below establishes that invariant.
+__device__ __forceinline__ uint32_t descBucketGet(const uint32_t* a, int b)
+{
+    return (a[b >> 1] >> ((b & 1) * 16)) & 0xffffu;
+}
+
+__device__ __forceinline__ uint32_t descBucketAdd(uint32_t* a, int b)
+{
+    const int shift = (b & 1) * 16;
+    return (atomicAdd(a + (b >> 1), 1u << shift) >> shift) & 0xffffu;
+}
+
+__device__ __forceinline__ uint32_t descBucketSub(uint32_t* a, int b)
+{
+    const int shift = (b & 1) * 16;
+    return (atomicSub(a + (b >> 1), 1u << shift) >> shift) & 0xffffu;
+}
+
+// Inclusive scan of the packed counters. One warp gives each lane a contiguous
+// 64-bucket slice, scans the 32 slice totals with shuffles, then revisits its
+// slice to write the prefixes.
+__device__ int descBucketScan(uint32_t* a, BlockRadixScratch* sh)
+{
+    const int tid = threadIdx.x;
+    if (tid < 32) {
+        const int first = tid * (DESC_MSD_BINS / 64);
+        int total = 0;
+        for (int k = 0; k < DESC_MSD_BINS / 64; k++) {
+            const uint32_t w = a[first + k];
+            total += (int)(w & 0xffffu) + (int)(w >> 16);
+        }
+
+        int inclusive = total;
+        for (int off = 1; off < 32; off <<= 1) {
+            const int v = DSG_SHFL_UP(inclusive, off);
+            if (tid >= off) inclusive += v;
+        }
+        int run = inclusive - total;
+        for (int k = 0; k < DESC_MSD_BINS / 64; k++) {
+            const uint32_t w = a[first + k];
+            run += (int)(w & 0xffffu);
+            const uint32_t lo = (uint32_t)run;
+            run += (int)(w >> 16);
+            a[first + k] = lo | ((uint32_t)run << 16);
+        }
+        if (tid == 31) sh->scanCarry = inclusive;
+    }
+    __syncthreads();
+    return sh->scanCarry;
+}
+#endif
+
 // descSuffixArrayBlock builds the suffix array of t[0:n] into sa[0:n]. The whole
 // block must call it with blockDim.x == BR_BLOCK. Returns 0 on success, or a
 // negative value when a key group was too large to merge (see DESC_MERGE_CAP),
@@ -636,11 +985,33 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
     // One order and key array per chunk, so chunks of the same run do not
     // overwrite each other. At DESC_CHUNKS == 1 this is the single array the
     // walk has always used.
-    __shared__ int32_t  s_order[DESC_CHUNKS * DESC_MAX_BLOCKS];
-    __shared__ uint32_t s_wkey[DESC_CHUNKS * DESC_MAX_BLOCKS];
+    // Block indices, not text positions.
+    //
+    // The walk's order table is read twice a column -- once as an address,
+    // t[ord[x]+col], and once as the arena's block index, ord[x]>>8 -- and a
+    // block index gives both: the address is (ord[x]<<8)+col, which is one
+    // shift the address unit folds in for free, and the arena entry is ord[x]
+    // itself. Sixteen bits is enough for DESC_MAX_BLOCKS and halves both the
+    // shared traffic of the hottest loop in the kernel and the 4.4 KB this
+    // table takes, which is 4 KB of the shared budget the MSD sort's bucket
+    // table competes for.
+    // The radix scratch is idle during the walk and both tables are dead by the
+    // sort. They fit together in that allocation, removing 6.7 KB of static
+    // SMEM without increasing the dynamic launch request. The boundary flags
+    // use the same bytes one phase earlier and are dead before these are built.
+    DescOrd* const s_order = (DescOrd*)sh;
+    uint32_t* const s_wkey = (uint32_t*)(s_order + DESC_CHUNKS * DESC_MAX_BLOCKS);
+    int32_t* const s_flag = (int32_t*)sh;
+    int32_t* const s_keep = s_flag + DESC_MAX_BLOCKS;
+    static_assert((int)(DESC_CHUNKS * DESC_MAX_BLOCKS *
+                        (sizeof(DescOrd) + sizeof(uint32_t))) <= BR_SHARED_BYTES,
+                  "walk tables must fit in the radix scratch");
     __shared__ int32_t s_start[DESC_MAX_BLOCKS + 1];
-    __shared__ int32_t s_flag[DESC_MAX_BLOCKS];
-    __shared__ int32_t s_keep[DESC_MAX_BLOCKS];   // s_flag before the scan ate it
+#if DESC_TASK_SORT
+    // Run indices, longest first. Live across the whole walk, so it cannot share
+    // the radix scratch the walk tables are in.
+    __shared__ uint16_t s_rorder[DESC_MAX_BLOCKS];
+#endif
     __shared__ int     s_nruns;
     __shared__ int     s_ndesc;
     __shared__ int     s_fail;
@@ -659,11 +1030,9 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
     if (tid == 0) {
         s_ndesc = 0; s_fail = 0; s_bump = 2 * DESC_BIG_MAX; s_nbig = 0; s_ncol = 0;
     }
-    blockRadixInit(sh);   // zeroes the per-tile matrix the sort relies on
-
 #if DESC_TEXT_SHARED
     if (n + 8 <= DESC_TEXT_CAP) {
-        uint8_t* s_text = (uint8_t*)sh + BR_SHARED_BYTES;
+        uint8_t* s_text = (uint8_t*)sh + BR_SHARED_BYTES + DESC_MSD_BYTES;
         for (int i = tid; i < n + 8; i += BR_BLOCK)
             s_text[i] = (i < n) ? t[i] : (uint8_t)0;
         __syncthreads();
@@ -744,6 +1113,44 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
     PROF_ADD(PH_D_RUNS);
     PROF_RUNS(s_start, s_nruns);
 
+#if DESC_TASK_SORT
+    // ---- 2a. order the runs by length, longest first; see DESC_TASK_SORT.
+    //
+    // The histogram sits in the boundary flags' bytes, which are dead from here
+    // and are not the walk tables' until the walk starts writing them.
+    {
+        int32_t* const s_hist = (int32_t*)sh;
+        for (int b = tid; b < DESC_TASK_BUCKETS; b += BR_BLOCK) s_hist[b] = 0;
+        __syncthreads();
+        for (int r = tid; r < nruns; r += BR_BLOCK) {
+            const int len = s_start[r + 1] - s_start[r];
+            atomicAdd(&s_hist[len < DESC_TASK_BUCKETS ? len : DESC_TASK_BUCKETS - 1], 1);
+        }
+        __syncthreads();
+        // Exclusive scan from the top, so bucket b starts after every longer one.
+        if (tid == 0) {
+            int acc = 0;
+            for (int b = DESC_TASK_BUCKETS - 1; b >= 0; b--) {
+                const int c = s_hist[b];
+                s_hist[b] = acc;
+                acc += c;
+            }
+        }
+        __syncthreads();
+        // Serial, and therefore stable: runs of one length keep their text
+        // order, which is what the walk's scattered reads live on. ~62 trivial
+        // iterations against a walk of ~665,000 cycles.
+        if (tid == 0) {
+            for (int r = 0; r < nruns; r++) {
+                const int len = s_start[r + 1] - s_start[r];
+                const int b = len < DESC_TASK_BUCKETS ? len : DESC_TASK_BUCKETS - 1;
+                s_rorder[s_hist[b]++] = (uint16_t)r;
+            }
+        }
+        __syncthreads();
+    }
+#endif
+
     // ---- 2. the column walk, one thread per run.
     //
     // The keys slide rather than being re-read. A descriptor key is the four
@@ -774,8 +1181,13 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
     for (int q = tid; q < ntask; q += BR_BLOCK) {
         PROF_TASK_DECL;
         PROF_TASK_BEG();
-        const int r = q / DESC_CHUNKS;
-        const int c = q - r * DESC_CHUNKS;    // 0 is the top of the text
+        const int slot = q / DESC_CHUNKS;
+        const int c = q - slot * DESC_CHUNKS; // 0 is the top of the text
+#if DESC_TASK_SORT
+        const int r = s_rorder[slot];
+#else
+        const int r = slot;
+#endif
         const int g0 = s_start[r];
         const int len = s_start[r + 1] - g0;
         const int base = g0 * 256;
@@ -787,7 +1199,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         // Chunks of the same run walk it at the same time, so each needs its own
         // order and keys -- hence the stride. Runs partition the blocks, so the
         // slices within a chunk are still disjoint.
-        int32_t*  ord = s_order + (size_t)c * DESC_MAX_BLOCKS + g0;
+        DescOrd*  ord = s_order + (size_t)c * DESC_MAX_BLOCKS + g0;
         uint32_t* key = s_wkey  + (size_t)c * DESC_MAX_BLOCKS + g0;
         uint16_t* arena = sc.arena + (size_t)g0 * 256;
 
@@ -867,20 +1279,76 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         }
 
         // Seed with the order of the suffixes starting at each block's last
-        // byte. Insertion sort: len is the blocks in a run, typically four.
+        // byte. len is the blocks in a run, typically four.
         PROF_SEED_BEG();
-        for (int i = 0; i < len; i++) ord[i] = base + i * 256;
+#if DESC_SEED_RANK
+        // Counted, not insertion sorted.
+        //
+        // An insertion sort's next comparison depends on how the last one came
+        // out, so `len` blocks are ~len*len/4 comparisons *one after another* --
+        // and a comparison here is a walk through global memory that decides
+        // after ~97 bytes. The chain is the cost, not the comparisons: the
+        // profiler puts this seed at a third of a short run's task and half of a
+        // long one's.
+        //
+        // Counting has no chain. Every block asks how many of the others sort
+        // before it and writes itself at that rank. It is len*len comparisons
+        // rather than len*len/4, so about three times the work, and they can all
+        // be in flight at once instead of queued behind each other.
+        //
+        // No ties to break: two suffixes of one text start at different
+        // positions, so they have different lengths and can never be equal.
+        for (int i = 0; i < len; i++) {
+            const int pi = base + i * 256;
+            int r = 0;
+            for (int j = 0; j < len; j++) {
+                if (j != i && descSuffixLess(t, n, base + j * 256 + hi, pi + hi)) r++;
+            }
+            ord[r] = DESC_ORD_VAL(pi >> 8);
+        }
+#elif DESC_SEED_RANK == 2
+        // Counted, and each pair asked once. Measured worse; see DESC_SEED_RANK.
+        //
+        // The counted rank above buys independence from the insertion sort's
+        // chain and pays len*len comparisons for it, which is why it loses:
+        // half of those are the same question twice, since (i,j) and (j,i) have
+        // one answer between them. Walking the upper triangle and crediting
+        // whichever block loses keeps every comparison independent of the last
+        // and issues half as many -- len*len/2 against the insertion sort's
+        // len*len/4, but with no chain in front of any of them.
+        //
+        // The rank counters live in the key array, which is not written until
+        // the loop below this one and is therefore free until then.
+        for (int i = 0; i < len; i++) key[i] = 0;
+        for (int i = 0; i < len; i++) {
+            const int pi = base + i * 256 + hi;
+            uint32_t ri = key[i];
+            for (int j = i + 1; j < len; j++) {
+                if (descSuffixLess(t, n, base + j * 256 + hi, pi)) ri++;
+                else key[j]++;
+            }
+            key[i] = ri;
+        }
+        for (int i = 0; i < len; i++)
+            ord[key[i]] = DESC_ORD_VAL(g0 + i);
+#elif DESC_ABLATE == 4
+        for (int i = 0; i < len; i++) ord[i] = DESC_ORD_VAL(g0 + i);
+#else
+        for (int i = 0; i < len; i++) ord[i] = DESC_ORD_VAL(g0 + i);
         for (int i = 1; i < len; i++) {
-            const int32_t v = ord[i];
+            const DescOrd v = ord[i];
             int j = i;
-            while (j > 0 && descSuffixLess(t, n, v + hi, ord[j - 1] + hi)) {
+            while (j > 0 && descSuffixLess(t, n, DESC_ORD_POS(v) + hi,
+                                           DESC_ORD_POS(ord[j - 1]) + hi)) {
                 ord[j] = ord[j - 1];
                 j--;
             }
             ord[j] = v;
         }
+#endif
         // The chunk's one full key read; every column below it slides.
-        for (int i = 0; i < len; i++) key[i] = descKey32(t, n, ord[i] + hi);
+        for (int i = 0; i < len; i++)
+            key[i] = descKey32(t, n, DESC_ORD_POS(ord[i]) + hi);
         PROF_SEED_END(len);
         PROF_COLS_BEG();
 
@@ -890,7 +1358,20 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         // sort. One sequential pass lets those columns slide from t[base+col]
         // and skip the gather. Chunks start at 0/64/128/192, so the uint4 path
         // is aligned on the same texts the run finder already requires.
+        // One bit per column instead of one byte.
+        //
+        // A 64-byte array indexed by a loop variable is thread-local memory,
+        // which is global memory with a per-thread address: 64 bytes a thread
+        // written once and read once per column, on 256 threads of 336 blocks.
+        // A chunk is exactly 64 columns, so the same table is two registers,
+        // and the read the walk does every column becomes a shift and an AND.
+        // Set bit i means column lo+i holds the same byte in every block of the
+        // run.
+#if DESC_COLMASK
+        uint64_t col_mask = 0;
+#else
         uint8_t col_same[DESC_CHUNK_COLS];
+#endif
         {
             int off = 0;
             if ((((uintptr_t)(t + base + lo)) & 15u) == 0) {
@@ -908,6 +1389,19 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                         m3 &= __vcmpeq4(a3, bg[3]);
                     }
                     const uint32_t ms[4] = { m0, m1, m2, m3 };
+#if DESC_COLMASK
+                    // __vcmpeq4 leaves each column's answer in bits 0, 8, 16
+                    // and 24 of its word; gather those into four adjacent bits.
+                    uint32_t nib = 0;
+                    for (int k = 0; k < 4; k++) {
+                        const uint32_t m = ms[k];
+                        nib |= ((( m        & 1u)       |
+                                 ((m >>  7) & 2u)       |
+                                 ((m >> 14) & 4u)       |
+                                 ((m >> 21) & 8u)) << (4 * k));
+                    }
+                    col_mask |= (uint64_t)nib << off;
+#else
                     for (int k = 0; k < 4; k++) {
                         const uint32_t m = ms[k];
                         col_same[off + 4 * k + 0] = (uint8_t)( m        & 1u);
@@ -915,6 +1409,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                         col_same[off + 4 * k + 2] = (uint8_t)((m >> 16) & 1u);
                         col_same[off + 4 * k + 3] = (uint8_t)((m >> 24) & 1u);
                     }
+#endif
                 }
             }
             for (; off < DESC_CHUNK_COLS; off++) {
@@ -923,10 +1418,28 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                 for (int g = 1; g < len; g++) {
                     if (t[base + g * 256 + lo + off] != c0) { same = 0; break; }
                 }
+#if DESC_COLMASK
+                col_mask |= (uint64_t)same << off;
+#else
                 col_same[off] = same;
+#endif
             }
         }
         PROF_COLS_END(len);
+
+#if DESC_SAMEKEY
+        // Columns whose next DESC_KEY_BYTES bytes are constant across the run.
+        const uint64_t same_mask = col_mask & (col_mask >> 1) & (col_mask >> 2);
+#endif
+#if DESC_UNIFORM
+        // True while every block's key is the same; then k0 is that key and the
+        // shared key array is not read or written at all.
+        uint32_t k0 = key[0];
+        bool uniform = true;
+        for (int x = 1; x < len; x++) {
+            if (DESC_KEY_OF(key[x]) != DESC_KEY_OF(k0)) { uniform = false; break; }
+        }
+#endif
 
         // The arena slot that currently holds ord[0..len), and whether ord has
         // moved since it was written there. See DESC_ARENA_REUSE.
@@ -945,18 +1458,54 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
 #if DESC_ARENA_REUSE
             if (awDirty) {
                 awBase = (uint32_t)(255 - rel) * (uint32_t)len;
+#if DESC_ABLATE != 2
                 for (int x = 0; x < len; x++)
-                    arena[awBase + x] = (uint16_t)(ord[x] >> 8);
+                    arena[awBase + x] = (uint16_t)(DESC_ORD_POS(ord[x]) >> 8);
+#endif
                 awDirty = false;
             }
 #else
             awBase = (uint32_t)(255 - rel) * (uint32_t)len;
             for (int x = 0; x < len; x++)
-                arena[awBase + x] = (uint16_t)(ord[x] >> 8);
+                arena[awBase + x] = (uint16_t)(DESC_ORD_POS(ord[x]) >> 8);
 #endif
             // Split the ordered suffixes into maximal groups sharing the key's
             // leading bytes, and record each as one descriptor.
-            int i = 0;
+#if DESC_UNIFORM
+            if (uniform) {
+#if DESC_ABLATE != 5
+                const uint32_t off = (uint32_t)((size_t)g0 * 256 + awBase);
+                const int d = atomicAdd(&s_ndesc, 1);
+                PROF_TASK_EMIT();
+                sc.words[d] = ((uint64_t)DESC_KEYREL(k0, rel) << 32) |
+                              ((uint64_t)off << DESC_LEN_BITS) | (uint32_t)len;
+#endif
+            } else
+#endif
+#if DESC_SAMEKEY
+            // Where the next DESC_KEY_BYTES columns are all constant across the
+            // run, every block of the run has the same key bytes there, so the
+            // whole run is one group and the scan below can only prove it the
+            // long way -- it reads len keys out of shared memory and compares
+            // them to discover what the constant-column mask already knows.
+            // Measured on the CPU sort, 91% of columns are like this.
+            //
+            // The mask makes it free. col_mask already has one bit per column
+            // of this chunk, so ANDing it with itself shifted by one and two is
+            // the whole test, once per task rather than once per column. The
+            // chunk's top two columns fall out on their own: their bits would
+            // need columns from the chunk above, and the shift brings in zeros,
+            // so they take the scan.
+            if ((same_mask >> (rel - lo)) & 1ull) {
+                const uint32_t off = (uint32_t)((size_t)g0 * 256 + awBase);
+                const int d = atomicAdd(&s_ndesc, 1);
+                PROF_TASK_EMIT();
+                sc.words[d] = ((uint64_t)DESC_KEYREL(key[0], rel) << 32) |
+                              ((uint64_t)off << DESC_LEN_BITS) | (uint32_t)len;
+            } else
+#endif
+            {
+            int i = 0, groups = 0;
             while (i < len) {
                 const uint32_t k = key[i];
                 int j = i + 1;
@@ -966,9 +1515,18 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
 
                 const int d = atomicAdd(&s_ndesc, 1);
                 PROF_TASK_EMIT();
+#if DESC_ABLATE != 1
                 sc.words[d] = ((uint64_t)DESC_KEYREL(k, rel) << 32) |
                               ((uint64_t)off << DESC_LEN_BITS) | (uint32_t)(j - i);
+#endif
+                groups++;
                 i = j;
+            }
+#if DESC_UNIFORM
+            // The scan has just answered the question the state asks, so take
+            // its answer rather than asking again next column.
+            if (groups == 1) { uniform = true; k0 = key[0]; }
+#endif
             }
 
             if (rel == lo) break;
@@ -977,30 +1535,60 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
             // suffix, so the order does not change; col_same already knows, and
             // t[base+col] is that byte.
             const int col = rel - 1;
+#if DESC_COLMASK
+            if ((col_mask >> (col - lo)) & 1ull) {
+#else
             if (col_same[col - lo]) {
+#endif
                 const uint32_t c0 = (uint32_t)t[base + col];
+#if DESC_UNIFORM
+                // Equal keys stay equal: the same byte goes on the front of all
+                // of them. So while uniform this is one register and no shared
+                // memory at all.
+                if (uniform) { k0 = (c0 << 24) | (k0 >> 8); continue; }
+#endif
                 for (int x = 0; x < len; x++)
                     key[x] = (c0 << 24) | (key[x] >> 8);
                 continue;
             }
 
-            // ord is about to move, so the slot it lives in stops describing
-            // it and the next column has to write a fresh one.
-            awDirty = true;
+#if DESC_UNIFORM
+            // This column reads a byte per block, so the keys are about to
+            // stop being copies of one another. Put the register back into the
+            // array first; the scan below decides whether they are equal again.
+            if (uniform) {
+                for (int x = 0; x < len; x++) key[x] = k0;
+                uniform = false;
+            }
+#endif
 
-            const uint8_t c0 = (uint8_t)t[ord[0] + col];
-            key[0] = ((uint32_t)c0 << 24) | (key[0] >> 8);
-            for (int x = 1; x < len; x++) {
-                const uint8_t c = (uint8_t)t[ord[x] + col];
+#if DESC_ABLATE == 3
+            for (int x = 0; x < len; x++) {
+                const uint8_t c = (uint8_t)t[base + col];
                 key[x] = ((uint32_t)c << 24) | (key[x] >> 8);
             }
+#else
+            const uint8_t c0 = (uint8_t)t[DESC_ORD_POS(ord[0]) + col];
+            key[0] = ((uint32_t)c0 << 24) | (key[0] >> 8);
+            for (int x = 1; x < len; x++) {
+                const uint8_t c = (uint8_t)t[DESC_ORD_POS(ord[x]) + col];
+                key[x] = ((uint32_t)c << 24) | (key[x] >> 8);
+            }
+#endif
 
             // Stable insertion sort by that one byte, which is now the top byte
             // of the slid key, so this reads no text at all. The existing order
             // is exactly the right tie-break, which is what makes one byte
             // enough. ord and key permute together or they stop corresponding.
+#if DESC_ABLATE != 6
+            // The slot ord lives in stops describing it only if ord actually
+            // moves, and a column that is not constant is not the same thing as
+            // a column that reorders: the byte it prepends can differ between
+            // blocks and still arrive in the order they were already in. The
+            // sort knows -- it shifted something or it did not -- so the arena
+            // is rewritten on that and not on the weaker test.
             for (int x = 1; x < len; x++) {
-                const int32_t v = ord[x];
+                const DescOrd v = ord[x];
                 const uint32_t kv = key[x];
                 const uint8_t kb = (uint8_t)(kv >> 24);
                 int y = x;
@@ -1009,9 +1597,18 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                     key[y] = key[y - 1];
                     y--;
                 }
-                ord[y] = v;
-                key[y] = kv;
+                if (y != x) {
+                    ord[y] = v;
+                    key[y] = kv;
+                    awDirty = true;
+                }
+#if !DESC_DIRTY_MOVED
+                awDirty = true;
+#endif
             }
+#else
+            awDirty = true;
+#endif
         }
         PROF_TASK_END(len);
     }
@@ -1036,8 +1633,125 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
 
     // ---- 3. sort the descriptors by key. The key is the top 32 bits of the
     // word, so this is the block-wide radix sort with nothing packed around it.
+#if DESC_NO_RADIX
+    // SCAFFOLDING: skip the sort. The answer is wrong; the point is the time
+    // everything else takes, which is the ceiling on any faster sort.
+    uint64_t* sorted = sc.words;
+#elif DESC_MSD
+    // Two buffers and two moves: the scatter groups the descriptors by digit,
+    // the count below puts each one in its place. sc.words is dead after the
+    // scatter has read it, so the second move lands back there.
+    uint64_t* const bucketed = sc.words2;
+    uint16_t* const lowkey   = (uint16_t*)sc.offs;
+    uint64_t* sorted = sc.words;
+    {
+        // The bucket table doubles as the histogram, the scan and the cursors,
+        // which is what keeps it to one array of BINS+1 words: the scatter
+        // fills each bucket downward from its inclusive end, so when it is done
+        // the cursor has walked back to the bucket's start and the table reads
+        // as the bucket boundaries it needs next.
+#if DESC_MSD_PACKED16
+        uint32_t* const s_bkt = (uint32_t*)((char*)sh + BR_SHARED_BYTES);
+#else
+        int32_t* const s_bkt = (int32_t*)((char*)sh + BR_SHARED_BYTES);
+#endif
+        const int msdShift = 64 - DESC_MSD_BITS;
+
+#if DESC_MSD_PACKED16
+        // Every logical cursor and their inclusive prefixes must fit in one
+        // half-word. A pathological text can exceed this; declining sends it
+        // through the exact prefix-doubling fallback rather than truncating it.
+        if (nd > 65535) return -1;
+        for (int w = tid; w < DESC_MSD_WORDS; w += BR_BLOCK) s_bkt[w] = 0;
+        __syncthreads();
+        for (int i = tid; i < nd; i += BR_BLOCK)
+            descBucketAdd(s_bkt, (int)(sc.words[i] >> msdShift));
+        __syncthreads();
+        descBucketScan(s_bkt, sh);
+        if (tid == 0) s_bkt[DESC_MSD_BINS >> 1] = (uint32_t)nd;
+        __syncthreads();
+#else
+        for (int b = tid; b <= DESC_MSD_BINS; b += BR_BLOCK) s_bkt[b] = 0;
+        __syncthreads();
+        for (int i = tid; i < nd; i += BR_BLOCK)
+            atomicAdd(&s_bkt[(int)(sc.words[i] >> msdShift)], 1);
+        __syncthreads();
+        blockScanFlags(s_bkt, DESC_MSD_BINS, sh);   // inclusive, in place
+        if (tid == 0) s_bkt[DESC_MSD_BINS] = nd;
+        __syncthreads();
+#endif
+
+        for (int i = tid; i < nd; i += BR_BLOCK) {
+            const uint64_t w = sc.words[i];
+            const int b = (int)(w >> msdShift);
+#if DESC_MSD_PACKED16
+            const int p = (int)descBucketSub(s_bkt, b) - 1;
+#else
+            const int p = atomicSub(&s_bkt[b], 1) - 1;
+#endif
+            bucketed[p] = w;
+            // The bits the digit did not take, kept narrow for the count below.
+            // The top DESC_MSD_BITS agree inside a bucket, so what is left of a
+            // 24-bit key is 24 - DESC_MSD_BITS bits and fits a uint16 -- which
+            // means a whole bucket's keys arrive in one 32-byte sector instead
+            // of four. sc.offs is the offset scan's array and is not written
+            // until after this sort returns.
+            lowkey[p] = (uint16_t)(DESC_KEY_OF((uint32_t)(w >> 32)) & DESC_MSD_LOWMASK);
+        }
+        __syncthreads();
+
+        // Inside a bucket the top DESC_MSD_BITS agree, so ordering by the whole
+        // upper word orders by the rest of the key -- and by the column after
+        // it, which the LSD sort left to emission order and nothing reads.
+        //
+        // One thread per descriptor, not per bucket. A bucket holds about ten
+        // and an insertion sort over ten is nothing -- but an insertion sort
+        // reads and writes the element it is walking past, and those are global
+        // memory, so ten elements is ~45 *dependent* round trips and one thread
+        // owns all of them. Counting instead makes every read independent: a
+        // descriptor asks how many of its bucket-mates come before it and
+        // writes itself there, once. The reads are the same handful of words
+        // for every thread in the bucket, so they are an L1 broadcast, and
+        // nothing waits on anything.
+        //
+        // Ties are broken by position in the bucket so the placement is a
+        // permutation: two descriptors can carry the same key and the same
+        // column when they come from different runs.
+        for (int i = tid; i < nd; i += BR_BLOCK) {
+            const uint64_t w = bucketed[i];
+            const int b = (int)(w >> msdShift);
+#if DESC_MSD_PACKED16
+            const int lo = (int)descBucketGet(s_bkt, b);
+            const int hi = (int)descBucketGet(s_bkt, b + 1);
+#else
+            const int lo = s_bkt[b], hi = s_bkt[b + 1];
+#endif
+            if (hi - lo > DESC_MSD_MAX) { atomicExch(&s_fail, 1); continue; }
+#if DESC_MSD_LOWKEY
+            const uint32_t k = lowkey[i];
+            int rank = 0;
+            for (int j = lo; j < hi; j++) {
+                const uint32_t kj = lowkey[j];
+                rank += (kj < k) || (kj == k && j < i);
+            }
+#else
+            const uint32_t k = (uint32_t)(w >> 32);
+            int rank = 0;
+            for (int j = lo; j < hi; j++) {
+                const uint32_t kj = (uint32_t)(bucketed[j] >> 32);
+                rank += (kj < k) || (kj == k && j < i);
+            }
+#endif
+            sorted[lo + rank] = w;
+        }
+        __syncthreads();
+        if (s_fail) return -1;
+    }
+#else
+    blockRadixInit(sh);
     uint64_t* sorted = blockRadixSort(sc.words, sc.words2, nd,
-                                      32 + DESC_KEY_DROP, 32 - DESC_KEY_DROP, sh);
+                                      64 - DESC_GBITS, DESC_GBITS, sh);
+#endif
     PROF_ADD(PH_D_RADIX);
 
     // ---- 4. output offsets: an exclusive scan over the sorted lengths. A key
@@ -1081,6 +1795,26 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         uint32_t* const s_aof = (uint32_t*)(s_beg + BR_BLOCK);  // its arena slot
         uint32_t* const s_key = s_aof + BR_BLOCK;          // and its sort key
         __shared__ int32_t s_end;                          // one past the window
+#if DESC_OWNER_MAP
+        // Which descriptor owns each output position of the window, one byte
+        // each, in the radix scratch this step has not otherwise claimed.
+        //
+        // The search it replaces is eight *dependent* shared loads per output
+        // position, ~70,000 positions a hash. Ablating it -- taking the first
+        // descriptor of the window instead of the owning one, which is wrong
+        // but timed -- takes the phase from 312M cycles to 204M, so it is a
+        // third of it. An earlier note here says a coarse index for the same
+        // search measured null; that was against a kernel whose sort was four
+        // radix passes, and this phase was a fifth of the size it is now.
+        //
+        // Painting it costs one write per position against eight reads, and no
+        // extra shared memory: s_beg, s_aof and s_key take 3 KB of the 6.8 KB
+        // BlockRadixScratch, which is finished with by the time step 5a runs.
+        // A window whose span does not fit falls back to the search.
+        uint8_t* const s_own = (uint8_t*)(s_key + BR_BLOCK);
+        __shared__ int s_q0;      // first output position of the window
+        __shared__ int s_fits;    // the whole window fits in s_own
+#endif
 
         for (int dbase = 0; dbase < nd; dbase += BR_BLOCK) {
             const int nt = (nd - dbase) < BR_BLOCK ? (nd - dbase) : BR_BLOCK;
@@ -1092,8 +1826,23 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                 s_aof[tid] = (uint32_t)((w >> DESC_LEN_BITS) & 0xFFFFFu);
                 s_key[tid] = (uint32_t)(w >> 32);
                 if (tid == nt - 1) s_end = e;
+#if DESC_OWNER_MAP
+                if (tid == 0) {
+                    s_q0 = s_beg[0];
+                    s_fits = 1;
+                }
+#endif
             }
             __syncthreads();
+#if DESC_OWNER_MAP
+            if (s_fits && tid < nt) {
+                const int b = s_beg[tid] - s_q0;
+                const int e = b + (int)(sorted[dbase + tid] & DESC_LEN_MASK);
+                if (e > DESC_OWN_CAP) s_fits = 0;
+                else for (int z = b; z < e; z++) s_own[z] = (uint8_t)tid;
+            }
+            __syncthreads();
+#endif
 
             // Which key groups collide, answered here rather than in a pass of
             // its own. Step 5 used to walk all ~20,000 descriptors again to ask
@@ -1129,12 +1878,37 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                 // before q owns it. Eight steps of shared memory, against a
                 // walk through global memory.
                 int lo = 0, hi = nt - 1;
+#if DESC_OWNER_MAP
+#if DESC_ABLATE == 10
+                {
+                    int lo2 = 0, hi2 = nt - 1;
+                    while (lo2 < hi2) {
+                        const int mid = (lo2 + hi2 + 1) >> 1;
+                        if (s_beg[mid] <= q) lo2 = mid; else hi2 = mid - 1;
+                    }
+                    if (s_fits && (int)s_own[q - s_q0] != lo2) {
+                        sa[q] = -1; continue;
+                    }
+                }
+#endif
+                if (s_fits && DESC_ABLATE != 9) {
+                    lo = (int)s_own[q - s_q0];
+                } else
+#endif
+                {
+#if DESC_ABLATE != 7
                 while (lo < hi) {
                     const int mid = (lo + hi + 1) >> 1;
                     if (s_beg[mid] <= q) lo = mid; else hi = mid - 1;
                 }
+#endif
+                }
+#if DESC_ABLATE == 8
+                sa[q] = (int32_t)DESC_REL_OF(s_key[lo]);
+#else
                 sa[q] = (int32_t)(((uint32_t)sc.arena[s_aof[lo] + (q - s_beg[lo])] << 8) |
                                   DESC_REL_OF(s_key[lo]));
+#endif
             }
             __syncthreads();
         }
@@ -1291,7 +2065,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                     int p1 = ba[l + 1], e1 = ba[l + 2];
                     while (p0 < e0 && p1 < e1) {
                         // 4: every position here shares the group's key.
-                        b[pos++] = descSuffixLessFrom(t, n, a[p1], a[p0], DESC_KEY_BYTES)
+                        b[pos++] = descSuffixLessFrom(t, n, a[p1], a[p0], DESC_CMP_FROM)
                                        ? a[p1++] : a[p0++];
                     }
                     while (p0 < e0) b[pos++] = a[p0++];
@@ -1416,7 +2190,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                     while (lo < hi) {
                         const int mid = (lo + hi + 1) >> 1;
                         if (descSuffixLessFrom(t, n, a[s1 + diag - mid],
-                                               a[s0 + mid - 1], DESC_KEY_BYTES))
+                                               a[s0 + mid - 1], DESC_CMP_FROM))
                             hi = mid - 1;
                         else
                             lo = mid;
@@ -1428,7 +2202,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                     while (d < stop) {
                         const bool takeB = (i >= n0) ||
                             (j < n1 && descSuffixLessFrom(t, n, a[s1 + j],
-                                                          a[s0 + i], DESC_KEY_BYTES));
+                                                          a[s0 + i], DESC_CMP_FROM));
                         b[d++] = takeB ? a[s1 + j++] : a[s0 + i++];
                     }
                 }

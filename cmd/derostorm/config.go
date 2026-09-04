@@ -15,8 +15,8 @@ import (
 const configName = "derostorm.json"
 
 type Config struct {
-	Node    string `json:"node"`
-	Wallet  string `json:"wallet"`
+	Node   string `json:"node"`
+	Wallet string `json:"wallet"`
 	// CPU mining threads. Zero turns the CPU off for GPU-only mining, for
 	// running a separate CPU miner beside this one; it needs a GPU in
 	// `gpus`, or nothing mines at all.
@@ -32,8 +32,8 @@ type Config struct {
 	GPUs     []int `json:"gpus,omitempty"`
 	GPUBatch int   `json:"gpu_batch,omitempty"`
 
-	// GPUBlocks pins the suffix kernel's resident block count. 0 means four
-	// blocks per SM, which is where this kernel plateaus (336 on a 5080).
+	// GPUBlocks pins the suffix kernel's grid-block count. 0 uses the
+	// runtime-derived occupancy/VRAM ceiling.
 	GPUBlocks int `json:"gpu_blocks,omitempty"`
 }
 

@@ -3,8 +3,8 @@ package main
 // The GPU benchmark, behind --bench.
 //
 // It exists because the GPU's throughput depends on how many suffix blocks
-// are resident (see gpu_tune.go), and someone tuning a machine wants to see
-// that curve. Mining sits at four per SM; this still sweeps, so a new kernel
+// are in its grid (see gpu_tune.go), and someone tuning a machine wants to see
+// that curve. Mining uses the runtime ceiling; this still sweeps, so a new kernel
 // can move the peak without anyone guessing. It also checks a kernel change
 // without connecting to a node.
 //
@@ -65,7 +65,7 @@ func runGPUBench(t *Theme, device int, batch int) float64 {
 
 	fmt.Printf("  %s\n", t.C(t.Muted, g.Name()))
 	fmt.Printf("  %s\n\n", t.C(t.Dim, fmt.Sprintf(
-		"%d hashes per batch · up to %d resident blocks", g.Batch(), g.MaxBlocks())))
+		"%d hashes per batch · up to %d grid blocks", g.Batch(), g.MaxBlocks())))
 
 	// Prove the device before reporting a number for it: a card that disagrees
 	// with the CPU has a hashrate of zero however fast it runs.

@@ -111,6 +111,41 @@
 #define DSA_BSWAP64(v) (((uint64_t)DSA_BSWAP32((uint32_t)(v)) << 32) |          (uint64_t)DSA_BSWAP32((uint32_t)((v) >> 32)))
 #endif
 
+/* SCAFFOLDING: leave one thing out of the merge's singleton group and time what
+ * is left. Every setting but 0 produces a wrong suffix array, so sabench has to
+ * be run with its force argument: native\sabench.exe gpu/vectors.bin 3 1 1
+ *
+ *   1  no arena read (the value stored is the column alone)
+ *   2  no store
+ *   3  no group body at all -- only the walk over the descriptors and the key
+ *      test that separates a singleton from a collision
+ *
+ * One thread, best of three over the 512 real texts, against 6,711 texts/s:
+ * 6,793 at 1, 6,669 at 2, and 9,157 at 3. So the body is 37% of the sort, and
+ * neither the read nor the store is any of it on its own -- taking either one
+ * away leaves the loop exactly as fast, and taking both away is worth a third.
+ * That is a throughput limit rather than a latency one, and it is why the store
+ * shapes below all measure the same.
+ */
+#ifndef DSA_MABLATE
+#define DSA_MABLATE 0
+#endif
+
+/* How the singleton group's positions are written.
+ *
+ *   0  AVX2 masked store, lane mask from a table indexed by len   6,645 / 6,797
+ *   1  the same store, lane mask from a compare instead           6,685 / 6,696
+ *   2  AVX-512 masked store, needs /arch:AVX512                   6,836 / 6,811
+ *
+ * Two rounds each, one thread, interleaved. The mask table load is free and the
+ * AVX-512 form is at best 1-2%, which does not justify a second code path and a
+ * runtime dispatch -- and /arch:AVX512 changes codegen across the whole file
+ * rather than just here, so even that 1-2% is not attributable. 0 ships.
+ */
+#ifndef DSA_MSTYLE
+#define DSA_MSTYLE 0
+#endif
+
 /* ---------------------------------------------------------------------------
  * Phase timing, compiled to nothing unless DSA_PROF is defined.
  *
@@ -244,6 +279,90 @@ unsigned long long dsa_stat[9];
 #define DSA_LEN_MASK  ((1u << DSA_LEN_BITS) - 1u)
 #define DSA_MAX_OFF   (1u << (32 - DSA_LEN_BITS))
 
+/* The arena holds a block index, not a position, and the column lives in the
+ * descriptor's spare byte.
+ *
+ * A three-byte key leaves the top eight bits of Desc.key unused, and the radix
+ * sort already only orders the low twenty-four (two passes of twelve). Every
+ * position this sort emits is `block * 256 + column`, and every position in one
+ * descriptor shares the column -- a descriptor *is* one column of one run -- so
+ * the column belongs in the descriptor and the arena needs only the block.
+ *
+ * That halves the arena: 277 KB of uint32 becomes 138 KB of uint16, on a
+ * working set that is about a megabyte against a 1 MB L2. It halves what the
+ * column walk writes and what the merge reads, and the merge pays one shift and
+ * one OR to put the two halves back together.
+ *
+ * The GPU sort has been shaped this way since 1.6; this is the same change on
+ * the CPU. Define DSA_COMPACT_ARENA=0 for the old layout. */
+#ifndef DSA_COMPACT_ARENA
+#define DSA_COMPACT_ARENA 1
+#endif
+
+/* Columns that share an order share one arena slice.
+ *
+ * This is what the compact arena is for. With positions in the arena every
+ * column's entries differ, because the column is part of the number; with block
+ * indices they differ only when the *order* differs, and a constant column
+ * leaves the order alone by definition. About 70% of columns are constant
+ * across their run, and a one-block run has 256 of them, so the walk writes the
+ * arena a fraction as often and the arena itself stops being one slot per
+ * suffix.
+ *
+ * Correctness does not depend on which slice a descriptor points at, only that
+ * the slice holds its blocks in order: the groups of a column partition
+ * order[0..blocks) in order, so every group is a contiguous run of whatever
+ * slice currently holds it.
+ *
+ * Requires DSA_COMPACT_ARENA. Define DSA_ARENA_REUSE=0 to write every column. */
+#ifndef DSA_ARENA_REUSE
+#define DSA_ARENA_REUSE DSA_COMPACT_ARENA
+#endif
+
+/* Carry "every block of this run has the same key" as a state.
+ *
+ * The same_key table below asks the question one column at a time, from the
+ * constant-column mask. Carrying the answer instead is strictly stronger --
+ * three constant columns mean the keys agree, but the keys can agree without
+ * them -- and it buys two things the table cannot.
+ *
+ * While the keys are all equal, `blocks` of them in memory are copies of one
+ * register, so a constant column slides the register and leaves the array
+ * alone. And a constant column prepends the *same byte* to every suffix, so it
+ * needs one text read rather than one per block, whether the keys agree or not:
+ * the old slide read t[order[x]+col] for every x on every column, and about 70%
+ * of columns are constant.
+ *
+ * The state can only change at a column that is not constant, which is the one
+ * column that has to read per block anyway. Ported from gpu/desc.cuh, where it
+ * measured +2%. Define DSA_UNIFORM=0 for the old shape. */
+#ifndef DSA_UNIFORM
+#define DSA_UNIFORM 1
+#endif
+
+
+#if DSA_ARENA_REUSE && !DSA_COMPACT_ARENA
+#error "DSA_ARENA_REUSE needs the compact arena: positions carry the column"
+#endif
+
+#if DSA_COMPACT_ARENA
+typedef uint16_t Arena;
+#define DSA_KEY_MASK   0x00FFFFFFu
+#define DSA_KEY_EQ(a, b) ((((a) ^ (b)) & DSA_KEY_MASK) == 0)
+#define DSA_KEYREL(k, rel) ((k) | ((uint32_t)(rel) << 24))
+#define DSA_REL_OF(k)  ((k) >> 24)
+#define DSA_POS(a, rel) (((uint32_t)(a) << 8) | (uint32_t)(rel))
+#define DSA_ARENA_VAL(blk, pos) (blk)
+#else
+typedef uint32_t Arena;
+#define DSA_KEY_MASK   0xFFFFFFFFu
+#define DSA_KEY_EQ(a, b) ((a) == (b))
+#define DSA_KEYREL(k, rel) (k)
+#define DSA_REL_OF(k)  0u
+#define DSA_POS(a, rel) (a)
+#define DSA_ARENA_VAL(blk, pos) (pos)
+#endif
+
 typedef struct {
     uint32_t key;    /* the four leading bytes, big-endian so it sorts as bytes */
     uint32_t packed; /* arena offset in the high bits, length in the low ones */
@@ -295,7 +414,7 @@ typedef char dsa_off_fits[((256 * 384) <= (int)DSA_MAX_OFF) ? 1 : -1];
 #endif
 
 typedef struct {
-    uint32_t* arena;    /* n positions, grouped by descriptor */
+    Arena*    arena;    /* n block indices, grouped by descriptor */
     Desc*     desc;     /* descriptors, then their radix-sorted copy */
     Desc*     desc2;
     uint32_t* order;    /* the run's block starts, in current column order */
@@ -352,7 +471,7 @@ static Scratch* scratch_get(size_t n, size_t want_desc)
     s->cap = n;
     s->desc_cap = want_desc;
     const size_t gcap = DSA_GROUP_CAP;
-    s->arena = (uint32_t*)malloc((n + 8) * sizeof(uint32_t));
+    s->arena = (Arena*)malloc((n + 16) * sizeof(Arena));
     s->desc  = (Desc*)malloc(want_desc * sizeof(Desc));
     s->desc2 = (Desc*)malloc(want_desc * sizeof(Desc));
     s->order = (uint32_t*)malloc((DSA_RUN_MAX + 8) * sizeof(uint32_t));
@@ -711,9 +830,27 @@ static inline void column_step_keys(uint32_t* order, uint32_t* keys, uint32_t* t
  */
 /* order[x] + column, written into the arena. Typical run length is ~4, so the
  * 4-wide path is the one that matters; 8-wide covers the long-run tail. */
-static inline void emit_ord_plus(uint32_t* dst, const uint32_t* order,
+static inline void emit_ord_plus(Arena* dst, const uint32_t* order,
                                  uint32_t n, uint32_t r)
 {
+#if DSA_COMPACT_ARENA
+    /* order[] holds block starts, so the block index is one shift and the
+     * column is not written at all. Packed sixteen bits at a time. */
+    (void)r;
+    uint32_t x = 0;
+#if defined(DSA_AVX2)
+    for (; x + 8 <= n; x += 8) {
+        const __m256i v = _mm256_srli_epi32(
+            _mm256_loadu_si256((const __m256i*)(order + x)), 8);
+        /* packus takes the low sixteen bits of each lane, then the permute
+         * undoes the 128-bit lane interleave it leaves behind. */
+        const __m256i pk = _mm256_permute4x64_epi64(
+            _mm256_packus_epi32(v, v), 0xD8);
+        _mm_storeu_si128((__m128i*)(dst + x), _mm256_castsi256_si128(pk));
+    }
+#endif
+    for (; x < n; x++) dst[x] = (Arena)(order[x] >> 8);
+#else
 #if defined(DSA_AVX2)
     const __m256i add8 = _mm256_set1_epi32((int32_t)r);
     const __m128i add4 = _mm_set1_epi32((int32_t)r);
@@ -737,6 +874,7 @@ static inline void emit_ord_plus(uint32_t* dst, const uint32_t* order,
 #else
     for (uint32_t x = 0; x < n; x++) dst[x] = order[x] + r;
 #endif
+#endif
 }
 
 
@@ -755,11 +893,22 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
      * constant masks removes common fixed work on every architecture. */
     if (blocks == 1) {
         uint32_t key = key32(t, n, base + DSA_BLOCK - 1);
+#if DSA_ARENA_REUSE
+        /* One block, so every column's arena entry is the same block index and
+         * all 256 descriptors point at one slot. */
+        const uint32_t one_off = (uint32_t)*arena_len;
+        s->arena[(*arena_len)++] = (Arena)first_block;
+#endif
         for (int rel = DSA_BLOCK - 1; rel >= 0; rel--) {
             Desc* d = &s->desc[*desc_len];
-            d->key = key;
+            d->key = DSA_KEYREL(key, rel);
+#if DSA_ARENA_REUSE
+            d->packed = desc_pack(one_off, 1);
+#else
             d->packed = desc_pack((uint32_t)*arena_len, 1);
-            s->arena[(*arena_len)++] = base + (uint32_t)rel;
+            s->arena[(*arena_len)++] = (Arena)DSA_ARENA_VAL(first_block,
+                                                      base + (uint32_t)rel);
+#endif
             (*desc_len)++;
             if (rel != 0) {
                 key = ((uint32_t)t[base + (uint32_t)rel - 1] <<
@@ -781,21 +930,37 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
         int swapped = suffix_less(t, n, b1 + DSA_BLOCK - 1,
                                   b0 + DSA_BLOCK - 1);
 
+#if DSA_ARENA_REUSE
+        uint32_t aw_off = 0;
+        int aw_dirty = 1;
+#endif
         for (int rel = DSA_BLOCK - 1; rel >= 0; rel--) {
-            const uint32_t off = (uint32_t)*arena_len;
             const uint32_t first = swapped ? b1 : b0;
             const uint32_t second = swapped ? b0 : b1;
             const uint32_t first_key = swapped ? key1 : key0;
             const uint32_t second_key = swapped ? key0 : key1;
-            s->arena[(*arena_len)++] = first + (uint32_t)rel;
-            s->arena[(*arena_len)++] = second + (uint32_t)rel;
+#if DSA_ARENA_REUSE
+            if (aw_dirty) {
+                aw_off = (uint32_t)*arena_len;
+                s->arena[(*arena_len)++] = (Arena)(first >> 8);
+                s->arena[(*arena_len)++] = (Arena)(second >> 8);
+                aw_dirty = 0;
+            }
+            const uint32_t off = aw_off;
+#else
+            const uint32_t off = (uint32_t)*arena_len;
+            s->arena[(*arena_len)++] = (Arena)DSA_ARENA_VAL(first >> 8,
+                                                      first + (uint32_t)rel);
+            s->arena[(*arena_len)++] = (Arena)DSA_ARENA_VAL(second >> 8,
+                                                      second + (uint32_t)rel);
+#endif
 
             Desc* d = &s->desc[(*desc_len)++];
-            d->key = first_key;
+            d->key = DSA_KEYREL(first_key, rel);
             d->packed = desc_pack(off, first_key == second_key ? 2 : 1);
             if (first_key != second_key) {
                 d = &s->desc[(*desc_len)++];
-                d->key = second_key;
+                d->key = DSA_KEYREL(second_key, rel);
                 d->packed = desc_pack(off + 1, 1);
             }
 
@@ -805,7 +970,13 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
                 const uint8_t c1 = t[b1 + col];
                 key0 = ((uint32_t)c0 << (8 * (DSA_KEY_BYTES - 1))) | (key0 >> 8);
                 key1 = ((uint32_t)c1 << (8 * (DSA_KEY_BYTES - 1))) | (key1 >> 8);
-                if (c0 != c1) swapped = c1 < c0;
+                if (c0 != c1) {
+                    const int next = c1 < c0;
+#if DSA_ARENA_REUSE
+                    aw_dirty |= (next != swapped);
+#endif
+                    swapped = next;
+                }
             }
         }
         return 1;
@@ -885,6 +1056,7 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
     }
 #endif
 
+#if !DSA_UNIFORM
     /* Columns where the next DSA_KEY_BYTES are all constant.
      *
      * Where they are, every block of the run has the same DSA_KEY_BYTES bytes at
@@ -907,6 +1079,7 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
     }
     for (uint32_t rel = DSA_BLOCK - DSA_KEY_BYTES + 1; rel < DSA_BLOCK; rel++)
         same_key[rel] = 0;
+#endif
 
     /* One key per block, slid rather than re-read. A descriptor key is the
      * DSA_KEY_BYTES bytes at order[x]+rel, and stepping to column rel-1 keeps
@@ -921,6 +1094,20 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
     uint32_t keys[DSA_RUN_MAX];
     for (uint32_t i = 0; i < blocks; i++) keys[i] = key32(t, n, order[i] + 255);
     const uint32_t key_shift = 8u * (DSA_KEY_BYTES - 1);
+#if DSA_UNIFORM
+    uint32_t k0 = keys[0];
+    int uniform = 1;
+    for (uint32_t i = 1; i < blocks; i++) {
+        if (keys[i] != k0) { uniform = 0; break; }
+    }
+#endif
+
+#if DSA_ARENA_REUSE
+    /* The arena slice that currently holds order[0..blocks), and whether the
+     * order has moved since it was written there. */
+    uint32_t aw_off = 0;
+    int      aw_dirty = 1;
+#endif
 
     for (int rel = DSA_BLOCK - 1; rel >= 0; rel--) {
         const uint32_t r = (uint32_t)rel;
@@ -929,33 +1116,68 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
          * their leading key bytes, and record each as one descriptor. */
         if (*desc_len + blocks > desc_room) return 0;   /* grow and retry */
 
-#ifndef DSA_NO_SAME4
+#if DSA_ARENA_REUSE
+        if (aw_dirty) {
+            aw_off = (uint32_t)*arena_len;
+            emit_ord_plus(s->arena + aw_off, order, blocks, r);
+            *arena_len += blocks;
+            aw_dirty = 0;
+        }
+#endif
+
+#if DSA_UNIFORM
+        if (uniform) {
+            Desc* d = &s->desc[*desc_len];
+            d->key = DSA_KEYREL(k0, r);
+#if DSA_ARENA_REUSE
+            d->packed = desc_pack(aw_off, blocks);
+#else
+            d->packed = desc_pack((uint32_t)*arena_len, blocks);
+            emit_ord_plus(s->arena + *arena_len, order, blocks, r);
+            *arena_len += blocks;
+#endif
+            (*desc_len)++;
+        } else
+#elif !defined(DSA_NO_SAME4)
         if (same_key[r]) {
             /* Every block shares this column's key bytes, so there is exactly
              * one group and the scan below would only prove it the long way. */
             Desc* d = &s->desc[*desc_len];
-            d->key = keys[0];
+            d->key = DSA_KEYREL(keys[0], r);
+#if DSA_ARENA_REUSE
+            d->packed = desc_pack(aw_off, blocks);
+#else
             d->packed = desc_pack((uint32_t)*arena_len, blocks);
             emit_ord_plus(s->arena + *arena_len, order, blocks, r);
             *arena_len += blocks;
+#endif
             (*desc_len)++;
         } else
 #endif
         {
-            uint32_t i = 0;
+            uint32_t i = 0, groups = 0;
             while (i < blocks) {
                 const uint32_t k = keys[i];
                 uint32_t j = i + 1;
                 while (j < blocks && keys[j] == k) j++;
 
                 Desc* d = &s->desc[*desc_len];
-                d->key = k;
+                d->key = DSA_KEYREL(k, r);
+#if DSA_ARENA_REUSE
+                d->packed = desc_pack(aw_off + i, j - i);
+#else
                 d->packed = desc_pack((uint32_t)*arena_len, j - i);
                 emit_ord_plus(s->arena + *arena_len, order + i, j - i, r);
                 *arena_len += (j - i);
+#endif
                 (*desc_len)++;
+                groups++;
                 i = j;
             }
+#if DSA_UNIFORM
+            /* The scan has just answered the question the state asks. */
+            if (groups == 1) { uniform = 1; k0 = keys[0]; }
+#endif
         }
 
         if (rel == 0) break;
@@ -965,6 +1187,32 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
          * order is unchanged and there is nothing further to do. */
         const uint32_t col = r - 1;
         uint32_t x = 0;
+#if DSA_UNIFORM
+        if (constant[col]) {
+            /* One byte for the whole run, not one per block. */
+            const uint32_t c = t[base + col];
+            if (uniform) {
+                k0 = (c << key_shift) | (k0 >> 8);
+                continue;
+            }
+            const uint32_t hi = c << key_shift;
+#if defined(DSA_AVX2)
+            const __m128i bc = _mm_set1_epi32((int)hi);
+            for (; x + 4 <= blocks; x += 4) {
+                const __m128i k = _mm_loadu_si128((const __m128i*)(keys + x));
+                _mm_storeu_si128((__m128i*)(keys + x),
+                                 _mm_or_si128(_mm_srli_epi32(k, 8), bc));
+            }
+#endif
+            for (; x < blocks; x++) keys[x] = hi | (keys[x] >> 8);
+            continue;
+        }
+        if (uniform) {
+            /* About to read per block, so put the register back in the array. */
+            for (uint32_t y = 0; y < blocks; y++) keys[y] = k0;
+            uniform = 0;
+        }
+#endif
 #if defined(DSA_AVX2)
         for (; x + 4 <= blocks; x += 4) {
             const uint32_t c0 = t[order[x] + col];
@@ -995,9 +1243,24 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
             keys[x] = ((uint32_t)c << key_shift) | (keys[x] >> 8);
         }
 #if !defined(DSA_ABLATE)
+#if DSA_UNIFORM
+        {   /* col is not constant here; the branch above returned otherwise. */
+            column_step_keys(order, keys, s->order2, blocks);
+#if DSA_ARENA_REUSE
+            aw_dirty = 1;
+#endif
+        }
+#else
         if (!constant[col]) {
             column_step_keys(order, keys, s->order2, blocks);
+#if DSA_ARENA_REUSE
+            /* The order may have moved, so the slice it lives in stops
+             * describing it. Conservative: a sort that changed nothing still
+             * costs one rewrite, which is cheaper than proving it did not. */
+            aw_dirty = 1;
+#endif
         }
+#endif
 #endif
     }
     return 1;
@@ -1188,15 +1451,19 @@ retry:
         const uint32_t key_shift = 8u * (DSA_KEY_BYTES - 1);
         for (size_t p = n; p-- > tail;) {
             Desc* d = &s->desc[desc_len++];
-            d->key = key;
+            d->key = DSA_KEYREL(key, (uint32_t)p & 255u);
             d->packed = desc_pack((uint32_t)arena_len, 1);
-            s->arena[arena_len++] = (uint32_t)p;
+            s->arena[arena_len++] = (Arena)DSA_ARENA_VAL((uint32_t)p >> 8, (uint32_t)p);
             if (p != tail)
                 key = ((uint32_t)t[p - 1] << key_shift) | (key >> 8);
         }
     }
 
+#if DSA_ARENA_REUSE
+    if (arena_len > n) return -4;    /* reuse only ever writes fewer */
+#else
     if (arena_len != n) return -4;   /* every suffix exactly once */
+#endif
     PROF_LAP(PH_TAIL);
     PROF_STAT(ST_DESC, desc_len);
     PROF_MAX(ST_MAXDESC, desc_len);
@@ -1249,10 +1516,19 @@ retry:
          * Checking one key rather than scanning forward for the end of the
          * group also matters -- a singleton is settled by a single comparison.
          */
-        if (i + 1 == desc_len || ds[i + 1].key != d0->key) {
+        if (i + 1 == desc_len || !DSA_KEY_EQ(ds[i + 1].key, d0->key)) {
             PROF_STAT(ST_KEYGRP, 1);
-            const uint32_t* src = s->arena + dsa_off(*d0);
+            const Arena* src = s->arena + dsa_off(*d0);
             const uint32_t len = dsa_len(*d0);
+#if DSA_COMPACT_ARENA
+            /* Every position in a descriptor shares its column, so the arena's
+             * block index is widened and the column ORed back in eight lanes at
+             * a time. Two extra vector operations for half the bytes read. */
+            const uint32_t rel = DSA_REL_OF(d0->key);
+#else
+            const uint32_t rel = 0;
+            (void)rel;
+#endif
             /* Four unconditional stores instead of a loop of `len`.
              *
              * len is one to a handful and unpredictable, so the loop cost a
@@ -1263,7 +1539,12 @@ retry:
              * at out+len and overwrites anything written past it, the arena has
              * eight words of slack so the reads stay in bounds, and the guard
              * keeps the last group from running off the end of sa. */
-#if defined(DSA_AVX2)
+#if DSA_MABLATE == 3
+            /* SCAFFOLDING: the singleton group's whole body removed, so what is
+             * left is the walk over the descriptor array and the key test. The
+             * answer is wrong; the point is what the group body costs. */
+            (void)src;
+#elif defined(DSA_AVX2)
             /* Exactly len words, with no branch and no overlap.
              *
              * This is the third version of four stores. Writing len of them in a
@@ -1297,22 +1578,57 @@ retry:
                     {-1, -1, -1, -1, -1, -1, -1,  0},
                     {-1, -1, -1, -1, -1, -1, -1, -1},
                 };
-                const __m256i m = _mm256_loadu_si256((const __m256i*)maskTab[len]);
+#if DSA_MABLATE == 1
+                const __m256i v = _mm256_set1_epi32((int32_t)rel);
+#elif DSA_COMPACT_ARENA
+                const __m256i v = _mm256_or_si256(
+                    _mm256_slli_epi32(
+                        _mm256_cvtepu16_epi32(
+                            _mm_loadu_si128((const __m128i*)src)), 8),
+                    _mm256_set1_epi32((int32_t)rel));
+#else
                 const __m256i v = _mm256_loadu_si256((const __m256i*)src);
+#endif
+#if DSA_MSTYLE == 1
+                /* The lane mask from a compare rather than from a table.
+                 *
+                 * maskTab[len] is a 32-byte load whose address depends on len,
+                 * which depends on the descriptor word just loaded: two
+                 * dependent loads in front of the store. The same mask is three
+                 * ALU instructions and no memory at all. */
+                const __m256i m = _mm256_cmpgt_epi32(
+                    _mm256_set1_epi32((int32_t)len),
+                    _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+#else
+                const __m256i m = _mm256_loadu_si256((const __m256i*)maskTab[len]);
+#endif
+#if DSA_MABLATE == 2
+                if (out == (size_t)-1) _mm256_maskstore_epi32(sa + out, m, v);
+#elif DSA_MSTYLE == 2
+                /* AVX-512's masked store, which is one instruction with a mask
+                 * register. VPMASKMOVD -- what _mm256_maskstore_epi32 compiles
+                 * to -- is microcoded on every AMD part to date. */
+                (void)m;
+                _mm256_mask_storeu_epi32(sa + out, (__mmask8)((1u << len) - 1u), v);
+#else
                 _mm256_maskstore_epi32(sa + out, m, v);
+#endif
+
             } else {
-                for (uint32_t z = 0; z < len; z++) sa[out + z] = (int32_t)src[z];
+                for (uint32_t z = 0; z < len; z++)
+                    sa[out + z] = (int32_t)DSA_POS(src[z], rel);
             }
 #else
             /* No AVX2: four unconditional stores, which is still better than a
              * loop of len. The guard keeps the last group from running past sa. */
             if (len <= 4 && out + 4 <= n) {
-                sa[out + 0] = (int32_t)src[0];
-                sa[out + 1] = (int32_t)src[1];
-                sa[out + 2] = (int32_t)src[2];
-                sa[out + 3] = (int32_t)src[3];
+                sa[out + 0] = (int32_t)DSA_POS(src[0], rel);
+                sa[out + 1] = (int32_t)DSA_POS(src[1], rel);
+                sa[out + 2] = (int32_t)DSA_POS(src[2], rel);
+                sa[out + 3] = (int32_t)DSA_POS(src[3], rel);
             } else {
-                for (uint32_t z = 0; z < len; z++) sa[out + z] = (int32_t)src[z];
+                for (uint32_t z = 0; z < len; z++)
+                    sa[out + z] = (int32_t)DSA_POS(src[z], rel);
             }
 #endif
             out += len;
@@ -1321,7 +1637,7 @@ retry:
         }
 
         size_t j = i + 1;
-        while (j < desc_len && ds[j].key == ds[i].key) j++;
+        while (j < desc_len && DSA_KEY_EQ(ds[j].key, ds[i].key)) j++;
 
         PROF_STAT(ST_KEYGRP, 1);
         {
@@ -1362,7 +1678,16 @@ retry:
                 const Desc* d = &ds[k];
                 ba[nlist++] = (uint32_t)total;
                 const uint32_t dl = dsa_len(*d);
+#if DSA_COMPACT_ARENA
+                /* Expanded once, here, so the merge below compares positions
+                 * exactly as it always has. */
+                const Arena* asrc = s->arena + dsa_off(*d);
+                const uint32_t drel = DSA_REL_OF(d->key);
+                for (uint32_t z = 0; z < dl; z++)
+                    a[total + z] = DSA_POS(asrc[z], drel);
+#else
                 memcpy(a + total, s->arena + dsa_off(*d), dl * sizeof(uint32_t));
+#endif
                 total += dl;
             }
             ba[nlist] = (uint32_t)total;

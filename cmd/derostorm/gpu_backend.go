@@ -429,7 +429,7 @@ type GPUContext struct {
 	batch   int
 	name    string
 
-	// blocks is the resident block count of the suffix kernel currently in
+	// blocks is the grid-block count of the suffix kernel currently in
 	// force, and maxBlocks the largest the context was allocated for. This is
 	// the one knob worth tuning per card; see tuneBlocks in gpu_worker.go.
 	blocks    int
@@ -450,9 +450,8 @@ type GPUContext struct {
 }
 
 // NewGPUContext opens a device. batch is the number of nonces hashed per call;
-// pass 0 to let the library size it. blocks is the resident block count to
-// reserve suffix-kernel scratch for; pass 0 for four blocks per SM, which is
-// where this kernel plateaus.
+// pass 0 to let the library size it. blocks is the grid-block count to reserve
+// suffix-kernel scratch for; pass 0 for the runtime-derived ceiling.
 func NewGPUContext(device, batch, blocks int) (*GPUContext, error) {
 	devs := gpuDeviceList()
 	if device < 0 || device >= len(devs) {
@@ -481,7 +480,7 @@ func NewGPUContext(device, batch, blocks int) (*GPUContext, error) {
 	return g, nil
 }
 
-// Blocks is the resident block count the suffix kernel is running with.
+// Blocks is the grid-block count the suffix kernel is running with.
 func (g *GPUContext) Blocks() int { return g.blocks }
 
 // MaxBlocks is the largest value SetBlocks will accept.
@@ -500,7 +499,7 @@ func (g *GPUContext) Kind() string {
 	return g.backend.kind
 }
 
-// SetBlocks changes the resident block count. Call it with nothing in flight:
+// SetBlocks changes the grid-block count. Call it with nothing in flight:
 // it takes effect at the next launch, so a change made between a Submit and its
 // Collect lands on the batch after the one being measured. That is why the
 // block sweep uses Search rather than the pipeline.

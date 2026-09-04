@@ -9,7 +9,7 @@
 // and blocks share SMs so a block's elapsed cycles include its neighbour's work.
 // The share each phase takes is what decides where to work next.
 //
-//   nvcc -O3 -arch=sm_120 -DBR_BLOCK=1024 -o gpu/prof/prof.exe gpu/prof/prof.cu
+//   nvcc -O3 -arch=sm_120 -DBR_BLOCK=256 -o gpu/prof/prof.exe gpu/prof/prof.cu
 //   gpu\prof\prof.exe gpu\vectors.bin
 
 #include <cstdio>
@@ -45,7 +45,17 @@ struct Pool {
     }
 };
 
-__global__ __launch_bounds__(BR_BLOCK) void prof_kernel(
+// The shipped occupancy bound, or the profile is of an image the miner does not
+// run: derostorm_gpu.cu gives this kernel 5 blocks per SM on Blackwell and 4
+// elsewhere, and the register budget that follows decides what spills.
+#ifndef PROF_OCC
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#define PROF_OCC 5
+#else
+#define PROF_OCC 4
+#endif
+#endif
+__global__ __launch_bounds__(BR_BLOCK, PROF_OCC) void prof_kernel(
         const uint8_t* texts, const int32_t* lens, int stride,
         Pool pool, int count, int32_t* saOut, int32_t* next)
 {
@@ -117,10 +127,13 @@ int main(int argc, char** argv)
            v.count, v.maxLen, BR_SHARED_BYTES / 1024.0);
 
     CK(cudaFuncSetAttribute(prof_kernel,
-                            cudaFuncAttributeMaxDynamicSharedMemorySize, BR_SHARED_BYTES));
+                            cudaFuncAttributeMaxDynamicSharedMemorySize, DESC_LAUNCH_SHARED));
 
     const int stride = v.maxLen;
-    const int blocks = 2 * p.multiProcessorCount; // the resident maximum
+    // SCAFFOLDING: 2 per SM by default, overridable, because a phase that only
+    // shows up when four blocks share an SM is invisible at two.
+    int blocks = 2 * p.multiProcessorCount;
+    if (const char* e = getenv("DSG_PROF_BLOCKS")) { const int v = atoi(e); if (v > 0) blocks = v; }
     const int count  = v.count;
 
     uint8_t* dTexts = nullptr;
@@ -152,7 +165,7 @@ int main(int argc, char** argv)
     CK(cudaEventCreate(&a));
     CK(cudaEventCreate(&b));
     CK(cudaEventRecord(a));
-    prof_kernel<<<blocks, BR_BLOCK, BR_SHARED_BYTES>>>(
+    prof_kernel<<<blocks, BR_BLOCK, DESC_LAUNCH_SHARED>>>(
         dTexts, dLens, stride, pool, count, dSA, dNext);
     CK(cudaEventRecord(b));
     CK(cudaDeviceSynchronize());

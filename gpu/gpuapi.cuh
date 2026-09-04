@@ -116,6 +116,8 @@
                                        hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaFuncSetCacheConfig         hipFuncSetCacheConfig
 #define cudaFuncCachePreferShared      hipFuncCachePreferShared
+#define cudaOccupancyMaxActiveBlocksPerMultiprocessor \
+                                       hipOccupancyMaxActiveBlocksPerMultiprocessor
 
 #endif /* DSG_HIP host API */
 

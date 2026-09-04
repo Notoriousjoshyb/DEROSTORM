@@ -497,18 +497,43 @@ __device__ uint64_t* blockRadixSort(uint64_t* a, uint64_t* b,
 // changed the hashrate by nothing: 7.70 KH/s against 7.73. The 32 shared loads
 // are to different addresses, so they pipeline, and only the accumulate is a
 // chain. Left as it is, being the shorter code.
+// BR_SCAN_ITEMS elements per thread per tile, not one.
+//
+// The offset scan runs over every descriptor -- ~19,700 of them -- and the tile
+// was BR_BLOCK wide, so it took 77 passes and each pass costs three
+// __syncthreads() and a serial walk over BR_WARPS totals on thread 0. The work
+// is one add per element; the barriers are not.
+//
+// Four elements a thread makes the tile 1,024 wide, so the same scan is 19
+// passes instead of 77 and the per-tile overhead is amortised four ways. The
+// elements a thread owns are consecutive, so its four loads and four stores are
+// one 16-byte access each rather than four strided ones.
+#ifndef BR_SCAN_ITEMS
+#define BR_SCAN_ITEMS 4
+#endif
+
 __device__ int blockScanFlags(int32_t* f, int n, BlockRadixScratch* sh)
 {
     const int tid  = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
+    const int tile = BR_BLOCK * BR_SCAN_ITEMS;
 
     if (tid == 0) sh->scanCarry = 0;
     __syncthreads();
 
-    for (int base = 0; base < n; base += BR_BLOCK) {
-        const int i = base + tid;
-        int x = (i < n) ? f[i] : 0;
+    for (int base = 0; base < n; base += tile) {
+        const int i0 = base + tid * BR_SCAN_ITEMS;
+
+        // Serial scan of this thread's own run, kept in registers.
+        int v[BR_SCAN_ITEMS];
+        int x = 0;
+#pragma unroll
+        for (int k = 0; k < BR_SCAN_ITEMS; k++) {
+            const int e = (i0 + k < n) ? f[i0 + k] : 0;
+            x += e;
+            v[k] = x;            // inclusive within the thread
+        }
 
         for (int off = 1; off < 32; off <<= 1) {
             const int y = DSG_SHFL_UP(x, off);
@@ -529,7 +554,13 @@ __device__ int blockScanFlags(int32_t* f, int n, BlockRadixScratch* sh)
         }
         __syncthreads();
 
-        if (i < n) f[i] = x + sh->warpScan[warp];
+        // x is this thread's inclusive warp scan; its exclusive prefix is
+        // x minus its own total, which v[BR_SCAN_ITEMS-1] holds.
+        const int pre = x - v[BR_SCAN_ITEMS - 1] + sh->warpScan[warp];
+#pragma unroll
+        for (int k = 0; k < BR_SCAN_ITEMS; k++) {
+            if (i0 + k < n) f[i0 + k] = v[k] + pre;
+        }
         __syncthreads();
     }
     return sh->scanCarry;

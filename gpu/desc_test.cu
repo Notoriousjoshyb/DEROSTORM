@@ -145,12 +145,17 @@ int main(int argc, char** argv)
     printf("\n  %s (sm_%d%d, %d SMs), BR_BLOCK=%d BR_BITS=%d\n",
            p.name, p.major, p.minor, p.multiProcessorCount, BR_BLOCK, BR_BITS);
     printf("  %d vectors, max text %d bytes, shared %.1f KB per block\n\n",
-           v.count, v.maxLen, BR_SHARED_BYTES / 1024.0);
+           v.count, v.maxLen, DESC_LAUNCH_SHARED / 1024.0);
 
+    // The opt-in has to cover what the launches below actually ask for, which is
+    // DESC_LAUNCH_SHARED: the radix scratch plus the MSD sort's bucket table.
+    // Raising it to BR_SHARED_BYTES alone leaves the request 4.1 KB over the
+    // limit and every launch fails with "invalid argument", which is what this
+    // test did between the MSD bucket table landing and here.
     CK(cudaFuncSetAttribute(doubling_kernel,
-                            cudaFuncAttributeMaxDynamicSharedMemorySize, BR_SHARED_BYTES));
+                            cudaFuncAttributeMaxDynamicSharedMemorySize, DESC_LAUNCH_SHARED));
     CK(cudaFuncSetAttribute(desc_kernel,
-                            cudaFuncAttributeMaxDynamicSharedMemorySize, BR_SHARED_BYTES));
+                            cudaFuncAttributeMaxDynamicSharedMemorySize, DESC_LAUNCH_SHARED));
 
     const int stride = v.maxLen;
     const int count = v.count;
@@ -250,7 +255,7 @@ int main(int argc, char** argv)
     // ---- correctness ------------------------------------------------------
     CK(cudaMemset(dSA, 0, got.size() * 4));
     CK(cudaMemset(dNext, 0, 4));
-    doubling_kernel<<<blocks, BR_BLOCK, BR_SHARED_BYTES>>>(
+    doubling_kernel<<<blocks, BR_BLOCK, DESC_LAUNCH_SHARED>>>(
         dTexts, dLens, stride, dpool, count, dSA, dNext);
     CK(cudaDeviceSynchronize());
     CK(cudaGetLastError());
@@ -259,7 +264,7 @@ int main(int argc, char** argv)
     CK(cudaMemset(dSA, 0, got.size() * 4));
     CK(cudaMemset(dNext, 0, 4));
     CK(cudaMemset(dFails, 0, 4));
-    desc_kernel<<<blocks, BR_BLOCK, BR_SHARED_BYTES>>>(
+    desc_kernel<<<blocks, BR_BLOCK, DESC_LAUNCH_SHARED>>>(
         dTexts, dLens, stride, cpool, count, dSA, dNext, dFails);
     CK(cudaDeviceSynchronize());
     CK(cudaGetLastError());
@@ -277,7 +282,7 @@ int main(int argc, char** argv)
         cudaEvent_t a, b;
         CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
         CK(cudaEventRecord(a));
-        doubling_kernel<<<blocks, BR_BLOCK, BR_SHARED_BYTES>>>(
+        doubling_kernel<<<blocks, BR_BLOCK, DESC_LAUNCH_SHARED>>>(
             dTexts, dLens, stride, dpool, count, dSA, dNext);
         CK(cudaEventRecord(b));
         CK(cudaDeviceSynchronize());
@@ -291,7 +296,7 @@ int main(int argc, char** argv)
         cudaEvent_t a, b;
         CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
         CK(cudaEventRecord(a));
-        desc_kernel<<<blocks, BR_BLOCK, BR_SHARED_BYTES>>>(
+        desc_kernel<<<blocks, BR_BLOCK, DESC_LAUNCH_SHARED>>>(
             dTexts, dLens, stride, cpool, count, dSA, dNext, dFails);
         CK(cudaEventRecord(b));
         CK(cudaDeviceSynchronize());
