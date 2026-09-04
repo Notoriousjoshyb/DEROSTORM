@@ -655,7 +655,46 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     // stopping at 420; going on to 672 gives the gain back. The extra grid row
     // costs about 240 MB there, while the old two-occupancy allocation spent
     // gigabytes on blocks that never paid for themselves.
-    const int plateau = prop.multiProcessorCount * (activeBlocks + 1);
+    int plateau = prop.multiProcessorCount * (activeBlocks + 1);
+
+#if DSG_HIP
+    // AMD does not get to use that number, because on RDNA it is rounded to
+    // nothing.
+    //
+    // multiProcessorCount counts WGPs -- an RX 7600 XT has 32 compute units and
+    // reports 16 -- while hipOccupancyMaxActiveBlocksPerMultiprocessor answers
+    // in whole blocks per COMPUTE UNIT. A kernel that fits three 256-thread
+    // workgroups in a WGP is one and a half per CU, and one and a half rounds
+    // to one. The plateau then comes out at two blocks per WGP.
+    //
+    // Measured on an RX 7600 XT (gfx1102, 16 WGPs, 16 GB), which is what found
+    // this: the API said one, the ceiling landed at 32 grid blocks, and the
+    // bench curve was still climbing when it ran out of room --
+    //
+    //     blocks     4      8     16     32
+    //     KH/s     4.08   7.74  14.27  22.95
+    //
+    // -- which is very nearly linear. Whatever the knee is on that card, 32 is
+    // not it, and the sweep in cmd/derostorm/gpu_tune.go could not look past
+    // the allocation.
+    //
+    // So the AMD ceiling is the architectural one instead of the register
+    // limited one: maxThreadsPerMultiProcessor is 2,048 on RDNA, which is four
+    // SIMDs of sixteen wave32 slots, and no WGP can ever hold more workgroups
+    // than that however few registers the kernel takes. Plus the same one
+    // queued row. At BR_BLOCK=256 that is nine blocks a WGP, so 144 on this
+    // card and 389 MB of scratch -- room for the sweep to find the answer
+    // rather than a guess at what the answer is.
+    //
+    // The occupancy call above is still made and still has to succeed: a zero
+    // there means the kernel does not fit at all, which is worth failing on.
+    if (prop.maxThreadsPerMultiProcessor >= BR_BLOCK) {
+        const int hwMax = prop.maxThreadsPerMultiProcessor / BR_BLOCK;
+        const int hwPlateau = prop.multiProcessorCount * (hwMax + 1);
+        if (hwPlateau > plateau) plateau = hwPlateau;
+    }
+#endif
+
     int want = blocks > 0 ? blocks : (plateau > 0 ? plateau : 1);
     c->maxBlocks = (int)(budget / 4 / perBlock);
     if (c->maxBlocks > want) c->maxBlocks = want;

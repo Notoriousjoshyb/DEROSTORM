@@ -27,7 +27,7 @@ If you want pool mining, this is the wrong miner.
 |---|---|
 | Miner | Custom |
 | Miner name | `derostorm` |
-| Installation URL | wherever you host `derostorm-1.8.6.tar.gz` |
+| Installation URL | wherever you host `derostorm-1.8.7.tar.gz` |
 | Wallet and worker template | your DERO address, e.g. `dero1qy...` |
 | Pool URL | your derod getwork address, e.g. `10.0.0.5:10100` |
 | Extra config arguments | anything below |

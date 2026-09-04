@@ -122,10 +122,15 @@
 #endif /* DSG_HIP host API */
 
 // What one unit of the thing multiProcessorCount counts is called, for the
-// device description the console prints. NVIDIA calls it a streaming
-// multiprocessor, AMD a compute unit, and they are the same field.
+// device description the console prints.
+//
+// NVIDIA calls it a streaming multiprocessor. On RDNA it is a WGP, which is two
+// compute units, and this used to say "CUs" -- an RX 7600 XT has 32 compute
+// units and prints 16. The number is not wrong, the noun was. It matters beyond
+// the label, because the occupancy API answers in blocks per CU while this
+// field counts WGPs; see the grid ceiling in dsg_init.
 #if DSG_HIP
-#define DSG_UNIT_PLURAL "CUs"
+#define DSG_UNIT_PLURAL "WGPs"
 #else
 #define DSG_UNIT_PLURAL "SMs"
 #endif

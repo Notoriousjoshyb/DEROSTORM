@@ -4,23 +4,39 @@ An AstroBWTv3 miner for DERO. Mines on the CPU and, when an NVIDIA or AMD card
 is present, on the GPU as well. Full-screen themed console, guided first-run
 setup.
 
-> **AMD support ships in the binaries from 1.7.1, and has never mined.**
->
-> What is proven: the kernels build for every RDNA target, the library loads on
-> a real AMD driver, a real AMD GPU is detected, and the hash it produces
-> **matches the CPU exactly** — checked on a `gfx1036` Radeon. That is stage 1,
-> the suffix sort and the SHA-256 all correct on AMD silicon.
->
-> What is not: the batched mining path, and any hashrate at all. The only AMD
-> device available here is a 1-CU integrated Radeon that cannot allocate enough
-> memory to run a batch, so **no hashrate figure anywhere in this file is an AMD
-> figure** and nobody has watched an AMD card mine for a minute, let alone a day.
+> **An AMD card has now mined.** An RX 7600 XT (`gfx1102`, 16 WGPs, 16 GB)
+> matched the CPU exactly and benchmarked at **22.95 KH/s** on 1.8.6. That is
+> the first AMD hashrate this project has ever had, and it was measured against
+> a grid ceiling that turned out to be four times too small — see 1.8.7 below.
+> The number after the fix has not been measured yet.
 >
 > **On Linux, use 1.7.3 or later.** 1.7.1 and 1.7.2 look for a ROCm 6 or ROCm 5
 > library and nothing else, so a rig on ROCm 7 — which has only
 > `libamdhip64.so.7` — finds no AMD device and says so as if no card were there.
 > 1.7.3 carries a ROCm 7 library and picks whichever generation the rig can
 > actually load.
+>
+> **1.8.7 gives an AMD card the rest of the machine.** The grid ceiling is
+> `multiProcessorCount * (blocks per unit + 1)`, and on RDNA the two halves of
+> that count different things: `multiProcessorCount` is WGPs — an RX 7600 XT has
+> 32 compute units and reports 16 — while
+> `hipOccupancyMaxActiveBlocksPerMultiprocessor` answers in blocks per **compute
+> unit**. Three workgroups in a WGP is one and a half per CU, and one and a half
+> rounds to **one**. The ceiling came out at 32 grid blocks on a card that was
+> nowhere near using them: 4, 8, 16 and 32 blocks measured 4.08, 7.74, 14.27 and
+> 22.95 KH/s, which is very nearly a straight line.
+>
+> AMD now takes its ceiling from `maxThreadsPerMultiProcessor` instead — 2,048
+> on RDNA, being four SIMDs of sixteen wave32 slots, which no WGP can exceed
+> however few registers a kernel wants. At 256 threads a block that is nine
+> blocks a WGP, so 144 on that card and 389 MB of scratch, and the sweep in
+> `--bench` can look for the knee instead of stopping at the allocation.
+>
+> The device line said "CUs" where it meant WGPs. The count was right and the
+> noun was wrong.
+>
+> NVIDIA is untouched: the change is inside `#if DSG_HIP`, and the 5080 still
+> sizes to 504 blocks and still benchmarks at 213.00 KH/s.
 >
 > **1.8.6 fixes the AMD kernels, and NVIDIA is unchanged.** `gpu/gpuapi.cuh`
 > said `__byte_perm` was one machine instruction on both vendors. On AMD it is
@@ -612,39 +628,40 @@ older were dropped by CUDA 13 itself and mine on the CPU. Only the display
 driver is needed at run time: the CUDA runtime is linked into the embedded
 library, so there is no toolkit to install.
 
-**AMD — HIP, RDNA only, and never yet mined.** `gfx1010`–`gfx1013` (RX 5000),
-`gfx1030`–`gfx1036` (RX 6000), `gfx1100`–`gfx1103` (RX 7000), `gfx1150`/`gfx1151`
-(Strix Point APUs) and `gfx1200`/`gfx1201` (RX 9000). All nineteen are in the
-shipped library, so there is nothing to build and nothing to install beyond the
-runtime.
+**AMD — HIP, RDNA only.** `gfx1010`–`gfx1013` (RX 5000), `gfx1030`–`gfx1036`
+(RX 6000), `gfx1100`–`gfx1103` (RX 7000), `gfx1150`/`gfx1151` (Strix Point APUs)
+and `gfx1200`/`gfx1201` (RX 9000). All nineteen are in the shipped library, so
+there is nothing to build and nothing to install beyond the runtime.
 
-What has actually been checked, on a `gfx1036` integrated Radeon:
+What has actually been checked, on an RX 7600 XT (`gfx1102`, 16 WGPs, 16 GB):
 
 | | |
 |---|---|
 | builds for all 19 RDNA targets | yes, both OSes |
 | library loads through the AMD driver | yes, Windows/Adrenalin |
-| device detected and named | yes — `AMD Radeon(TM) Graphics (gfx1036, 1 CUs)` |
+| device detected and named | yes — `AMD Radeon RX 7600 XT (gfx1102, 16 WGPs)` |
 | **hash matches the CPU exactly** | **yes** |
-| a batch mines | **no — never run** |
-| hashrate | **unknown** |
+| a batch mines | **yes** |
+| hashrate | **22.95 KH/s**, on 1.8.6, at a ceiling four times too small |
 
-1.8.6 changed what the compiler makes of these kernels, which is the one thing
-about AMD that can be checked without a card. Three constructs that cost nothing
-on nvcc were putting scratch memory — global memory, on AMD — in inner loops;
-the suffix kernel now compiles with none. `gpu/README.md` has the measurements
-and the method. It is not a hashrate, and it does not pretend to be one.
+That last row is the whole AMD story so far. It is the first AMD hashrate this
+project has ever had, and the sweep that produced it was cut off by the
+allocation rather than by the card — 4, 8, 16 and 32 grid blocks measured 4.08,
+7.74, 14.27 and 22.95 KH/s, which is very nearly a straight line. 1.8.7 raises
+that ceiling to 144 blocks on the same card; **what it does to the number has
+not been measured**, and nothing here will claim it until somebody runs it.
 
-The hash check is the one that matters most and it passed: stage 1, the
-descriptor suffix sort and the SHA-256 all produce the same 32 bytes the CPU
-does, on real AMD silicon. What stopped there is the *batched* path. The only
-AMD device on hand is a one-compute-unit integrated Radeon whose driver reports
-system memory as VRAM and then refuses the allocations, so it fails at
-`create stream: out of memory` before a batch ever starts.
+Before that, on a `gfx1036` integrated Radeon, the hash was proven correct but a
+batch never ran: its driver reports system memory as VRAM and then refuses the
+allocations, so it failed at `create stream: out of memory`.
 
-So the NVIDIA figures below are the only hashrate figures in this file. The sort
-is memory-bound and RDNA's cache hierarchy is not Ada's, so an AMD number could
-land anywhere.
+The other thing that changed without a card is what the compiler makes of these
+kernels. 1.8.6 removed three constructs that cost nothing on nvcc and put scratch
+memory — global memory, on AMD — in inner loops; the suffix kernel now compiles
+with none. `gpu/README.md` has the measurements and the method.
+
+The NVIDIA figures below are still the only *tuned* hashrate figures in this
+file. The sort is memory-bound and RDNA's cache hierarchy is not Ada's.
 
 **Please report what you see**, working or not, at
 [the issue tracker](https://github.com/Notoriousjoshyb/DEROSTORM/issues). A card
