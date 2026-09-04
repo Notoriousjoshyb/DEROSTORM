@@ -449,6 +449,13 @@ static_assert(DESC_CHUNKS * DESC_CHUNK_COLS == 256,
 #define DESC_COLMASK 1
 #endif
 
+// Find the constant columns by accumulating differences, not by ANDing byte-wise
+// equality masks; 0 restores the mask form, for A/B. See the note where it is
+// built for why the two are the same answer.
+#ifndef DESC_COL_XOR
+#define DESC_COL_XOR 1
+#endif
+
 // Skip the per-column group scan where the constant-column mask already says
 // every block shares the key. Needs DESC_COLMASK, and DESC_KEY_BYTES == 3.
 #ifndef DESC_SAMEKEY
@@ -714,7 +721,8 @@ struct DescScratch {
 //     result byte 0 = t[p+3] = source m+3      nibble 0 = m+3
 //
 // which is 0x0123 + 0x1111*m, and m is at most 3, so the top nibble reaches 6
-// and never leaves the eight bytes available.
+// and never leaves the eight bytes available. DSG_PERM_SEQ in gpuapi.cuh is that
+// expression, written in whichever selector form the vendor's permute reads.
 //
 // The address is walked back with pointer arithmetic (`b - m`) rather than
 // masked as an integer, and that is not cosmetic. Casting a uintptr_t to a
@@ -762,7 +770,7 @@ __device__ __forceinline__ uint32_t descLoadBE32(const uint8_t* t, int p)
     const uint8_t*  b = t + p;
     const uint32_t  m = (uint32_t)((uintptr_t)b & 3u);
     const uint32_t* w = (const uint32_t*)(b - m);
-    return __byte_perm(DESC_LDW(w), DESC_LDW(w + 1), 0x0123u + 0x1111u * m);
+    return dsgBytePermNative(DESC_LDW(w), DESC_LDW(w + 1), DSG_PERM_SEQ(m));
 #else
     return ((uint32_t)t[p] << 24) | ((uint32_t)t[p + 1] << 16) |
            ((uint32_t)t[p + 2] << 8) | (uint32_t)t[p + 3];
@@ -780,10 +788,10 @@ __device__ __forceinline__ uint64_t descLoadBE64(const uint8_t* t, int p)
     const uint8_t*  b = t + p;
     const uint32_t  m = (uint32_t)((uintptr_t)b & 3u);
     const uint32_t* w = (const uint32_t*)(b - m);
-    const uint32_t sel = 0x0123u + 0x1111u * m;
+    const uint32_t sel = DSG_PERM_SEQ(m);
     const uint32_t w0 = DESC_LDW(w), w1 = DESC_LDW(w + 1), w2 = DESC_LDW(w + 2);
-    const uint32_t lo = __byte_perm(w0, w1, sel);
-    const uint32_t hi = __byte_perm(w1, w2, sel);
+    const uint32_t lo = dsgBytePermNative(w0, w1, sel);
+    const uint32_t hi = dsgBytePermNative(w1, w2, sel);
     return ((uint64_t)lo << 32) | (uint64_t)hi;
 }
 #endif
@@ -1379,6 +1387,45 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                     const uint32_t* b0 =
                         (const uint32_t*)(t + (size_t)base + lo + off);
                     const uint32_t a0 = b0[0], a1 = b0[1], a2 = b0[2], a3 = b0[3];
+                    // Accumulate the differences, then ask once which byte
+                    // lanes stayed zero.
+                    //
+                    // A column is constant when it matches the first block in
+                    // every later one, and the obvious way to write that is to
+                    // AND a byte-wise equality mask across the run. That puts
+                    // the byte compare inside the loop, which costs nothing on
+                    // NVIDIA -- __vcmpeq4 is one instruction -- and seven
+                    // instructions a word on AMD, where there is no byte-wise
+                    // compare and gpuapi.cuh has to build one out of a SWAR
+                    // zero-byte test.
+                    //
+                    // XOR is the byte compare's own input. A byte lane of the
+                    // OR of the XORs is zero exactly when that column never
+                    // moved, so the loop is two instructions a word on both
+                    // vendors and the byte test runs once at the end instead of
+                    // len-1 times. Same answer, and the run lengths here reach
+                    // the low hundreds.
+                    //
+                    // NVIDIA gives up nothing for it: six interleaved rounds on
+                    // an RTX 5080 at 1,344 blocks measured 182.5 KH/s this way
+                    // against 181.7 the other, which is the same number. The
+                    // point of the change is the seven instructions it does not
+                    // spend on AMD. DESC_COL_XOR=0 is the mask form, for A/B.
+#if DESC_COL_XOR
+                    uint32_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                    for (int g = 1; g < len; g++) {
+                        const uint32_t* bg =
+                            (const uint32_t*)(t + (size_t)base + g * 256 + lo + off);
+                        d0 |= a0 ^ bg[0];
+                        d1 |= a1 ^ bg[1];
+                        d2 |= a2 ^ bg[2];
+                        d3 |= a3 ^ bg[3];
+                    }
+                    const uint32_t ms[4] = {
+                        __vcmpeq4(d0, 0u), __vcmpeq4(d1, 0u),
+                        __vcmpeq4(d2, 0u), __vcmpeq4(d3, 0u)
+                    };
+#else
                     uint32_t m0 = 0xFFFFFFFFu, m1 = m0, m2 = m0, m3 = m0;
                     for (int g = 1; g < len; g++) {
                         const uint32_t* bg =
@@ -1389,6 +1436,7 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                         m3 &= __vcmpeq4(a3, bg[3]);
                     }
                     const uint32_t ms[4] = { m0, m1, m2, m3 };
+#endif
 #if DESC_COLMASK
                     // __vcmpeq4 leaves each column's answer in bits 0, 8, 16
                     // and 24 of its word; gather those into four adjacent bits.

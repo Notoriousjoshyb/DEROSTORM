@@ -213,10 +213,6 @@ struct BlockRadixScratch {
 // launch and to cudaFuncSetAttribute.
 #define BR_SHARED_BYTES ((int)sizeof(BlockRadixScratch))
 
-// Lanes below mine. The body is in gpuapi.cuh because CUDA reads it from a
-// special register and HIP has to build it.
-__device__ __forceinline__ unsigned laneMaskLt() { return dsgLaneMaskLt(); }
-
 // Zeroes the parts of the scratch that must start clean. Call once per block
 // before any other function here.
 __device__ __forceinline__ void blockRadixInit(BlockRadixScratch* sh)
@@ -350,7 +346,7 @@ __device__ void blockRadixPass(const uint64_t* in, uint64_t* out,
         // affordable, and it changes nothing on NVIDIA.
         const unsigned same = dsgMatchAnyBits(live ? (unsigned)d : (unsigned)BR_BINS,
                                               BR_BITS + 1);
-        const int rankInWarp = __popc(same & laneMaskLt());
+        const int rankInWarp = dsgRankBelow(same);
         const int isLeader   = (rankInWarp == 0);
         const int warpCount  = __popc(same);
         const int leaderLane = __ffs(same) - 1;

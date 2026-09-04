@@ -354,8 +354,35 @@ struct SHA256 {
     uint64_t total;     // total bytes fed
 };
 
+// How many of the four sixteen-round groups to unroll into each other. 1 leaves
+// them as a loop, 3 unrolls the lot, and both are correct; it is only code size
+// against whatever the scheduler makes of a longer straight line.
+//
+// One is the default because three costs the AMD build 2,276 instructions --
+// 3,156 against 5,432 in the SHA kernel -- for no change in scratch, and sha256
+// is inlined into three kernels. Five interleaved rounds on an RTX 5080, best
+// H/s at 1,344 blocks: 182,167 at 1, 182,336 at 3, against 181,959 for the
+// 64-word schedule this replaced. All three are the same number.
+#ifndef SHA_ROUND_GROUPS
+#define SHA_ROUND_GROUPS 1
+#endif
+
 __device__ void sha256Block(uint32_t h[8], const uint8_t* p) {
-    uint32_t w[64];
+    // Sixteen schedule words, not sixty-four.
+    //
+    // The textbook form builds all 64 up front and then runs the rounds over
+    // them. Written that way the array is 256 bytes a thread, and whether that
+    // is free depends entirely on whether the compiler can see it is really a
+    // sliding window of sixteen. nvcc can. amdclang++ cannot: it put w[64] in
+    // scratch, which on AMD is global memory with a per-lane address, and the
+    // SHA kernel came out with 159 scratch accesses per thread for a stage
+    // whose whole job is 64 rounds of shifts and adds.
+    //
+    // w[i] reads w[i-16], w[i-15], w[i-7] and w[i-2], so sixteen words is all
+    // the state there ever was. Indexing modulo 16 says so out loud, and the
+    // unrolled loop then turns every index into a constant and the window into
+    // sixteen registers on both compilers.
+    uint32_t w[16];
 
     // The schedule wants sixteen big-endian words, and building each from four
     // byte loads is 64 global loads for 64 bytes. That is what the SHA kernel
@@ -389,28 +416,59 @@ __device__ void sha256Block(uint32_t h[8], const uint8_t* p) {
 #pragma unroll
         for (int i = 0; i < 16; i++) w[i] = __byte_perm(q[i], 0, 0x0123);
     } else {
+#pragma unroll
         for (int i = 0; i < 16; i++) {
             w[i] = ((uint32_t)p[i * 4] << 24) | ((uint32_t)p[i * 4 + 1] << 16) |
                    ((uint32_t)p[i * 4 + 2] << 8) | (uint32_t)p[i * 4 + 3];
         }
     }
-    for (int i = 16; i < 64; i++) {
-        uint32_t s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3);
-        uint32_t s1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10);
-        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-    }
+
     uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
     uint32_t e = h[4], f = h[5], g = h[6], hh = h[7];
-    for (int i = 0; i < 64; i++) {
-        uint32_t S1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
-        uint32_t ch = (e & f) ^ (~e & g);
-        uint32_t t1 = hh + S1 + ch + SHA256_K[i] + w[i];
-        uint32_t S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
-        uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
-        uint32_t t2 = S0 + mj;
-        hh = g; g = f; f = e; e = d + t1;
-        d = c; c = b; b = a; a = t1 + t2;
+
+    // Sixteen rounds at a time, four times, rather than sixty-four unrolled.
+    //
+    // Sixteen is the smallest group that makes both indexings constant. The
+    // window is modulo 16, and a round rotates the eight working variables by
+    // one, so sixteen rounds put every one of them back where it started and
+    // the next group is the same code again. SHA_ROUND_GROUPS above unrolls the
+    // four groups into each other if that is ever wanted.
+#define SHA_ROUND(kk, wi)                                                  \
+    do {                                                                   \
+        const uint32_t S1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);  \
+        const uint32_t ch = (e & f) ^ (~e & g);                            \
+        const uint32_t t1 = hh + S1 + ch + (kk) + (wi);                    \
+        const uint32_t S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);  \
+        const uint32_t mj = (a & b) ^ (a & c) ^ (b & c);                   \
+        const uint32_t t2 = S0 + mj;                                       \
+        hh = g; g = f; f = e; e = d + t1;                                  \
+        d = c; c = b; b = a; a = t1 + t2;                                  \
+    } while (0)
+
+#pragma unroll
+    for (int k = 0; k < 16; k++) SHA_ROUND(SHA256_K[k], w[k]);
+
+    // Spelled out rather than `#pragma unroll SHA_ROUND_GROUPS`: CUDA 12's nvcc
+    // does not expand macros inside a pragma and rejects the file outright.
+#if SHA_ROUND_GROUPS >= 3
+#pragma unroll
+#else
+#pragma unroll 1
+#endif
+    for (int r = 16; r < 64; r += 16) {
+#pragma unroll
+        for (int k = 0; k < 16; k++) {
+            // The window advances in place before it is read:
+            // i-16 == k, i-15 == k+1, i-7 == k+9 and i-2 == k+14, modulo 16.
+            const uint32_t x = w[(k + 1) & 15];
+            const uint32_t y = w[(k + 14) & 15];
+            const uint32_t s0 = rotr32(x, 7) ^ rotr32(x, 18) ^ (x >> 3);
+            const uint32_t s1 = rotr32(y, 17) ^ rotr32(y, 19) ^ (y >> 10);
+            w[k] += w[(k + 9) & 15] + s0 + s1;
+            SHA_ROUND(SHA256_K[r + k], w[k]);
+        }
     }
+#undef SHA_ROUND
     h[0] += a; h[1] += b; h[2] += c; h[3] += d;
     h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
 }

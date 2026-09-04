@@ -160,6 +160,24 @@ __device__ __forceinline__ unsigned dsgLaneMaskLt()
 #endif
 }
 
+// How many lanes below mine are set in `m` -- a lane's rank within its group.
+//
+// __popc(m & lanemask_lt) on NVIDIA, where the mask is a register read. AMD has
+// the whole expression as one instruction: v_mbcnt_lo_u32_b32 counts the set
+// bits of its operand below the calling lane. Four instructions become one on a
+// line the radix scatter runs once per element per pass.
+//
+// mbcnt_lo alone is the wave32 answer; the wave64 form needs a second
+// v_mbcnt_hi for lanes 32..63, and this file refuses to build wave64 at all.
+__device__ __forceinline__ int dsgRankBelow(unsigned m)
+{
+#if DSG_HIP
+    return (int)__builtin_amdgcn_mbcnt_lo(m, 0u);
+#else
+    return __popc(m & dsgLaneMaskLt());
+#endif
+}
+
 // Lanes of this warp holding the same key as mine.
 //
 // CUDA has one instruction for it. AMD does not, so it is rebuilt from one
@@ -187,14 +205,45 @@ __device__ __forceinline__ unsigned dsgMatchAnyBits(unsigned key, int bits)
 #endif
 }
 
-// __byte_perm is a single instruction on both -- PRMT on NVIDIA, V_PERM_B32 on
-// AMD -- and HIP provides it under the CUDA name. DSG_BYTE_PERM_FALLBACK is the
-// escape hatch if some ROCm release does not: it is correct and slow, and it
-// handles only selector digits 0..7, which is all this codebase uses.
+// __byte_perm: four bytes chosen out of two words.
+//
+// HIP defines the CUDA name, and the note that used to be here said that made
+// it a single V_PERM_B32. It does not. ROCm's `__byte_perm` is a union of a
+// four-byte array and a word, indexed by a runtime value -- so the two inputs
+// are written to the stack and read back a byte at a time. On AMD the stack is
+// scratch, which is global memory with a per-lane address.
+//
+// descLoadBE32 is the descriptor sort's innermost line and calls it once per
+// key; descLoadBE64 calls it twice, and every SHA-256 word swap calls it once.
+// A compiled derostorm_gpu.cu carried 973 scratch accesses in the suffix
+// kernel, and switching to the instruction below took that to zero, so all of
+// them were this.
+//
+// __builtin_amdgcn_perm is the instruction itself. It differs from CUDA's
+// intrinsic in two ways and neither is a choice:
+//
+//   * it takes one selector BYTE per output byte, where CUDA takes one NIBBLE,
+//     so the nibbles are spread out. A constant selector folds this away
+//     entirely and a loop-invariant one hoists; there is no case in this
+//     codebase where it costs more than the four ANDs and three shifts.
+//   * it sees {src0, src1} with src0 on TOP, where CUDA's byte 0 is the low
+//     byte of its first argument. So the arguments swap.
+//
+// Only selector digits 0..7 are used here and only three bits of each are read,
+// which is exactly what CUDA does with them.
+//
+// Verified by constant folding, which LLVM does for this builtin: selectors
+// 0x0123, 0x1234, 0x3456, 0x0000 and 0x7777 over {0x07060504, 0x03020100} fold
+// to 0x00010203, 0x01020304, 0x03040506, 0x00000000 and 0x07070707, which is
+// what CUDA returns for the same arguments.
+//
+// DSG_BYTE_PERM_FALLBACK restores the portable version -- correct, and slow the
+// same way ROCm's own is -- if some future toolchain loses the builtin.
 #ifndef DSG_BYTE_PERM_FALLBACK
 #define DSG_BYTE_PERM_FALLBACK 0
 #endif
-#if DSG_HIP && DSG_BYTE_PERM_FALLBACK
+#if DSG_HIP
+#if DSG_BYTE_PERM_FALLBACK
 __device__ __forceinline__ uint32_t dsgBytePerm(uint32_t a, uint32_t b, uint32_t s)
 {
     const uint64_t v = ((uint64_t)b << 32) | (uint64_t)a;
@@ -206,7 +255,56 @@ __device__ __forceinline__ uint32_t dsgBytePerm(uint32_t a, uint32_t b, uint32_t
     }
     return r;
 }
+#else
+__device__ __forceinline__ uint32_t dsgBytePerm(uint32_t a, uint32_t b, uint32_t s)
+{
+    const uint32_t sel = ((s      ) & 0x00000007u)
+                       | ((s <<  4) & 0x00000700u)
+                       | ((s <<  8) & 0x00070000u)
+                       | ((s << 12) & 0x07000000u);
+    return __builtin_amdgcn_perm(b, a, sel);
+}
+#endif
 #define __byte_perm dsgBytePerm
+#endif
+
+// A permute that takes the selector in the vendor's own form, and the selector
+// for the one shape this codebase asks for.
+//
+// __byte_perm's selector is one nibble per output byte; V_PERM_B32's is one
+// byte. dsgBytePerm above widens the nibbles so the CUDA-shaped call sites read
+// the same on both, and that costs four ANDs and three shifts whenever the
+// selector is not a constant. descLoadBE32's is not: it depends on the low two
+// bits of the address, and it is the innermost line of the descriptor sort.
+//
+// Both vendors want "the four bytes starting at byte m, most significant
+// first", and both express walking m by adding a constant -- 0x1111 a nibble,
+// 0x01010101 a byte. So the selector is built in the native form and the widen
+// disappears. The two agree by construction: for m = 0..3 the CUDA selectors
+// 0x0123, 0x1234, 0x2345 and 0x3456 widen to exactly 0x00010203 + m * 0x01010101.
+#if DSG_HIP
+#if DSG_BYTE_PERM_FALLBACK
+#define DSG_PERM_SEQ(m) (0x0123u + 0x1111u * (m))
+__device__ __forceinline__ uint32_t dsgBytePermNative(uint32_t a, uint32_t b,
+                                                      uint32_t sel)
+{
+    return dsgBytePerm(a, b, sel);
+}
+#else
+#define DSG_PERM_SEQ(m) (0x00010203u + 0x01010101u * (m))
+__device__ __forceinline__ uint32_t dsgBytePermNative(uint32_t a, uint32_t b,
+                                                      uint32_t sel)
+{
+    return __builtin_amdgcn_perm(b, a, sel);
+}
+#endif
+#else
+#define DSG_PERM_SEQ(m) (0x0123u + 0x1111u * (m))
+__device__ __forceinline__ uint32_t dsgBytePermNative(uint32_t a, uint32_t b,
+                                                      uint32_t sel)
+{
+    return __byte_perm(a, b, sel);
+}
 #endif
 
 // Byte-wise compares of a packed word. CUDA has both as single instructions

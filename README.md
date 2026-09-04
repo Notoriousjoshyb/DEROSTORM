@@ -22,6 +22,29 @@ setup.
 > 1.7.3 carries a ROCm 7 library and picks whichever generation the rig can
 > actually load.
 >
+> **1.8.6 fixes the AMD kernels, and NVIDIA is unchanged.** `gpu/gpuapi.cuh`
+> said `__byte_perm` was one machine instruction on both vendors. On AMD it is
+> not: ROCm supplies the CUDA *name*, whose body is a byte array on the stack
+> indexed by a runtime value, and on AMD the stack is scratch — global memory
+> with a per-lane address. `descLoadBE32` is the descriptor sort's innermost
+> line and calls it once per key, so the compiled suffix kernel carried **973
+> scratch accesses per thread**. Building it on `__builtin_amdgcn_perm`, the
+> instruction itself, takes that to **zero**.
+>
+> Two more of the same shape: SHA-256's 64-word message schedule fitted in
+> registers on nvcc and went to scratch on amdclang++, and is now written as the
+> sixteen-word window it always was; and the descriptor sort's constant-column
+> test accumulates differences instead of running a byte-wise compare inside its
+> loop, which is one instruction on NVIDIA and seven on AMD. The suffix kernel
+> is **12,736 → 9,377 instructions with no scratch at all**, and no register
+> spills on any RDNA target.
+>
+> Still no AMD hashrate figure, because there is still no AMD card here — see
+> *Which cards* below. Every change is in the shared source, so the card that
+> can be measured was: five interleaved rounds on the RTX 5080 read 181,959 H/s
+> before and 182,167 after, which is the same number, and all 512 vectors still
+> match the CPU.
+>
 > **1.8.5 is +6.2% on the RTX 5080 and removes the Windows CPU hot-path
 > allocations.** The descriptor MSD histogram now packs two sixteen-bit
 > counters per word, so an 11-bit digit fits in 4.1 KB of shared memory. The
@@ -605,6 +628,12 @@ What has actually been checked, on a `gfx1036` integrated Radeon:
 | **hash matches the CPU exactly** | **yes** |
 | a batch mines | **no — never run** |
 | hashrate | **unknown** |
+
+1.8.6 changed what the compiler makes of these kernels, which is the one thing
+about AMD that can be checked without a card. Three constructs that cost nothing
+on nvcc were putting scratch memory — global memory, on AMD — in inner loops;
+the suffix kernel now compiles with none. `gpu/README.md` has the measurements
+and the method. It is not a hashrate, and it does not pretend to be one.
 
 The hash check is the one that matters most and it passed: stage 1, the
 descriptor suffix sort and the SHA-256 all produce the same 32 bytes the CPU

@@ -347,16 +347,44 @@ __global__ void stage1_kernel(const uint8_t* work, uint32_t nonceBase, int count
 //
 // Blackwell trades registers for a fifth resident block: 48 registers and some
 // local traffic beat the 64-register/four-block image by about 4% in the full
-// miner. Older CUDA targets and HIP keep the measured four-block budget. This
-// is deliberately not a global -maxrregcount: stage1_kernel is shared-memory
-// bound and must remain free to take the registers it wants.
+// miner. Older CUDA targets keep the measured four-block budget. This is
+// deliberately not a global -maxrregcount: stage1_kernel is shared-memory bound
+// and must remain free to take the registers it wants.
+//
+// The second argument of __launch_bounds__ is not the same quantity on the two
+// compilers, and the AMD build used to pass CUDA's. nvcc reads it as blocks per
+// SM; hipcc reads it as WAVES PER SIMD, so "4" asked an AMD card for something
+// nobody measured and, as it happens, for less than the kernel already fits.
+//
+// It now asks for nothing there, and that is a decision rather than an
+// omission. Every value above what the register allocator picks on its own buys
+// a wave on some targets and spills to scratch on others, and scratch on AMD is
+// global memory with a per-lane address. From
+// -Rpass-analysis=kernel-resource-usage at BR_BLOCK=256, VGPRs and waves per
+// SIMD, with what spills:
+//
+//                        asking 1        asking 8            asking 10
+//   gfx1010 gfx1030      139, 7w         128, 8w, 2 spilled  96, 10w, 29
+//   gfx1100 gfx1101      146, 9w         146, 9w             144, 10w, none
+//   gfx1102 gfx1103      146, 6w         146, 6w             96, 10w, 47
+//   gfx1150              146, 6w         146, 6w             96, 10w, 47
+//   gfx1200 gfx1201      144, 10w        144, 10w            143, 10w, none
+//
+// There is no one number: 10 is free on the big RDNA 3 dies, which have 1,536
+// registers a SIMD, and ruinous on the small ones, which have 1,024. Pinning a
+// value per gfx target is a list this file would have to keep in step with the
+// hardware, to buy at most one wave in five, unmeasured. Somebody with a card
+// can settle it with -DDSG_SUFFIX_OCC=N against the table above.
 #ifndef DSG_SUFFIX_OCC
-#if !DSG_HIP && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#if DSG_HIP
+#define DSG_SUFFIX_OCC 1
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
 #define DSG_SUFFIX_OCC 5
 #else
 #define DSG_SUFFIX_OCC 4
 #endif
 #endif
+
 __global__ __launch_bounds__(BR_BLOCK, DSG_SUFFIX_OCC) void suffix_kernel(
         const uint8_t* texts, const int32_t* lens, int count,
         Pool pool, int32_t* saOut, int32_t* nextHash)
@@ -390,7 +418,17 @@ __global__ __launch_bounds__(BR_BLOCK, DSG_SUFFIX_OCC) void suffix_kernel(
             asm volatile("prefetch.global.L2 [%0];" :: "l"(text + i));
         }
 #else
-        for (int i = threadIdx.x; i < n; i += BR_BLOCK) {
+        // One byte a stride, not one byte a thread.
+        //
+        // AMD has no prefetch instruction that reaches the last level without
+        // also landing the line in a register, so the warm-up here is a real
+        // load whose result is thrown away. That does not mean it has to read
+        // every byte: a cache line is 128 bytes on RDNA, so a lane touching
+        // every 64th byte pulls in the same lines and issues a sixty-fourth of
+        // the loads. Over a 68 KB text that is about 1,100 loads a block
+        // instead of 70,000 -- four iterations a thread instead of 273.
+        for (int i = (int)threadIdx.x * DESC_PREFETCH_STRIDE; i < n;
+             i += BR_BLOCK * DESC_PREFETCH_STRIDE) {
             (void)*(((const volatile uint8_t*)text) + i);
         }
 #endif

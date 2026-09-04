@@ -140,7 +140,17 @@ __global__ __launch_bounds__(BR_BLOCK, HP_OCC) void suffix_kernel(
             asm volatile("prefetch.global.L2 [%0];" :: "l"(text + i));
         }
 #else
-        for (int i = threadIdx.x; i < n; i += BR_BLOCK) {
+        // One byte a stride, not one byte a thread.
+        //
+        // AMD has no prefetch instruction that reaches the last level without
+        // also landing the line in a register, so the warm-up here is a real
+        // load whose result is thrown away. That does not mean it has to read
+        // every byte: a cache line is 128 bytes on RDNA, so a lane touching
+        // every 64th byte pulls in the same lines and issues a sixty-fourth of
+        // the loads. Over a 68 KB text that is about 1,100 loads a block
+        // instead of 70,000 -- four iterations a thread instead of 273.
+        for (int i = (int)threadIdx.x * DESC_PREFETCH_STRIDE; i < n;
+             i += BR_BLOCK * DESC_PREFETCH_STRIDE) {
             (void)*(((const volatile uint8_t*)text) + i);
         }
 #endif

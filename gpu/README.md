@@ -13,12 +13,83 @@ anything. `buildlib.bat`/`buildlib.sh` build the CUDA library;
 `buildlib_hip.bat`/`buildlib_hip.sh` build the AMD one, which is optional and
 needs ROCm.
 
-Every measured figure below is NVIDIA. Nobody has run these kernels on an AMD
-card yet, and the AMD numbers will be different — the sort is memory-bound and
-RDNA's cache hierarchy is not Ada's. The correctness claim is the one that
-carries over: `go test ./cmd/derostorm/ -run GPU` compares the GPU hash against
-the CPU through whichever backend is present, so an AMD card proves itself the
-same way this one did.
+Every hashrate figure below is NVIDIA. The AMD numbers will be different — the
+sort is memory-bound and RDNA's cache hierarchy is not Ada's. The correctness
+claim is the one that carries over: `go test ./cmd/derostorm/ -run GPU` compares
+the GPU hash against the CPU through whichever backend is present, so an AMD
+card proves itself the same way this one did.
+
+## What was wrong with the AMD build
+
+Writing the kernels once and building them twice is only as good as the
+assumption that the two compilers turn the same source into comparable code.
+For one intrinsic that assumption was wrong, and it put a global memory round
+trip in the descriptor sort's innermost line. How much that cost is a question
+only a card can answer; that it cost something is not in doubt.
+
+**HIP's `__byte_perm` is not an instruction.** `gpuapi.cuh` said it was — PRMT on
+NVIDIA, V\_PERM\_B32 on AMD, provided under the CUDA name. ROCm provides the
+*name*. Its body is a union of a four-byte array and a word, indexed by a
+runtime value, so both inputs go to the stack and come back a byte at a time.
+On AMD the stack is scratch, which is global memory with a per-lane address.
+
+`descLoadBE32` is the descriptor sort's innermost line and calls it once per
+key; every SHA-256 word swap calls it once more. A compiled `derostorm_gpu.cu`
+carried **973 scratch accesses in the suffix kernel**, and switching to
+`__builtin_amdgcn_perm` — the instruction itself — took that to zero, so all of
+them were this. The selector it wants is the same walk written in bytes instead
+of nibbles.
+
+**A 64-word SHA-256 schedule is not free.** `w[64]` is 256 bytes a thread and
+whether that costs anything depends on the compiler seeing it is really a
+sliding window of sixteen. nvcc sees it; amdclang++ put it in scratch. Indexing
+modulo 16 says so out loud, and both compilers then keep it in registers.
+
+**Nothing here needed a second copy of anything.** The column-constant test in
+`desc.cuh` used to run a byte-wise compare inside its loop, which is one
+instruction on NVIDIA and seven on AMD, where `gpuapi.cuh` has to build one out
+of a SWAR zero-byte test. Accumulating the XOR and asking once at the end is the
+same answer, two instructions a word on both, and fewer on NVIDIA too.
+
+Measured with `-Rpass-analysis=kernel-resource-usage` and by counting
+instructions in `--cuda-device-only -S` output, gfx1100 at `BR_BLOCK=256`:
+
+| | instructions | scratch accesses | waves/SIMD |
+|---|---:|---:|---:|
+| suffix kernel, before | 12,736 | 973 | 9 |
+| suffix kernel, after | 9,377 | **0** | 9 |
+| SHA + difficulty, before | 2,381 | 159 | 16 |
+| SHA + difficulty, after | 3,156 | 72 | 16 |
+
+A scratch access is a global memory round trip, so the 973 mattered far more
+than the 26% of static instructions they came with. The SHA kernel trades
+instructions for them deliberately: the rounds are unrolled sixteen at a time,
+which is the smallest group that turns both the window index and the working
+variables' rotation into constants.
+
+None of this is a static-analysis argument about what *might* be slow. Scratch
+in an inner loop is not a tuning question, and the AMD build had no reason to
+be doing any.
+
+**NVIDIA pays nothing for it.** Every one of these changes is in the shared
+source, so the card that can be measured was measured. Five interleaved rounds
+of `gpu/hash_parallel_test.exe` on the RTX 5080, best H/s at 1,344 blocks:
+
+| | H/s |
+|---|---:|
+| before | 181,959 |
+| after | 182,167 |
+
+which is the same number — the spread within either set is wider than the gap
+between them. `ptxas -v` agrees: the suffix kernel is 48 registers either way,
+and the SHA kernel went from 48 to 46. All 512 vectors still match the CPU.
+
+**What is not fixed, and needs a card.** `__launch_bounds__`'s second argument
+means blocks per SM to nvcc and waves per SIMD to hipcc, and the AMD build was
+passing CUDA's number — see the table in `derostorm_gpu.cu`. It now asks for
+nothing, because the value that buys a wave on a 7900 XTX spills 47 registers to
+scratch on a 7600. `BR_BITS` and `BR_BLOCK` were swept on Ada and never on RDNA.
+Both are `-D` knobs and both want an A/B on hardware, not a guess.
 
 Measured on an RTX 5080 (sm_120, 84 SMs, 16 GB) beside a Ryzen 7 9800X3D.
 
