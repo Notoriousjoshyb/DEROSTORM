@@ -4,6 +4,53 @@ An AstroBWTv3 miner for DERO. Mines on the CPU and, when an NVIDIA or AMD card
 is present, on the GPU as well. Full-screen themed console, guided first-run
 setup.
 
+### 1.9.0 — measured CPU and GPU improvements
+
+Measured against the starting source on a Ryzen 7 9800X3D and RTX 5080.
+These are medians of three interleaved A/B rounds, not comparisons with an
+older release's best result:
+
+| Windows workload | Before | After | Gain |
+|---|---:|---:|---:|
+| Native CPU, complete hashes, 15 threads | 39,387 H/s | 40,775 H/s | **+3.5%** |
+| Portable CPU, complete hashes, 15 threads, bounds checks on | 19,552 H/s | 21,857 H/s | **+11.8%** |
+| CUDA, complete mining search, 336 grid blocks | 199,672 H/s | 204,337 H/s | **+2.3%** |
+| CUDA, complete mining search, 420 grid blocks | 209,468 H/s | 212,782 H/s | **+1.6%** |
+
+At the 504-block ceiling the GPU median moved 211,350 → 214,071 H/s (+1.3%),
+but one candidate round fell to 204,766 H/s. That setting is noisy, not a
+guaranteed gain. The GPU improvement is incremental; the portable CPU path is
+the double-digit improvement. CPU and GPU were measured separately, not as a
+claim about simultaneous mining throughput.
+
+Linux/WSL passed native CPU, GPU hash, difficulty-search and pipeline checks,
+but its three A/B rounds were roughly flat and included a slow outlier. No
+repeatable Linux hashrate gain is claimed. Windows/Linux CUDA and HIP libraries
+were rebuilt, including the Linux ROCm 5, 6 and 7 variants.
+
+The native CPU walk emits a constant, uniform-key span in one loop. The
+portable walk now carries uniform keys and shares unchanged block-order slices
+between columns, reconstructing positions only at output; long suffix
+comparisons use Go's architecture-specific `bytes.Compare`. The GPU seed finds
+each insertion position by binary search before moving the shared order
+entries, instead of doing an expensive suffix comparison for every move.
+
+The native one-block path also now checks descriptor capacity before writing.
+An 8,192-byte random-text reproduction overran the old allocation under
+AddressSanitizer; the fixed path grows, retries and matches libsais. This case
+is retained in `native/sabench.c`. Portable regression coverage exercises
+shared orders, key collisions across columns, and uniform/nonuniform changes.
+
+Both CPU implementations and the GPU passed all 512 reference vectors; the
+portable implementation also passed 512 complete-hash comparisons on amd64
+and on arm64 under QEMU. **Emulation is correctness evidence, not an ARM or Mac
+hashrate measurement.** macOS builds use the improved portable CPU path when
+cross-built, or the native C path when built locally with cgo. There is still
+no macOS GPU backend: CUDA/HIP changes do not provide Metal support. AMD and
+Mac hardware speedups have not been measured here.
+
+### Earlier releases
+
 > **An AMD card has now mined.** An RX 7600 XT (`gfx1102`, 16 WGPs, 16 GB)
 > matched the CPU exactly and benchmarked at **22.95 KH/s** on 1.8.6. That is
 > the first AMD hashrate this project has ever had, and it was measured against

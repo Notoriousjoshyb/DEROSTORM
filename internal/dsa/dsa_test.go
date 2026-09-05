@@ -94,3 +94,32 @@ func TestSuffixArrayMatchesNaive(t *testing.T) {
 		}
 	}
 }
+
+func TestSuffixArraySharedColumnOrders(t *testing.T) {
+	// Cover local one-/two-block orders, rank sorting, insertion sorting and
+	// counting sorting. Repeated keys at different columns must merge by the
+	// key alone, while reconstruction must retain each descriptor's column.
+	for _, blocks := range []int{1, 2, 4, 17, 49} {
+		input := make([]byte, blocks*blockSize+7)
+		for i := range input {
+			input[i] = byte((i % 16) * 13)
+		}
+		for block := range blocks {
+			// Long constant spans alternate with differing prepends. Keys
+			// become uniform again when those differing bytes slide out.
+			for _, col := range []int{1, 32, 64, 127, 253} {
+				input[block*blockSize+col] ^= byte(block*19 + col)
+			}
+		}
+		want := naiveSA(input)
+		got := make([]int32, len(input))
+		if !SuffixArray(input, got) {
+			t.Fatalf("%d blocks: sorter declined", blocks)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%d blocks, position %d: got %d want %d", blocks, i, got[i], want[i])
+			}
+		}
+	}
+}

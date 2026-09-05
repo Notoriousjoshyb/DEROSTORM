@@ -147,6 +147,29 @@ static double time_threaded(const Vector* v, uint32_t count, int threads,
 }
 #endif
 
+/* Unstructured input splits into single-block runs, which exhaust the initial
+ * half-sized descriptor allocation. This must grow and retry before writing,
+ * not overrun the buffer (the former one-block fast path missed that guard). */
+static int check_singleton_runs(void)
+{
+    enum { n = 8192 };
+    uint8_t text[n];
+    int32_t got[n], want[n];
+    uint32_t state = 0x12345678u;
+    for (int i = 0; i < n; i++) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        text[i] = (uint8_t)state;
+    }
+    const int ok = libsais(text, want, n, 0, NULL) == 0 &&
+                   dsa_descriptor_suffix_array(text, got, n) == 0 &&
+                   memcmp(got, want, sizeof(got)) == 0;
+    dsa_descriptor_release();
+    printf("  singleton runs %s\n", ok ? "correct" : "MISMATCH");
+    return ok;
+}
+
 int main(int argc, char** argv)
 {
     const char* path = argc > 1 ? argv[1] : "gpu/vectors.bin";
@@ -158,6 +181,7 @@ int main(int argc, char** argv)
      * other way, since a phase timer fine enough to see inside the walk would
      * cost more than the walk. The exit status still reports the mismatch. */
     const int force = argc > 4 ? atoi(argv[4]) : 0;
+    if (!check_singleton_runs()) return 1;
 
     FILE* f = fopen(path, "rb");
     if (!f) { printf("cannot open %s\n", path); return 1; }

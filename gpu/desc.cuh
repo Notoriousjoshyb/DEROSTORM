@@ -1345,13 +1345,24 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         for (int i = 0; i < len; i++) ord[i] = DESC_ORD_VAL(g0 + i);
         for (int i = 1; i < len; i++) {
             const DescOrd v = ord[i];
-            int j = i;
-            while (j > 0 && descSuffixLess(t, n, DESC_ORD_POS(v) + hi,
-                                           DESC_ORD_POS(ord[j - 1]) + hi)) {
-                ord[j] = ord[j - 1];
-                j--;
+            // ord[0..i) is sorted, and distinct suffix positions cannot tie.
+            // Once v is known to precede ord[i-1], search only the remaining
+            // prefix; i-1 is already a valid upper bound for its insertion.
+            // Search before shifting: full suffix comparisons are expensive,
+            // shared order moves are not. Keep the one-comparison ordered case.
+            const int vp = DESC_ORD_POS(v) + hi;
+            if (!descSuffixLess(t, n, vp, DESC_ORD_POS(ord[i - 1]) + hi))
+                continue;
+            int first = 0, last = i - 1;
+            while (first < last) {
+                const int mid = first + (last - first) / 2;
+                if (descSuffixLess(t, n, vp, DESC_ORD_POS(ord[mid]) + hi))
+                    last = mid;
+                else
+                    first = mid + 1;
             }
-            ord[j] = v;
+            for (int j = i; j > first; j--) ord[j] = ord[j - 1];
+            ord[first] = v;
         }
 #endif
         // The chunk's one full key read; every column below it slides.

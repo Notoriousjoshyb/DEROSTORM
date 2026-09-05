@@ -892,6 +892,7 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
      * about 27% of real runs, so avoiding the order/key arrays and 256-entry
      * constant masks removes common fixed work on every architecture. */
     if (blocks == 1) {
+        if (*desc_len + DSA_BLOCK > desc_room) return 0;
         uint32_t key = key32(t, n, base + DSA_BLOCK - 1);
 #if DSA_ARENA_REUSE
         /* One block, so every column's arena entry is the same block index and
@@ -1110,7 +1111,7 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
 #endif
 
     for (int rel = DSA_BLOCK - 1; rel >= 0; rel--) {
-        const uint32_t r = (uint32_t)rel;
+        uint32_t r = (uint32_t)rel;
 
         /* Split the (already ordered) suffixes into maximal groups sharing
          * their leading key bytes, and record each as one descriptor. */
@@ -1127,16 +1128,34 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
 
 #if DSA_UNIFORM
         if (uniform) {
+#if DSA_ARENA_REUSE
+            /* A constant prepend preserves both the uniform key and the order.
+             * Emit that whole span with one arena slice and one capacity check,
+             * without revisiting the arena/group dispatch for each column.
+             * Every remaining column needs at least one descriptor, so this
+             * reservation cannot reject a run that would otherwise fit. */
+            if (*desc_len + r + 1 > desc_room) return 0;
+            Desc* d = s->desc + *desc_len;
+            const uint32_t packed = desc_pack(aw_off, blocks);
+            for (;;) {
+                d->key = DSA_KEYREL(k0, r);
+                d->packed = packed;
+                d++;
+                if (rel == 0 || !constant[r - 1]) break;
+                r--;
+                rel--;
+                k0 = ((uint32_t)t[base + r] << key_shift) | (k0 >> 8);
+            }
+            *desc_len = (size_t)(d - s->desc);
+            if (rel == 0) return 1;
+#else
             Desc* d = &s->desc[*desc_len];
             d->key = DSA_KEYREL(k0, r);
-#if DSA_ARENA_REUSE
-            d->packed = desc_pack(aw_off, blocks);
-#else
             d->packed = desc_pack((uint32_t)*arena_len, blocks);
             emit_ord_plus(s->arena + *arena_len, order, blocks, r);
             *arena_len += blocks;
-#endif
             (*desc_len)++;
+#endif
         } else
 #elif !defined(DSA_NO_SAME4)
         if (same_key[r]) {

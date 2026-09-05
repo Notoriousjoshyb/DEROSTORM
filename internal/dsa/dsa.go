@@ -8,6 +8,7 @@
 package dsa
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math/bits"
 	"sync"
@@ -18,6 +19,7 @@ const (
 	runSplit  = 160
 	blockSize = 256
 	keyBytes  = 3
+	keyMask   = (1 << (8 * keyBytes)) - 1
 	lenBits   = 12
 	lenMask   = (1 << lenBits) - 1
 	countMin  = 48
@@ -30,7 +32,7 @@ const (
 )
 
 type desc struct {
-	key    uint32
+	key    uint32 // low 24 bits: sort key; high 8 bits: column within block
 	packed uint32
 }
 
@@ -112,13 +114,11 @@ func suffixLessFrom(t []byte, n int, a, b, from uint32) bool {
 			return x < y
 		}
 	}
-	aa, bb := t[int(a)+i+q:int(a)+m], t[int(b)+i+q:int(b)+m]
-	for j := 0; j < len(aa); j++ {
-		if aa[j] != bb[j] {
-			return aa[j] < bb[j]
-		}
-	}
-	return la < lb
+	// Long shared prefixes are common between near-copy stage-1 blocks.
+	// Compare the remainder with the runtime's architecture-specific vector
+	// loop instead of one byte (and one branch) at a time. Full suffix slices
+	// also preserve the shorter-suffix-first rule when the prefix is equal.
+	return bytes.Compare(t[int(a)+i+q:n], t[int(b)+i+q:n]) < 0
 }
 
 func suffixLess(t []byte, n int, a, b uint32) bool {
@@ -241,17 +241,18 @@ func emitRun(t []byte, n int, first, blocks uint32, s *scratch, arenaLen, descLe
 	base := first * blockSize
 	// One- and two-block runs occur in about 44% of real stage-1 texts' runs.
 	// Keep their complete ordering state in locals instead of initializing the
-	// runMax-sized order/key scratch and two blockSize-sized column masks.
+	// runMax-sized order/key scratch and blockSize-sized column mask.
 	if blocks == 1 {
 		if *descLen+blockSize > descRoom {
 			return false
 		}
 		key := key32(t, n, int(base)+blockSize-1)
 		keyShift := uint32(8 * (keyBytes - 1))
+		arenaOff := uint32(*arenaLen)
+		s.arena[*arenaLen] = base
+		*arenaLen++
 		for rel := blockSize - 1; rel >= 0; rel-- {
-			s.desc[*descLen] = desc{key: key, packed: pack(uint32(*arenaLen), 1)}
-			s.arena[*arenaLen] = base + uint32(rel)
-			*arenaLen++
+			s.desc[*descLen] = desc{key: key | uint32(rel)<<24, packed: pack(arenaOff, 1)}
 			*descLen++
 			if rel != 0 {
 				key = uint32(t[int(base)+rel-1])<<keyShift | key>>8
@@ -270,6 +271,7 @@ func emitRun(t []byte, n int, first, blocks uint32, s *scratch, arenaLen, descLe
 		key1 := key32(t, n, int(b1)+blockSize-1)
 		swapped := suffixLess(t, n, b1+blockSize-1, b0+blockSize-1)
 		keyShift := uint32(8 * (keyBytes - 1))
+		arenaOff, dirty := uint32(0), true
 
 		for rel := blockSize - 1; rel >= 0; rel-- {
 			first, second := b0, b1
@@ -278,20 +280,22 @@ func emitRun(t []byte, n int, first, blocks uint32, s *scratch, arenaLen, descLe
 				first, second = second, first
 				firstKey, secondKey = secondKey, firstKey
 			}
-			arenaOff := uint32(*arenaLen)
-			s.arena[*arenaLen] = first + uint32(rel)
-			*arenaLen++
-			s.arena[*arenaLen] = second + uint32(rel)
-			*arenaLen++
+			if dirty {
+				arenaOff = uint32(*arenaLen)
+				s.arena[*arenaLen] = first
+				s.arena[*arenaLen+1] = second
+				*arenaLen += 2
+				dirty = false
+			}
 
 			length := uint32(1)
 			if firstKey == secondKey {
 				length = 2
 			}
-			s.desc[*descLen] = desc{key: firstKey, packed: pack(arenaOff, length)}
+			s.desc[*descLen] = desc{key: firstKey | uint32(rel)<<24, packed: pack(arenaOff, length)}
 			*descLen++
 			if firstKey != secondKey {
-				s.desc[*descLen] = desc{key: secondKey, packed: pack(arenaOff+1, 1)}
+				s.desc[*descLen] = desc{key: secondKey | uint32(rel)<<24, packed: pack(arenaOff+1, 1)}
 				*descLen++
 			}
 
@@ -301,6 +305,7 @@ func emitRun(t []byte, n int, first, blocks uint32, s *scratch, arenaLen, descLe
 				key0 = uint32(c0)<<keyShift | key0>>8
 				key1 = uint32(c1)<<keyShift | key1>>8
 				if c0 != c1 {
+					dirty = swapped != (c1 < c0)
 					swapped = c1 < c0
 				}
 			}
@@ -345,61 +350,82 @@ func emitRun(t []byte, n int, first, blocks uint32, s *scratch, arenaLen, descLe
 		}
 	}
 
-	var sameKey [blockSize]byte
-	for rel := 0; rel+keyBytes <= blockSize; rel++ {
-		s := constant[rel]
-		for k := 1; k < keyBytes; k++ {
-			s &= constant[rel+k]
-		}
-		sameKey[rel] = s
-	}
-
 	var keys [runMax]uint32
 	for i := uint32(0); i < blocks; i++ {
 		keys[i] = key32(t, n, int(order[i])+255)
 	}
 	keyShift := uint32(8 * (keyBytes - 1))
+	// While all keys agree, carry one key instead of sliding the same value
+	// once per block. Restore the array before a nonconstant prepend.
+	k0, uniform := keys[0], true
+	for i := uint32(1); i < blocks; i++ {
+		if keys[i] != k0 {
+			uniform = false
+			break
+		}
+	}
+	// Constant prepends preserve order. Store block bases once and carry the
+	// column in each descriptor, so successive columns can share that slice.
+	arenaOff, dirty := uint32(0), true
 
 	for rel := blockSize - 1; rel >= 0; rel-- {
 		r := uint32(rel)
 		if *descLen+int(blocks) > descRoom {
 			return false
 		}
-		if sameKey[r] != 0 {
-			s.desc[*descLen] = desc{key: keys[0], packed: pack(uint32(*arenaLen), blocks)}
-			for x := uint32(0); x < blocks; x++ {
-				s.arena[*arenaLen] = order[x] + r
-				*arenaLen++
-			}
+		if dirty {
+			arenaOff = uint32(*arenaLen)
+			copy(s.arena[*arenaLen:*arenaLen+int(blocks)], order[:blocks])
+			*arenaLen += int(blocks)
+			dirty = false
+		}
+		if uniform {
+			s.desc[*descLen] = desc{key: k0 | r<<24, packed: pack(arenaOff, blocks)}
 			*descLen++
 		} else {
-			i := uint32(0)
+			i, groups := uint32(0), 0
 			for i < blocks {
 				k := keys[i]
 				j := i + 1
 				for j < blocks && keys[j] == k {
 					j++
 				}
-				s.desc[*descLen] = desc{key: k, packed: pack(uint32(*arenaLen), j-i)}
-				for x := i; x < j; x++ {
-					s.arena[*arenaLen] = order[x] + r
-					*arenaLen++
-				}
+				s.desc[*descLen] = desc{key: k | r<<24, packed: pack(arenaOff+i, j-i)}
 				*descLen++
+				groups++
 				i = j
+			}
+			if groups == 1 {
+				k0, uniform = keys[0], true
 			}
 		}
 		if rel == 0 {
 			break
 		}
 		col := r - 1
+		if constant[col] != 0 {
+			hi := uint32(t[int(base)+int(col)]) << keyShift
+			if uniform {
+				k0 = hi | k0>>8
+			} else {
+				for x := uint32(0); x < blocks; x++ {
+					keys[x] = hi | keys[x]>>8
+				}
+			}
+			continue
+		}
+		if uniform {
+			for x := uint32(0); x < blocks; x++ {
+				keys[x] = k0
+			}
+			uniform = false
+		}
 		for x := uint32(0); x < blocks; x++ {
 			c := uint32(t[int(order[x])+int(col)])
 			keys[x] = (c << keyShift) | (keys[x] >> 8)
 		}
-		if constant[col] == 0 {
-			columnStepKeys(order, keys[:], s.order2, blocks)
-		}
+		columnStepKeys(order, keys[:], s.order2, blocks)
+		dirty = true
 	}
 	return true
 }
@@ -489,18 +515,16 @@ retry:
 	if tail < n {
 		key := key32(text, n, n-1)
 		keyShift := uint32(8 * (keyBytes - 1))
+		arenaOff := uint32(arenaLen)
+		s.arena[arenaLen] = uint32(tail)
+		arenaLen++
 		for p := n - 1; p >= tail; p-- {
-			s.desc[descLen] = desc{key: key, packed: pack(uint32(arenaLen), 1)}
-			s.arena[arenaLen] = uint32(p)
+			s.desc[descLen] = desc{key: key | uint32(p-tail)<<24, packed: pack(arenaOff, 1)}
 			descLen++
-			arenaLen++
 			if p != tail {
 				key = uint32(text[p-1])<<keyShift | key>>8
 			}
 		}
-	}
-	if arenaLen != n {
-		return false
 	}
 
 	ds := sortDesc(s.desc[:descLen], s.desc2[:descLen], descLen)
@@ -509,21 +533,22 @@ retry:
 	i := 0
 	for i < descLen {
 		d0 := ds[i]
-		if i+1 == descLen || ds[i+1].key != d0.key {
+		if i+1 == descLen || ds[i+1].key&keyMask != d0.key&keyMask {
 			src := s.arena[off(d0):]
 			ln := int(dlen(d0))
+			col := d0.key >> 24
 			// Short lengths are unpredictable and dominate unique-key groups.
 			// Four straight stores avoid one loop branch per group. Overwrites
 			// are repaired by the next group; arena slack and the output guard
 			// keep both sides in bounds.
 			if ln <= 4 && out+4 <= n {
-				sa[out] = int32(src[0])
-				sa[out+1] = int32(src[1])
-				sa[out+2] = int32(src[2])
-				sa[out+3] = int32(src[3])
+				sa[out] = int32(src[0] + col)
+				sa[out+1] = int32(src[1] + col)
+				sa[out+2] = int32(src[2] + col)
+				sa[out+3] = int32(src[3] + col)
 			} else {
 				for z := 0; z < ln; z++ {
-					sa[out+z] = int32(src[z])
+					sa[out+z] = int32(src[z] + col)
 				}
 			}
 			out += ln
@@ -531,7 +556,7 @@ retry:
 			continue
 		}
 		j := i + 1
-		for j < descLen && ds[j].key == ds[i].key {
+		for j < descLen && ds[j].key&keyMask == d0.key&keyMask {
 			j++
 		}
 		need := 0
@@ -549,7 +574,11 @@ retry:
 			ba[nlist] = uint32(total)
 			nlist++
 			dl := int(dlen(d))
-			copy(a[total:total+dl], s.arena[int(off(d)):int(off(d))+dl])
+			src := s.arena[int(off(d)) : int(off(d))+dl]
+			col := d.key >> 24
+			for z := range dl {
+				a[total+z] = src[z] + col
+			}
 			total += dl
 		}
 		ba[nlist] = uint32(total)

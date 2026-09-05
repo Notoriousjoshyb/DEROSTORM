@@ -19,6 +19,21 @@ claim is the one that carries over: `go test ./cmd/derostorm/ -run GPU` compares
 the GPU hash against the CPU through whichever backend is present, so an AMD
 card proves itself the same way this one did.
 
+## Binary-search seed insertion
+
+The descriptor column walk seeds each chunk by sorting its run's suffixes.
+It now probes the preceding suffix first, preserving the one-comparison
+already-ordered case, then binary-searches the sorted prefix before shifting
+the shared order entries. This bounds expensive seed comparisons to
+O(run length × log(run length)); the cheap one-byte column sorts are unchanged.
+No extra scratch, barriers, descriptor fields or platform-specific operations.
+
+On the RTX 5080, three interleaved complete-miner A/B rounds at 336 blocks
+measured median 199,672 → 204,337 H/s (+2.3%); at 420 blocks, +1.6%.
+All 512 final hashes match the CPU. These are NVIDIA measurements, not AMD
+predictions. Windows CUDA and HIP, and Linux CUDA and ROCm 5/6/7 libraries were
+rebuilt from the shared source. There is no Metal backend.
+
 ## What was wrong with the AMD build
 
 Writing the kernels once and building them twice is only as good as the
@@ -234,7 +249,7 @@ one boundary.
 | `gpu/hash_test.exe` | option A: stage 1 text, then the final hash, all 512 |
 | `gpu/sa_parallel_test.exe` | option B's suffix arrays vs the CPU, and B vs A |
 | `gpu/hash_parallel_test.exe` | option B end to end: all 512 final hashes |
-| `go test -tags cuda -run GPU ./cmd/derostorm` | the cgo bridge, and that the GPU's difficulty check picks exactly the nonces the CPU would |
+| `go test -run GPU ./cmd/derostorm` | the runtime-loaded library, CPU/GPU hash agreement, difficulty checks and pipelined search |
 
 On top of that the miner re-hashes every winning nonce on the CPU before
 submitting it, and refuses to mine on a device that disagrees with the CPU on
