@@ -8,10 +8,26 @@ package main
 // library that is actually loaded.
 
 import (
+	"runtime"
 	"testing"
 
 	"github.com/deroproject/derohe/astrobwt/astrobwtv3"
 )
+
+// BenchmarkMiningCPU measures the complete paired mining loop at GOMAXPROCS
+// workers. Each operation covers 1,000 nonces per worker, including scheduling
+// and scratch acquisition. Use -cpu to compare a fixed thread count.
+func BenchmarkMiningCPU(b *testing.B) {
+	installForBench(b)
+	threads := runtime.GOMAXPROCS(0)
+	benchRound(threads, 100)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		benchRound(threads, 1000)
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.N)*float64(threads)*1000/b.Elapsed().Seconds(), "H/s")
+}
 
 func benchWork(slot int) [48]byte {
 	var w [48]byte

@@ -31,7 +31,7 @@ import (
 	"github.com/docopt/docopt-go"
 )
 
-const version = "1.9.0"
+const version = "1.9.1"
 
 const usage = `DeroStorm ` + version + `
 AstroBWTv3 miner for DERO. Mines on the CPU, and on NVIDIA or AMD GPUs as well

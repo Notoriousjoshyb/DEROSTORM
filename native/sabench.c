@@ -152,19 +152,35 @@ static double time_threaded(const Vector* v, uint32_t count, int threads,
  * not overrun the buffer (the former one-block fast path missed that guard). */
 static int check_singleton_runs(void)
 {
-    enum { n = 8192 };
-    uint8_t text[n];
-    int32_t got[n], want[n];
+    enum { capacity = 8193 };
+    uint8_t text[capacity];
+    int32_t got[capacity], want[capacity];
+    const int lengths[] = {249, 250, 251, 252, 253, 254, 255, 256, 257,
+                           258, 259, 260, 261, 262, 263, 511, 512, 513,
+                           767, 768, 769, 8191, 8192, 8193};
     uint32_t state = 0x12345678u;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < capacity; i++) {
         state ^= state << 13;
         state ^= state >> 17;
         state ^= state << 5;
         text[i] = (uint8_t)state;
     }
-    const int ok = libsais(text, want, n, 0, NULL) == 0 &&
-                   dsa_descriptor_suffix_array(text, got, n) == 0 &&
-                   memcmp(got, want, sizeof(got)) == 0;
+    int ok = 1;
+    for (size_t k = 0; k < sizeof(lengths) / sizeof(lengths[0]); k++) {
+        const int n = lengths[k];
+        // Exact-sized allocations let AddressSanitizer detect a vector load
+        // across the text boundary, including partial final blocks.
+        uint8_t* exact = (uint8_t*)malloc((size_t)n);
+        if (!exact) return 0;
+        memcpy(exact, text, (size_t)n);
+        if (libsais(exact, want, n, 0, NULL) != 0 ||
+            dsa_descriptor_suffix_array(exact, got, n) != 0 ||
+            memcmp(got, want, (size_t)n * sizeof(*got)) != 0) {
+            printf("  singleton boundary MISMATCH at %d bytes\n", n);
+            ok = 0;
+        }
+        free(exact);
+    }
     dsa_descriptor_release();
     printf("  singleton runs %s\n", ok ? "correct" : "MISMATCH");
     return ok;
@@ -343,5 +359,4 @@ int main(int argc, char** argv)
 #endif
     return desc_ok ? 0 : 1;
 }
-
 

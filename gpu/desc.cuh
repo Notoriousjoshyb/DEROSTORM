@@ -256,6 +256,43 @@
 #define DESC_SEED_RANK 0
 #endif
 
+// Seed the column walk by ranking every block against one of them, instead of
+// comparing pairs of them.
+//
+// The seed sorts a run's blocks by the suffixes starting at the chunk's top
+// column, and the note on DESC_CHUNKS says plainly what is wrong with it: the
+// per-chunk seeding cost is what stops the columns being cut any finer, and the
+// walk's 1.98x imbalance stands because of it.
+//
+// What makes a seed comparison expensive is stated a few lines up, under
+// DESC_LEAD8: the blocks are near copies, so a comparison "never separates in
+// the first eight bytes" and walks about a hundred before it decides. The
+// binary-search insertion sort issues len*log(len) of those.
+//
+// Ranking issues len. Every block is compared once against the run's first
+// block, and that comparison reports how far the two agreed as well as which
+// way round they go. That pair -- which side, how far -- orders the whole run:
+// take x and y both below the pivot p, agreeing with it for Lx and Ly bytes
+// with Lx > Ly. At offset Ly, y differs from p downwards while x still matches
+// it, so x > y. Below the pivot, agreeing for longer means larger; above it the
+// same argument runs the other way, so one side is stored inverted and
+// ascending rank is ascending suffix order on both.
+//
+// Only blocks that agreed with the pivot for the *same* length are left to
+// compare, and that comparison starts at that length -- past the hundred bytes
+// that made the original expensive.
+//
+// 0 restores the binary-search insertion sort exactly.
+#ifndef DESC_SEED_LCP
+#define DESC_SEED_LCP 1
+#endif
+// Runs shorter than this keep the insertion sort. Ranking costs len text walks
+// whatever happens, while insertion sort on an already-ordered short run costs
+// one comparison; the crossover is where log(len) stops being about 1.
+#ifndef DESC_SEED_LCP_MIN
+#define DESC_SEED_LCP_MIN 4
+#endif
+
 // SCAFFOLDING: leave one thing out of the column walk and time what is left.
 // Every setting but 0 produces a wrong suffix array; the point is where the
 // walk's wall time goes, which the per-task table cannot say because a lane's
@@ -928,6 +965,63 @@ __device__ __forceinline__ bool descSuffixLess(const uint8_t* t, int n, int a, i
     return descSuffixLessFrom(t, n, a, b, 0);
 }
 
+#if DESC_SEED_LCP
+// descSuffixCmpLcp orders two suffixes and reports how far they agreed.
+//
+// Same sweep as descSuffixLessFrom, with the offset of the first difference
+// kept. It is the seed's whole cost either way: a comparison already has to
+// walk to the divergence, so saying where it was is free.
+__device__ __forceinline__ bool descSuffixCmpLcp(const uint8_t* t, int n,
+                                                 int a, int b, int* lcp)
+{
+    const int la = n - a, lb = n - b;
+    const int m = la < lb ? la : lb;
+    int i = 0;
+
+    for (; i + DESC_WIDE_STEP <= m; i += DESC_WIDE_STEP) {
+#pragma unroll
+        for (int u = 0; u < DESC_WIDE_STEP; u += 8) {
+            const uint64_t wau = descLoadBE64(t, a + i + u);
+            const uint64_t wbu = descLoadBE64(t, b + i + u);
+            if (wau != wbu) {
+                const int z = __clzll((unsigned long long)(wau ^ wbu)) >> 3;
+                *lcp = i + u + z;
+                return ((wau >> (56 - 8 * z)) & 255u) < ((wbu >> (56 - 8 * z)) & 255u);
+            }
+        }
+    }
+    for (; i + 8 <= m; i += 8) {
+        const uint64_t wa = descLoadBE64(t, a + i);
+        const uint64_t wb = descLoadBE64(t, b + i);
+        if (wa != wb) {
+            const int z = __clzll((unsigned long long)(wa ^ wb)) >> 3;
+            *lcp = i + z;
+            return ((wa >> (56 - 8 * z)) & 255u) < ((wb >> (56 - 8 * z)) & 255u);
+        }
+    }
+    for (; i < m; i++) {
+        const uint8_t ca = t[a + i], cb = t[b + i];
+        if (ca != cb) { *lcp = i; return ca < cb; }
+    }
+    *lcp = m;
+    return la < lb;   // a prefix sorts before what it prefixes
+}
+
+// The rank built from that. Seventeen bits hold any LCP in a text of at most
+// ASTRO_MAX_TEXT bytes; the side goes above them, inverted on the upper side so
+// that ascending rank is ascending suffix order on both.
+#define DESC_RANK_LCP_BITS 20
+#define DESC_RANK_LCP_MASK ((1u << DESC_RANK_LCP_BITS) - 1u)
+#define DESC_RANK_LESS(l)  ((0u << DESC_RANK_LCP_BITS) | (uint32_t)(l))
+#define DESC_RANK_PIVOT    (1u << DESC_RANK_LCP_BITS)
+#define DESC_RANK_MORE(l)  ((2u << DESC_RANK_LCP_BITS) |                                             (DESC_RANK_LCP_MASK - (uint32_t)(l)))
+__device__ __forceinline__ int descRankLcp(uint32_t r)
+{
+    const uint32_t low = r & DESC_RANK_LCP_MASK;
+    return (int)((r >> DESC_RANK_LCP_BITS) == 0u ? low : DESC_RANK_LCP_MASK - low);
+}
+#endif
+
 #if DESC_MSD && DESC_MSD_PACKED16
 // Two logical uint16 bucket cursors in one physical uint32. Adding/subtracting
 // 1 or 1<<16 with a 32-bit shared atomic is exact while neither half can wrap;
@@ -1221,10 +1315,12 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
             arena[awBase] = (uint16_t)g0;
             const uint32_t off = (uint32_t)((size_t)g0 * 256 + awBase);
             uint32_t oneKey = descKey32(t, n, base + hi);
+            // Every column emits exactly one descriptor. Reserve the chunk
+            // once instead of contending on the shared counter per column.
+            int d = atomicAdd(&s_ndesc, hi - lo + 1);
             for (int rel = hi; rel >= lo; rel--) {
-                const int d = atomicAdd(&s_ndesc, 1);
                 PROF_TASK_EMIT();
-                sc.words[d] = ((uint64_t)DESC_KEYREL(oneKey, rel) << 32) |
+                sc.words[d++] = ((uint64_t)DESC_KEYREL(oneKey, rel) << 32) |
                               ((uint64_t)off << DESC_LEN_BITS) | 1u;
                 if (rel != lo)
                     oneKey = ((uint32_t)t[base + rel - 1] << 24) | (oneKey >> 8);
@@ -1343,6 +1439,43 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
         for (int i = 0; i < len; i++) ord[i] = DESC_ORD_VAL(g0 + i);
 #else
         for (int i = 0; i < len; i++) ord[i] = DESC_ORD_VAL(g0 + i);
+#if DESC_SEED_LCP
+        if (len >= DESC_SEED_LCP_MIN) {
+            // One walk each against the run's first block. Nothing here depends
+            // on the walk before it, so they overlap; the insertion sort below
+            // could not start a comparison until the last one had decided.
+            const int pivot = base + hi;
+            key[0] = DESC_RANK_PIVOT;
+            for (int i = 1; i < len; i++) {
+                int l = 0;
+                const bool less =
+                    descSuffixCmpLcp(t, n, base + i * 256 + hi, pivot, &l);
+                key[i] = less ? DESC_RANK_LESS(l) : DESC_RANK_MORE(l);
+            }
+            // Ranks order the run outright except where two blocks left the
+            // pivot at the same byte, and that comparison starts there.
+            for (int i = 1; i < len; i++) {
+                const uint32_t rv = key[i];
+                const DescOrd v = ord[i];
+                const int vp = DESC_ORD_POS(v) + hi;
+                int j = i;
+                while (j > 0) {
+                    const uint32_t rp = key[j - 1];
+                    bool greater;
+                    if (rp != rv) greater = rp > rv;
+                    else greater = descSuffixLessFrom(t, n, vp,
+                                                      DESC_ORD_POS(ord[j - 1]) + hi,
+                                                      descRankLcp(rv));
+                    if (!greater) break;
+                    key[j] = rp;
+                    ord[j] = ord[j - 1];
+                    j--;
+                }
+                key[j] = rv;
+                ord[j] = v;
+            }
+        } else
+#endif
         for (int i = 1; i < len; i++) {
             const DescOrd v = ord[i];
             // ord[0..i) is sorted, and distinct suffix positions cannot tie.
@@ -1534,10 +1667,27 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
             if (uniform) {
 #if DESC_ABLATE != 5
                 const uint32_t off = (uint32_t)((size_t)g0 * 256 + awBase);
+#if DESC_ARENA_REUSE && DESC_COLMASK && DESC_CHUNK_COLS <= 64
+                // Equal keys and an unchanged order persist through constant
+                // prepends. Claim all descriptors in that span with one atomic.
+                // rel-lo is at most 63, so the shift never uses the word width.
+                const uint64_t different = ~col_mask & ((1ull << (rel - lo)) - 1ull);
+                const int last = different ? lo + 64 - __clzll(different) : lo;
+                int d = atomicAdd(&s_ndesc, rel - last + 1);
+                for (;;) {
+                    PROF_TASK_EMIT();
+                    sc.words[d++] = ((uint64_t)DESC_KEYREL(k0, rel) << 32) |
+                                   ((uint64_t)off << DESC_LEN_BITS) | (uint32_t)len;
+                    if (rel == last) break;
+                    --rel;
+                    k0 = ((uint32_t)t[base + rel] << 24) | (k0 >> 8);
+                }
+#else
                 const int d = atomicAdd(&s_ndesc, 1);
                 PROF_TASK_EMIT();
                 sc.words[d] = ((uint64_t)DESC_KEYREL(k0, rel) << 32) |
                               ((uint64_t)off << DESC_LEN_BITS) | (uint32_t)len;
+#endif
 #endif
             } else
 #endif

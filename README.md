@@ -4,6 +4,87 @@ An AstroBWTv3 miner for DERO. Mines on the CPU and, when an NVIDIA or AMD card
 is present, on the GPU as well. Full-screen themed console, guided first-run
 setup.
 
+### 1.9.1 — a smaller sort on both devices
+
+Two further changes on top of the batched emission below. Both keep the same
+suffix arrays: a suffix array is unique, so a faster route either produces
+exactly what libsais produces or it is wrong. `native\sabench.exe` checks all
+512 real texts against libsais, and `gpu\hash_parallel_test.exe` checks all 512
+final GPU hashes against the CPU.
+
+| Suffix sort, one thread, nine interleaved A/B visits | Before | After | Median |
+|---|---:|---:|---:|
+| `native\sabench.exe gpu\vectors.bin` | 7,077 texts/s | 7,156 texts/s | +1.1% |
+
+| CUDA search, interleaved A/B visits | Before | After | Median |
+|---|---:|---:|---:|
+| 336 blocks, three separate runs | 203,063 H/s | 208,224 H/s | +2.5% to +5.3% |
+| 420 blocks | 200,360 H/s | 200,858 H/s | +0.3%, within noise |
+| 504 blocks (device default) | 199,785 H/s | 200,645 H/s | +0.4%, within noise |
+
+**The CPU: a colliding key group is insertion sorted, not merged.** A key group
+whose descriptors share their three key bytes has to be resolved by comparison,
+and it used to be resolved by a merge tree in every case. The tree is the right
+shape for a big group and the wrong one for the groups that occur: 329 groups a
+text hold 2,205 positions between them, arriving as five short lists each, so
+the boundary table, the ping-pong buffer and a pass per level are nearly all of
+the cost. Groups under 48 positions are now insertion sorted where they lie,
+which is correct without being stable — the suffixes of a string are distinct,
+so the comparison is a total order. The tree is kept for the rare large group;
+the high water over the 512 texts is 930 positions in one. Each position also
+carries the eight text bytes after the key, gathered once so the reads overlap
+instead of queueing behind the comparison that wants them.
+
+**The GPU: the column walk's seed ranks rather than compares.** The walk seeds
+each chunk by sorting its run's blocks by the suffixes starting at the chunk's
+top column, and `gpu/desc.cuh` already recorded that this seeding cost is what
+stops the columns being cut any finer. What makes those comparisons expensive is
+that the blocks are near copies, so one never separates in its first eight bytes
+and walks about a hundred before it decides; a binary-search insertion sort
+issues `len·log(len)` of them. Ranking issues `len`: every block is compared
+once against the run's first block, and that comparison reports how far the two
+agreed as well as which way round they go. Which side and how far orders the
+whole run, and only blocks that left the pivot at the same byte need comparing
+— from that byte. The kernel's own phase timer puts the column walk at
+516.4M cycles before and 493.9M after, with register use and occupancy
+unchanged.
+
+Three things were built, measured and are not kept, and the reasons are recorded
+where the code is: finishing the CPU descriptor sort in one bucketed pass rather
+than two radix passes (4,234 texts/s against 7,259 — the pass is cheaper and the
+unpredictable branch it leaves in the merge costs more), profile-guided
+optimisation of the CPU library (7,187 against 7,285), and the GPU's rank-by-LCP
+seed applied to the CPU's colliding groups (6,744 against 7,251 — the groups are
+too small for it to pay).
+
+#### Also in 1.9.1: batched descriptor emission
+
+Measured against the starting Windows build on a Ryzen 7 9800X3D and RTX 5080:
+
+| Complete mining workload | Before | After | Median change |
+|---|---:|---:|---:|
+| CPU, one worker, three interleaved A/B rounds | 3,882 H/s | 4,007 H/s | +3.2% |
+| CPU, 15 workers, five interleaved A/B rounds | 38,008 H/s | 38,186 H/s | +0.5%, within noise |
+| CUDA search, 336 blocks, five interleaved A/B rounds | 203,869 H/s | 207,899 H/s | +2.0% |
+| CUDA search, 504 blocks (device default), same rounds | 204,788 H/s | 208,886 H/s | +2.0% |
+
+These are incremental gains, with significant background-load variation. At
+420 GPU blocks the median was 210,527 → 208,225 H/s (-1.1%). No repeatable
+15-worker CPU improvement is claimed. CPU and GPU were measured separately;
+these numbers are not simultaneous mining throughput or AMD/Linux predictions.
+
+The native AVX2 CPU sorter finds whole spans of unchanged columns from a bitmap
+and emits four descriptors per vector operation. Short or final text fragments
+retain bounded scalar reads. The GPU reserves one descriptor range per uniform
+span or single-block chunk, reducing shared-counter atomics. The portable Go
+and non-AVX2 CPU paths retain their existing implementation.
+
+Reproduce fixed-thread CPU measurements with `BenchmarkMiningCPU` in
+`cmd/derostorm/shabench_test.go` (`-cpu=1` or `-cpu=15`). The new
+`gpu/bench_compare.py` interleaves complete searches from two CUDA/HIP libraries
+at fixed block counts, alternates A/B order, and reports medians. GPU measurements
+above used batches of 32,768, two warmups and eight timed batches per visit.
+
 ### 1.9.0 — measured CPU and GPU improvements
 
 Measured against the starting source on a Ryzen 7 9800X3D and RTX 5080.

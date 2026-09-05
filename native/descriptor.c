@@ -413,6 +413,41 @@ typedef char dsa_off_fits[((256 * 384) <= (int)DSA_MAX_OFF) ? 1 : -1];
 #define DSA_GROUP_CAP 4096
 #endif
 
+/* Below this many positions a colliding key group is insertion sorted rather
+ * than merged.
+ *
+ * The merge tree is the right shape for a big group and the wrong one for the
+ * groups that actually occur: 329 groups a text hold 2,205 positions between
+ * them, so the average is under seven, arriving as five separate lists. For
+ * that the tree is nearly all overhead -- a boundary table, a ping-pong buffer,
+ * a memcpy per odd list and a pass per level -- around a handful of elements.
+ *
+ * Insertion sort needs none of it, and it is correct here without being stable:
+ * the suffixes of a string are distinct, so the comparison is a total order and
+ * every correct sort gives the same answer. It stays quadratic, which is why
+ * the tree is kept for the rare large group -- the high water over the 512 real
+ * texts is 930 positions in one group.
+ *
+ * Swept at one thread, interleaved: 7,142 texts/s at 16, 7,251 at 48, 7,217 at
+ * 128. Flat past 48, which is what a threshold that has stopped mattering looks
+ * like -- the groups are all far below it.
+ *
+ * Two other shapes for this were measured and are not here. Ranking the group
+ * against one of its members, so that each is walked once instead of compared
+ * against its neighbours, is what the GPU seed does (DESC_SEED_LCP in
+ * gpu/desc.cuh) and it loses here: 6,744 texts/s against 7,251. The reason is
+ * the size. A seed there ranks up to 45 blocks and saves the difference between
+ * 45 walks and 45*log(45) comparisons; a group here holds under seven, so there
+ * is nothing to save, and the ranks tie anyway -- 7,233 comparisons a text fell
+ * through to a full one against 3,543 with the eight-byte key.
+ *
+ * Dropping the eight-byte key and insertion sorting on the full comparison
+ * alone measured 7,080, so the key is worth keeping even though nine
+ * comparisons in ten fall through it. */
+#ifndef DSA_SMALL_GROUP
+#define DSA_SMALL_GROUP 48
+#endif
+
 typedef struct {
     Arena*    arena;    /* n block indices, grouped by descriptor */
     Desc*     desc;     /* descriptors, then their radix-sorted copy */
@@ -421,6 +456,8 @@ typedef struct {
     uint32_t* order2;   /* ping-pong for the counting sort in the column step */
     uint32_t* merge;    /* ping-pong space for merging a key group */
     uint32_t* merge2;
+    uint64_t* mkey;     /* the eight bytes after the key, per gathered position */
+    uint64_t* mkey2;
     uint32_t* bnd;      /* list boundaries within the above, ping-ponged too */
     uint32_t* bnd2;
     size_t    cap;      /* text length this scratch was sized for */
@@ -447,6 +484,8 @@ static void scratch_free(Scratch* s)
     free(s->order2);
     free(s->merge);
     free(s->merge2);
+    free(s->mkey);
+    free(s->mkey2);
     free(s->bnd);
     free(s->bnd2);
     free(s);
@@ -478,10 +517,13 @@ static Scratch* scratch_get(size_t n, size_t want_desc)
     s->order2 = (uint32_t*)malloc((DSA_RUN_MAX + 8) * sizeof(uint32_t));
     s->merge = (uint32_t*)malloc((gcap + 8) * sizeof(uint32_t));
     s->merge2 = (uint32_t*)malloc((gcap + 8) * sizeof(uint32_t));
+    s->mkey = (uint64_t*)malloc((gcap + 8) * sizeof(uint64_t));
+    s->mkey2 = (uint64_t*)malloc((gcap + 8) * sizeof(uint64_t));
     s->bnd  = (uint32_t*)malloc((gcap + 8) * sizeof(uint32_t));
     s->bnd2 = (uint32_t*)malloc((gcap + 8) * sizeof(uint32_t));
     if (!s->arena || !s->desc || !s->desc2 || !s->order || !s->order2 ||
-        !s->merge || !s->merge2 || !s->bnd || !s->bnd2) {
+        !s->merge || !s->merge2 || !s->mkey || !s->mkey2 ||
+        !s->bnd || !s->bnd2) {
         scratch_free(s);
         return NULL;
     }
@@ -507,6 +549,39 @@ static inline uint32_t key32(const uint8_t* t, size_t n, size_t p)
     }
     uint32_t k = 0;
     for (size_t i = 0; i < DSA_KEY_BYTES; i++) {
+        k <<= 8;
+        if (p + i < n) k |= t[p + i];
+    }
+    return k;
+}
+
+/* ekey64 reads the eight bytes at p as a comparable number, padding past the
+ * end of the text with 0.
+ *
+ * This is the tie-break key for a colliding key group, and it is gathered per
+ * position rather than computed inside the comparison. The reason is where the
+ * loads sit: inside a sort, the two text reads a comparison needs are on its
+ * critical path -- the next comparison cannot start until this one picks a
+ * side, so each pays the full latency of a random read into a 69 KB text.
+ * Gathered up front nothing depends on them, so they overlap each other, and
+ * the sort then compares two registers.
+ *
+ * It does not settle every pair: these texts are near-copies of each other, so
+ * about nine comparisons in ten still agree on all eight bytes and fall through
+ * to the full one. It is worth its cost on the other tenth, measured at 7,251
+ * texts/s against 7,080 without it.
+ *
+ * Padding with 0 is order preserving for the same reason it is in key32, and a
+ * tie falls through to the full comparison, which settles it. */
+static inline uint64_t ekey64(const uint8_t* t, size_t n, size_t p)
+{
+    if (p + 8 <= n) {
+        uint64_t v;
+        memcpy(&v, t + p, 8);
+        return DSA_BSWAP64(v);
+    }
+    uint64_t k = 0;
+    for (size_t i = 0; i < 8; i++) {
         k <<= 8;
         if (p + i < n) k |= t[p + i];
     }
@@ -878,6 +953,32 @@ static inline void emit_ord_plus(Arena* dst, const uint32_t* order,
 }
 
 
+#if defined(DSA_AVX2) && DSA_ARENA_REUSE && DSA_KEY_BYTES == 3
+/* Emit a span sharing one arena slice. Only full-block loads are vectorized;
+ * key32 handles the final bytes and their possible end-of-text padding. */
+static inline void emit_uniform_span(Desc* d, const uint8_t* t, size_t n,
+                                     uint32_t base, uint32_t lo, uint32_t hi,
+                                     uint32_t packed)
+{
+    const __m128i pk = _mm_set1_epi32((int)packed);
+    const __m128i shuffle = _mm_setr_epi8(2, 1, 0, -1, 3, 2, 1, -1,
+                                         4, 3, 2, -1, 5, 4, 3, -1);
+    __m128i columns = _mm_setr_epi32((int)(lo << 24), (int)((lo + 1) << 24),
+                                    (int)((lo + 2) << 24), (int)((lo + 3) << 24));
+    for (; lo + 3 <= hi && lo <= 248; lo += 4, d += 4) {
+        const __m128i bytes = _mm_loadl_epi64((const __m128i*)(t + base + lo));
+        const __m128i keys = _mm_or_si128(_mm_shuffle_epi8(bytes, shuffle), columns);
+        _mm_storeu_si128((__m128i*)d, _mm_unpacklo_epi32(keys, pk));
+        _mm_storeu_si128((__m128i*)(d + 2), _mm_unpackhi_epi32(keys, pk));
+        columns = _mm_add_epi32(columns, _mm_set1_epi32(4 << 24));
+    }
+    for (; lo <= hi; lo++, d++) {
+        d->key = DSA_KEYREL(key32(t, n, base + lo), lo);
+        d->packed = packed;
+    }
+}
+#endif
+
 static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
                     uint32_t blocks, Scratch* s,
                     size_t* arena_len, size_t* desc_len)
@@ -899,6 +1000,11 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
          * all 256 descriptors point at one slot. */
         const uint32_t one_off = (uint32_t)*arena_len;
         s->arena[(*arena_len)++] = (Arena)first_block;
+#endif
+#if defined(DSA_AVX2) && DSA_ARENA_REUSE && DSA_KEY_BYTES == 3
+        emit_uniform_span(s->desc + *desc_len, t, n, base, 0, 255, desc_pack(one_off, 1));
+        *desc_len += DSA_BLOCK;
+        return 1;
 #endif
         for (int rel = DSA_BLOCK - 1; rel >= 0; rel--) {
             Desc* d = &s->desc[*desc_len];
@@ -1011,6 +1117,7 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
      * the remainder is handled as single-suffix descriptors -- so every one of
      * these 32-byte loads is inside the text. */
     uint8_t constant[DSA_BLOCK];
+    uint32_t variable[DSA_BLOCK / 32];
 #if defined(DSA_ABLATE) && DSA_ABLATE >= 1
     /* Ablation, for measurement only: pretend every column is constant. Removes
      * both the table and every column_step, and the suffix array it produces is
@@ -1029,6 +1136,7 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
                 acc = _mm256_and_si256(acc, _mm256_cmpeq_epi8(v0, vg));
             }
             /* cmpeq leaves 0xFF where equal; the AND turns that into a 1. */
+            variable[off / 32] = ~(uint32_t)_mm256_movemask_epi8(acc);
             _mm256_storeu_si256((__m256i*)(constant + off),
                                 _mm256_and_si256(acc, one));
         }
@@ -1137,6 +1245,30 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
             if (*desc_len + r + 1 > desc_room) return 0;
             Desc* d = s->desc + *desc_len;
             const uint32_t packed = desc_pack(aw_off, blocks);
+#if defined(DSA_AVX2) && DSA_KEY_BYTES == 3 && !defined(DSA_ABLATE)
+            // Locate the nearest nonconstant prepend by words, then emit the
+            // entire uniform span without a per-column dispatch or key chain.
+            uint32_t last = 0;
+            if (r) {
+                int word = (int)((r - 1) / 32);
+                uint32_t bits = variable[word] & (uint32_t)((1ull << (((r - 1) & 31) + 1)) - 1);
+                while (!bits && word > 0) bits = variable[--word];
+                if (bits) {
+#if defined(_MSC_VER)
+                    unsigned long highest;
+                    _BitScanReverse(&highest, bits);
+#else
+                    const uint32_t highest = 31u - (uint32_t)__builtin_clz(bits);
+#endif
+                    last = (uint32_t)word * 32 + (uint32_t)highest + 1;
+                }
+            }
+            emit_uniform_span(d, t, n, base, last, r, packed);
+            d += r - last + 1;
+            rel = (int)last;
+            r = last;
+            k0 = key32(t, n, base + r);
+#else
             for (;;) {
                 d->key = DSA_KEYREL(k0, r);
                 d->packed = packed;
@@ -1146,6 +1278,7 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
                 rel--;
                 k0 = ((uint32_t)t[base + r] << key_shift) | (k0 >> 8);
             }
+#endif
             *desc_len = (size_t)(d - s->desc);
             if (rel == 0) return 1;
 #else
@@ -1315,15 +1448,44 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
  * Three is odd, so the result ends up in the scratch array rather than back
  * where it started. Returning which one it is beats copying it back, which
  * would give away the pass this saved.
+ *
+ * Finishing the sort in one pass was built and measured and is not here. The
+ * GPU does exactly that -- one counting pass on the top bits of the key, then
+ * the short run left in each bucket ordered where it is found (see DESC_MSD in
+ * gpu/desc.cuh) -- and on the CPU it is a large loss: 4,234 texts/s at 14 bits
+ * against 7,259, and 3,441 to 3,945 at 10 to 13 bits.
+ *
+ * The pass really does get cheaper -- the phase timer says 134M cycles to 93M
+ * -- and the merge that follows more than gives it back, 450M to 860M. The
+ * reason is the branch. A fully sorted array lets the merge ask "does the next
+ * descriptor share my key", which is false 98.7% of the time and predicts
+ * perfectly; a bucketed one has to ask "is the next descriptor in my bucket",
+ * and at 16,384 buckets over 19,800 descriptors that is a coin flip. The
+ * mispredict costs more than the pass.
+ *
+ * The GPU is not in that position because it has no branch to mispredict: a
+ * bucket's order is settled by every descriptor in it counting how many of its
+ * bucket-mates come first, in parallel, unconditionally.
+ *
+ * Profile-guided optimisation was also tried, on the theory that this file is
+ * mostly hot branches with lopsided outcomes. /LTCG:PGI, one training run over
+ * the 512 texts, then /LTCG:PGO: 7,187 texts/s against 7,285 for the ordinary
+ * build. The hot loops here are already shaped by hand and there was nothing
+ * left for it to learn.
  */
 
 
+#ifndef DSA_RBITS
 #if DSA_KEY_BYTES == 3
 #define DSA_RBITS 12
+#define DSA_RPASS 2
+#elif DSA_KEY_BYTES == 2
+#define DSA_RBITS 8
 #define DSA_RPASS 2
 #else
 #define DSA_RBITS 11
 #define DSA_RPASS 3
+#endif
 #endif
 #define DSA_RBINS (1u << DSA_RBITS)
 #define DSA_RMASK (DSA_RBINS - 1u)
@@ -1680,23 +1842,25 @@ retry:
              */
             uint32_t* a = s->merge;
             uint32_t* b = s->merge2;
+            uint64_t* ka = s->mkey;
+            uint64_t* kb = s->mkey2;
             uint32_t* ba = s->bnd;
             uint32_t* bb = s->bnd2;
             size_t nlist = 0, total = 0;
 
             /* Sized for what these texts do, not for the worst case; see the
              * note on DSA_GROUP_CAP. A group past it hands the whole hash to
-             * libsais, which is slower and right. */
-            {
-                size_t need = 0;
-                for (size_t k = i; k < j; k++) need += dsa_len(ds[k]);
-                if (need > DSA_GROUP_CAP || (j - i) > DSA_GROUP_CAP) return -6;
-            }
+             * libsais, which is slower and right. The bound is checked as the
+             * group is gathered rather than in a pass of its own before it:
+             * the groups are small and a second walk over their descriptors
+             * cost more than the check does. */
+            if ((j - i) > DSA_GROUP_CAP) return -6;
 
             for (size_t k = i; k < j; k++) {
                 const Desc* d = &ds[k];
                 ba[nlist++] = (uint32_t)total;
                 const uint32_t dl = dsa_len(*d);
+                if (total + dl > DSA_GROUP_CAP) return -6;
 #if DSA_COMPACT_ARENA
                 /* Expanded once, here, so the merge below compares positions
                  * exactly as it always has. */
@@ -1707,11 +1871,38 @@ retry:
 #else
                 memcpy(a + total, s->arena + dsa_off(*d), dl * sizeof(uint32_t));
 #endif
+                for (uint32_t z = 0; z < dl; z++)
+                    ka[total + z] = ekey64(t, n, a[total + z] + DSA_KEY_BYTES);
                 total += dl;
             }
             ba[nlist] = (uint32_t)total;
             PROF_MAX(ST_MAXMERGE, total);
             PROF_MAX(ST_MAXLIST, nlist);
+
+            /* A small group is insertion sorted instead of merged. The lists
+             * arrive nearly in order, so the inner loop almost never moves
+             * anything and the comparison count is close to linear. */
+            if (total <= DSA_SMALL_GROUP) {
+                for (size_t x = 1; x < total; x++) {
+                    const uint64_t kx = ka[x];
+                    const uint32_t px = a[x];
+                    size_t y = x;
+                    while (y > 0) {
+                        const uint64_t ky = ka[y - 1];
+                        const int greater =
+                            (ky != kx) ? (ky > kx)
+                                       : suffix_less_from(t, n, px, a[y - 1],
+                                                          DSA_KEY_BYTES + 8);
+                        if (!greater) break;
+                        ka[y] = ky;
+                        a[y] = a[y - 1];
+                        y--;
+                    }
+                    ka[y] = kx;
+                    a[y] = px;
+                }
+                nlist = 1;
+            }
 
             while (nlist > 1) {
                 size_t out_lists = 0, pos = 0;
@@ -1720,20 +1911,32 @@ retry:
                     if (l + 1 == nlist) {
                         const uint32_t s0 = ba[l], e0 = ba[l + 1];
                         memcpy(b + pos, a + s0, (e0 - s0) * sizeof(uint32_t));
+                        memcpy(kb + pos, ka + s0, (e0 - s0) * sizeof(uint64_t));
                         pos += e0 - s0;
                     } else {
                         uint32_t p0 = ba[l], e0 = ba[l + 1];
                         uint32_t p1 = ba[l + 1], e1 = ba[l + 2];
-                        while (p0 < e0 && p1 < e1)
-                            b[pos++] = suffix_less_from(t, n, a[p1], a[p0], DSA_KEY_BYTES)
-                                           ? a[p1++] : a[p0++];
-                        while (p0 < e0) b[pos++] = a[p0++];
-                        while (p1 < e1) b[pos++] = a[p1++];
+                        while (p0 < e0 && p1 < e1) {
+                            const uint64_t k0 = ka[p0], k1 = ka[p1];
+                            const int takeb =
+                                (k1 != k0) ? (k1 < k0)
+                                           : suffix_less_from(t, n, a[p1], a[p0],
+                                                              DSA_KEY_BYTES + 8);
+                            const uint32_t src = takeb ? p1 : p0;
+                            b[pos] = a[src];
+                            kb[pos] = ka[src];
+                            pos++;
+                            p1 += (uint32_t)takeb;
+                            p0 += (uint32_t)(!takeb);
+                        }
+                        while (p0 < e0) { kb[pos] = ka[p0]; b[pos++] = a[p0++]; }
+                        while (p1 < e1) { kb[pos] = ka[p1]; b[pos++] = a[p1++]; }
                     }
                 }
                 bb[out_lists] = (uint32_t)pos;
 
                 uint32_t* tv = a; a = b; b = tv;
+                uint64_t* tk = ka; ka = kb; kb = tk;
                 uint32_t* tb = ba; ba = bb; bb = tb;
                 nlist = out_lists;
             }
