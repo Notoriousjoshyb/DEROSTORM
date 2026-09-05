@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -236,6 +237,14 @@ func run(o runOpts) {
 	}
 	if len(cfg.GPUs) > 0 {
 		engine.SetGPUs(cfg.GPUs, cfg.GPUBatch, cfg.GPUBlocks)
+		// The GPU feeder must wake the instant a batch lands to keep the
+		// depth-2 pipeline full (see gpu_worker.go). With a miner on every
+		// logical CPU it waits a scheduler quantum for that while the card
+		// idles — the default leaves one CPU free for exactly this reason,
+		// so only an explicit override can get here.
+		if n := runtime.GOMAXPROCS(0); n > 1 && cfg.Threads >= n {
+			logf(LogWarn, "start", "%d CPU threads cover all %d logical CPUs — the GPU feeder has no free CPU to wake on; consider \"threads %d\"", cfg.Threads, n, n-1)
+		}
 		if cfg.Threads == 0 {
 			logf(LogInfo, "start", "mining on %d GPU(s), CPU off", len(cfg.GPUs))
 		} else {

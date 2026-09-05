@@ -55,7 +55,9 @@ func runGPUBench(t *Theme, device int, batch int) float64 {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	// Four blocks per SM is the mining default and the allocation ceiling.
+	// blocks=0 takes the runtime occupancy/VRAM ceiling, which is also what
+	// mining uses (see gpu_tune.go). The sweep below re-measures each
+	// candidate with Search so one setting's timing cannot blur into another's.
 	g, err := NewGPUContext(device, batch, 0)
 	if err != nil {
 		fmt.Printf("  %s\n\n", t.C(t.Err, err.Error()))
@@ -154,9 +156,14 @@ func runGPUBench(t *Theme, device int, batch int) float64 {
 	if best > 0 {
 		fmt.Printf("\n  %s\n", t.C(t.Accent+t.Bold,
 			fmt.Sprintf("best %s at %d blocks", humanRate(best), bestBlocks)))
-		fmt.Printf("  %s\n", t.C(t.Dim, fmt.Sprintf(
-			"pin it with --gpu-blocks=%d, or leave it and the miner measures it while mining",
-			bestBlocks)))
+		if bestBlocks == g.MaxBlocks() {
+			fmt.Printf("  %s\n", t.C(t.Dim,
+				"the peak is at the runtime ceiling, which is already the mining default — no flag needed"))
+		} else {
+			fmt.Printf("  %s\n", t.C(t.Dim, fmt.Sprintf(
+				"pin it with --gpu-blocks=%d — mining otherwise uses the ceiling at %d blocks",
+				bestBlocks, g.MaxBlocks())))
+		}
 	}
 	fmt.Println()
 	return best

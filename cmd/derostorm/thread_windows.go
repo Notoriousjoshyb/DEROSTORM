@@ -38,10 +38,14 @@ func currentThread() syscall.Handle { return syscall.Handle(^uintptr(0)) }
 // physical cores first (see spreadOverCores).
 func pinToCPU(slot int) {
 	count := runtime.GOMAXPROCS(0)
-	if slot < 0 || slot >= count || slot >= bits.UintSize {
+	// Guard the mapped CPU, not the slot: with an odd CPU count the spread
+	// can land past the top (e.g. slot 14 of 15 maps to CPU 15), and pinning
+	// there leaves the thread wherever the scheduler puts it — or nowhere.
+	cpu := spreadOverCores(slot, count)
+	if slot < 0 || cpu < 0 || cpu >= count || cpu >= bits.UintSize {
 		return // more threads than CPUs: leave this one to the scheduler
 	}
-	mask := uint(1) << uint(spreadOverCores(slot, count))
+	mask := uint(1) << uint(cpu)
 	syscall.Syscall(setThreadAffinityPtr, 2, uintptr(currentThread()), uintptr(mask), 0)
 	_ = unsafe.Pointer(nil)
 }

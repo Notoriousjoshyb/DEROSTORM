@@ -64,25 +64,46 @@ func getScratch(n, wantDesc int) *scratch {
 	if s == nil {
 		s = &scratch{}
 	}
-	s.cap, s.dcap = n, wantDesc
-	s.arena = make([]uint32, n+8)
-	s.desc = make([]desc, wantDesc)
-	s.desc2 = make([]desc, wantDesc)
-	s.order = make([]uint32, runMax+8)
-	s.order2 = make([]uint32, runMax+8)
-	s.merge = make([]uint32, groupCap+8)
-	s.merge2 = make([]uint32, groupCap+8)
-	s.bnd = make([]uint32, groupCap+8)
-	s.bnd2 = make([]uint32, groupCap+8)
+	// Grow only what fell short. The retry path in SuffixArray asks for more
+	// descriptors at the same n; reallocating the arena and the group buffers
+	// with it doubles a large zeroed alloc for no reason.
+	if s.cap < n {
+		s.cap = n
+		s.arena = make([]uint32, n+8)
+		s.order = make([]uint32, runMax+8)
+		s.order2 = make([]uint32, runMax+8)
+		s.merge = make([]uint32, groupCap+8)
+		s.merge2 = make([]uint32, groupCap+8)
+		s.bnd = make([]uint32, groupCap+8)
+		s.bnd2 = make([]uint32, groupCap+8)
+	}
+	if s.dcap < wantDesc {
+		s.dcap = wantDesc
+		s.desc = make([]desc, wantDesc)
+		s.desc2 = make([]desc, wantDesc)
+	}
 	return s
 }
 
+// u64le loads eight bytes little-endian without building a slice header.
+// blockDiff and the constant-column mask below are its only callers; both
+// compare near-copy blocks, so this is once per adjacent block pair per text.
+func u64le(t []byte, p int) uint64 {
+	_ = t[p+7]
+	return uint64(t[p]) | uint64(t[p+1])<<8 | uint64(t[p+2])<<16 |
+		uint64(t[p+3])<<24 | uint64(t[p+4])<<32 | uint64(t[p+5])<<40 |
+		uint64(t[p+6])<<48 | uint64(t[p+7])<<56
+}
+
 func key32(t []byte, n, p int) uint32 {
-	if p+4 <= n {
-		return binary.BigEndian.Uint32(t[p:]) >> (8 * (4 - keyBytes))
+	if p+keyBytes <= n {
+		// Manual 3-byte load. binary.BigEndian.Uint32 reads a fourth byte
+		// only to shift it back out, at the cost of a slice header and a
+		// call on every descriptor seed and tail key.
+		return uint32(t[p])<<16 | uint32(t[p+1])<<8 | uint32(t[p+2])
 	}
 	var k uint32
-	for i := 0; i < keyBytes; i++ {
+	for i := range keyBytes {
 		k <<= 8
 		if p+i < n {
 			k |= uint32(t[p+i])
@@ -338,7 +359,7 @@ func emitRun(t []byte, n int, first, blocks uint32, s *scratch, arenaLen, descLe
 	for g := uint32(1); g < blocks; g++ {
 		bg := t[int(base)+int(g)*blockSize:]
 		for i := 0; i < blockSize; i += 8 {
-			xor := binary.LittleEndian.Uint64(b0[i:]) ^ binary.LittleEndian.Uint64(bg[i:])
+			xor := u64le(b0, i) ^ u64le(bg, i)
 			if xor == 0 {
 				continue
 			}
@@ -462,7 +483,7 @@ func sortDesc(a, b []desc, count int) []desc {
 func blockDiff(a, b []byte) int {
 	diff := 0
 	for i := 0; i < blockSize; i += 8 {
-		x := binary.LittleEndian.Uint64(a[i:]) ^ binary.LittleEndian.Uint64(b[i:])
+		x := u64le(a, i) ^ u64le(b, i)
 		// Collapse each non-zero byte to its low bit without allowing shifts to
 		// cross byte boundaries, then count all eight comparisons at once.
 		x = (x | x>>4) & 0x0f0f0f0f0f0f0f0f
@@ -503,7 +524,12 @@ retry:
 			if s.dcap >= full {
 				return false
 			}
-			s = getScratch(n, full)
+			// Grow the descriptors in place: getScratch would pull a fresh
+			// object from the pool and leak this one, then reallocate the
+			// arena and group buffers that already fit.
+			s.dcap = full
+			s.desc = make([]desc, full)
+			s.desc2 = make([]desc, full)
 			goto retry
 		}
 		g += length

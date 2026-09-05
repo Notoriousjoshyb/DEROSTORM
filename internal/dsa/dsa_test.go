@@ -6,6 +6,56 @@ import (
 	"testing"
 )
 
+func TestKey32AndU64leMatchReference(t *testing.T) {
+	// key32, u64le, and blockDiff were hand-inlined off binary.BigEndian /
+	// binary.LittleEndian. Any divergence silently reorders the SA, so check
+	// the helpers against the stdlib forms directly, including the
+	// past-the-end padding key32 applies near EOF.
+	rng := rand.New(rand.NewSource(1))
+	buf := make([]byte, 2*blockSize+16)
+	rng.Read(buf)
+	for trial := range 200 {
+		n := 1 + rng.Intn(len(buf))
+		text := buf[:n]
+		for _, p := range []int{0, 1, n / 2, n - keyBytes, n - 1, n} {
+			if p < 0 || p > n {
+				continue
+			}
+			var want uint32
+			for i := range keyBytes {
+				want <<= 8
+				if p+i < n {
+					want |= uint32(text[p+i])
+				}
+			}
+			if got := key32(text, n, p); got != want {
+				t.Fatalf("trial %d key32(%d,%d): got %x want %x", trial, n, p, got, want)
+			}
+		}
+		if n >= 8 {
+			p := rng.Intn(n - 7)
+			var want uint64
+			for i := range 8 {
+				want |= uint64(text[p+i]) << (8 * i)
+			}
+			if got := u64le(text, p); got != want {
+				t.Fatalf("trial %d u64le(%d): got %x want %x", trial, p, got, want)
+			}
+		}
+	}
+	a := buf[:blockSize]
+	b := buf[blockSize : 2*blockSize]
+	want, got := 0, blockDiff(a, b)
+	for i := range blockSize {
+		if a[i] != b[i] {
+			want++
+		}
+	}
+	if got != want {
+		t.Fatalf("blockDiff random blocks: got %d want %d", got, want)
+	}
+}
+
 func naiveSA(t []byte) []int32 {
 	n := len(t)
 	sa := make([]int32, n)

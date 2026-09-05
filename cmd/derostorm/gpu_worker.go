@@ -119,6 +119,14 @@ func (e *Engine) RunGPUMiner(device, batch, blocks int, stop <-chan struct{}) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
+	// Pin the feeder to the last logical CPU. Under the default thread count
+	// (one below the CPU count) that CPU has no miner on it: this thread
+	// spends its life blocked in Collect and must Submit the instant a batch
+	// lands to keep the depth-2 pipeline full, and a floating feeder waits a
+	// scheduler quantum for that while the card idles. When every CPU already
+	// has a miner this shares one, which is no worse than floating.
+	pinToCPU(runtime.GOMAXPROCS(0) - 1)
+
 	g, err := NewGPUContext(device, batch, blocks)
 	if err != nil {
 		e.post(LogError, "gpu", "%v", err)
@@ -175,6 +183,15 @@ func (e *Engine) RunGPUMiner(device, batch, blocks int, stop <-chan struct{}) {
 
 	nonce := uint32(0)
 	verified := false
+
+	// One-time batch-latency note, fed by the collect-to-collect gaps take()
+	// already measures. The batch cannot be resized without rebuilding the
+	// context, so this advises rather than tunes: it says what one batch
+	// costs, which is also how long a new job waits at most before reaching
+	// the card.
+	var latSum time.Duration
+	var latN int
+	latencyNoted := false
 
 	for !done() {
 		myjob := e.Job()
@@ -238,6 +255,15 @@ func (e *Engine) RunGPUMiner(device, batch, blocks int, stop <-chan struct{}) {
 			now := time.Now()
 			if timed {
 				tuner.observe(now.Sub(lastDone), g.Batch())
+				if !latencyNoted {
+					latSum += now.Sub(lastDone)
+					latN++
+					if latN >= 8 {
+						latencyNoted = true
+						e.post(LogInfo, "gpu", "device %d: ~%.0f ms per batch of %d hashes — a new job waits at most one batch; shrink it with --gpu-batch",
+							device, latSum.Seconds()/float64(latN)*1000, g.Batch())
+					}
+				}
 			}
 			lastDone, timed = now, true
 			if noteSettled != nil {

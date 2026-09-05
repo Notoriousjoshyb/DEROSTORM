@@ -801,7 +801,7 @@ struct DescScratch {
 #define DESC_LDW(p) (*(p))
 #endif
 
-__device__ __forceinline__ uint32_t descLoadBE32(const uint8_t* t, int p)
+__device__ __forceinline__ uint32_t descLoadBE32(const uint8_t* __restrict__ t, int p)
 {
 #if DESC_WIDE_LOAD
     const uint8_t*  b = t + p;
@@ -820,7 +820,7 @@ __device__ __forceinline__ uint32_t descLoadBE32(const uint8_t* t, int p)
 // middle word is shared. The second load of the pair reaches four bytes past
 // p+7 in the worst alignment, still inside the eight-byte text tail.
 #if DESC_LOAD64
-__device__ __forceinline__ uint64_t descLoadBE64(const uint8_t* t, int p)
+__device__ __forceinline__ uint64_t descLoadBE64(const uint8_t* __restrict__ t, int p)
 {
     const uint8_t*  b = t + p;
     const uint32_t  m = (uint32_t)((uintptr_t)b & 3u);
@@ -875,7 +875,7 @@ __device__ __forceinline__ uint32_t descKey32(const uint8_t* t, int n, int p)
 // padded, and then the bytes are not known to be equal -- they are not all
 // there. m < from falls back to a full comparison, which is what a text end
 // costs and there are at most three of them.
-__device__ __forceinline__ bool descSuffixLessFrom(const uint8_t* t, int n,
+__device__ __forceinline__ bool descSuffixLessFrom(const uint8_t* __restrict__ t, int n,
                                                    int a, int b, int from)
 {
     const int la = n - a, lb = n - b;
@@ -960,7 +960,7 @@ __device__ __forceinline__ bool descSuffixLessFrom(const uint8_t* t, int n,
     return la < lb;
 }
 
-__device__ __forceinline__ bool descSuffixLess(const uint8_t* t, int n, int a, int b)
+__device__ __forceinline__ bool descSuffixLess(const uint8_t* __restrict__ t, int n, int a, int b)
 {
     return descSuffixLessFrom(t, n, a, b, 0);
 }
@@ -971,7 +971,7 @@ __device__ __forceinline__ bool descSuffixLess(const uint8_t* t, int n, int a, i
 // Same sweep as descSuffixLessFrom, with the offset of the first difference
 // kept. It is the seed's whole cost either way: a comparison already has to
 // walk to the divergence, so saying where it was is free.
-__device__ __forceinline__ bool descSuffixCmpLcp(const uint8_t* t, int n,
+__device__ __forceinline__ bool descSuffixCmpLcp(const uint8_t* __restrict__ t, int n,
                                                  int a, int b, int* lcp)
 {
     const int la = n - a, lb = n - b;
@@ -1081,7 +1081,7 @@ __device__ int descBucketScan(uint32_t* a, BlockRadixScratch* sh)
 // block must call it with blockDim.x == BR_BLOCK. Returns 0 on success, or a
 // negative value when a key group was too large to merge (see DESC_MERGE_CAP),
 // in which case sa holds nothing useful.
-__device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
+__device__ int descSuffixArrayBlock(const uint8_t* __restrict__ t, int n, int32_t* __restrict__ sa,
                                     DescScratch sc, BlockRadixScratch* sh)
 {
     // One order and key array per chunk, so chunks of the same run do not
@@ -1352,6 +1352,9 @@ __device__ int descSuffixArrayBlock(const uint8_t* t, int n, int32_t* sa,
                 const uint32_t firstKey = swapped ? key1 : key0;
                 const uint32_t secondKey = swapped ? key0 : key1;
                 const uint32_t off = (uint32_t)((size_t)g0 * 256 + awBase);
+                // One atomic per descriptor, not one per column: reserving both
+                // slots together measured -0.4% (the count-then-reserve scan's
+                // extra shared reads cost more than the saved atomics).
 
                 int d = atomicAdd(&s_ndesc, 1);
                 PROF_TASK_EMIT();

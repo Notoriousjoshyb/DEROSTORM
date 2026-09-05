@@ -413,7 +413,18 @@ __global__ __launch_bounds__(BR_BLOCK, DSG_SUFFIX_OCC) void suffix_kernel(
         int32_t* out = saOut + (size_t)h * ASTRO_MAX_TEXT;
 
 #if DESC_PREFETCH_TEXT
-#if DESC_PREFETCH_L2 && DSG_HAVE_L2_PREFETCH
+#if DESC_PREFETCH_L1 && DSG_HAVE_L2_PREFETCH
+        // Default off (DESC_PREFETCH_L1=0 in desc.cuh). Same shape as the L2 arm
+        // one line down, but resident in L1 for the walk's first touch instead
+        // of L2. Five resident blocks share ~128 KB of L1 against ~69 KB texts,
+        // so this may thrash rather than help; it exists so the integrator can
+        // A/B it with -DDESC_PREFETCH_L1=1 rather than to claim it wins. The
+        // DSG_HAVE_L2_PREFETCH leg keeps the PTX off the HIP build, where the
+        // instruction does not exist. Mirrors hash_parallel_test.cu.
+        for (int i = (int)threadIdx.x * DESC_PREFETCH_STRIDE; i < n; i += BR_BLOCK * DESC_PREFETCH_STRIDE) {
+            asm volatile("prefetch.global.L1 [%0];" :: "l"(text + i));
+        }
+#elif DESC_PREFETCH_L2 && DSG_HAVE_L2_PREFETCH
         for (int i = (int)threadIdx.x * DESC_PREFETCH_STRIDE; i < n; i += BR_BLOCK * DESC_PREFETCH_STRIDE) {
             asm volatile("prefetch.global.L2 [%0];" :: "l"(text + i));
         }
@@ -432,7 +443,19 @@ __global__ __launch_bounds__(BR_BLOCK, DSG_SUFFIX_OCC) void suffix_kernel(
             (void)*(((const volatile uint8_t*)text) + i);
         }
 #endif
-        __syncthreads();
+        // No barrier here, by dominance rather than by hope. The interval since
+        // the claimed barrier writes no shared memory on any path above -- all
+        // three arms are hints or discarded loads -- and h, n, text and out are
+        // already in registers, so there is nothing to publish. Past this
+        // point, the sort's first cross-lane read of shared state is dominated
+        // by its phase-1 fence (the s_flag/s_keep scan barrier ending run
+        // detection in desc.cuh): everything before that fence reads only the
+        // global text, which no thread writes, and the fence is reached on
+        // every path -- the DESC_TEXT_SHARED copy carries its own fence, and
+        // the sort has no return before the phase-1 one. Loop-carried state is
+        // fenced separately by the barrier on each continue path below, and
+        // kernel entry plus the claimed barrier cover the first hash. Saves one
+        // block-wide barrier per hash.
 #endif
 
         // The descriptor sort first. It knows how stage 1 built this text --

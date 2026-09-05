@@ -495,15 +495,21 @@ __device__ uint64_t* blockRadixSort(uint64_t* a, uint64_t* b,
 // chain. Left as it is, being the shorter code.
 // BR_SCAN_ITEMS elements per thread per tile, not one.
 //
-// The offset scan runs over every descriptor -- ~19,700 of them -- and the tile
-// was BR_BLOCK wide, so it took 77 passes and each pass costs three
+// The scans run over every descriptor -- ~19,700 of them -- and the tile was
+// BR_BLOCK wide, so a scan took 77 passes and each pass costs three
 // __syncthreads() and a serial walk over BR_WARPS totals on thread 0. The work
-// is one add per element; the barriers are not.
+// is one op per element; the barriers are not.
 //
-// Four elements a thread makes the tile 1,024 wide, so the same scan is 19
-// passes instead of 77 and the per-tile overhead is amortised four ways. The
-// elements a thread owns are consecutive, so its four loads and four stores are
-// one 16-byte access each rather than four strided ones.
+// Four elements a thread makes the tile 1,024 wide at BR_BLOCK=256, so the
+// same scan is 19 passes instead of 77 and the per-tile overhead is amortised
+// four ways. The elements a thread owns are consecutive, so its loads and
+// stores are one wide access each rather than strided ones.
+//
+// Eight measured worse, not better: -1.1% at 336 blocks over five interleaved
+// rounds (213.6 -> 212.8 KH/s medians against the 1.9.1 library, all five
+// rounds the same way). The barrier saving is real but the extra live state
+// costs more in the kernel's register budget. Keep the default at four;
+// -DBR_SCAN_ITEMS=8 remains for A/B.
 #ifndef BR_SCAN_ITEMS
 #define BR_SCAN_ITEMS 4
 #endif
@@ -565,19 +571,38 @@ __device__ int blockScanFlags(int32_t* f, int n, BlockRadixScratch* sh)
 // Running inclusive maximum over n elements, in place, block-wide. Used to turn
 // "this position starts a new group" markers into "the position my group starts
 // at", which is the rank prefix doubling needs.
+//
+// BR_SCAN_ITEMS elements per thread per tile, matching blockScanFlags: at
+// BR_BLOCK=256 a scan over ~19,700 descriptors is 10 passes instead of 77,
+// three __syncthreads() per pass either way. Max is not invertible like the
+// flag sum, so a thread's exclusive warp prefix comes from a shuffle of the
+// inclusive scan (prior lane's total, -1 on lane 0) rather than subtraction.
+// OOB lanes contribute the identity (-1) and are never written back.
 __device__ void blockScanMax(int32_t* a, int n, BlockRadixScratch* sh)
 {
     const int tid  = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
+    const int tile = BR_BLOCK * BR_SCAN_ITEMS;
 
     if (tid == 0) sh->scanCarry = -1;
     __syncthreads();
 
-    for (int base = 0; base < n; base += BR_BLOCK) {
-        const int i = base + tid;
-        int x = (i < n) ? a[i] : -1;
+    for (int base = 0; base < n; base += tile) {
+        const int i0 = base + tid * BR_SCAN_ITEMS;
 
+        // Serial inclusive max of this thread's own run, kept in registers.
+        int v[BR_SCAN_ITEMS];
+        int t = -1;
+#pragma unroll
+        for (int k = 0; k < BR_SCAN_ITEMS; k++) {
+            const int e = (i0 + k < n) ? a[i0 + k] : -1;
+            if (e > t) t = e;
+            v[k] = t;            // inclusive within the thread
+        }
+
+        // Inclusive max across the warp of the per-thread totals.
+        int x = t;
         for (int off = 1; off < 32; off <<= 1) {
             const int y = DSG_SHFL_UP(x, off);
             if (lane >= off && y > x) x = y;
@@ -588,15 +613,23 @@ __device__ void blockScanMax(int32_t* a, int n, BlockRadixScratch* sh)
         if (tid == 0) {
             int m = sh->scanCarry;
             for (int w = 0; w < BR_WARPS; w++) {
-                const int t = sh->warpScan[w];
+                const int tt = sh->warpScan[w];
                 sh->warpScan[w] = m;
-                if (t > m) m = t;
+                if (tt > m) m = tt;
             }
             sh->scanCarry = m;
         }
         __syncthreads();
 
-        if (i < n) a[i] = x > sh->warpScan[warp] ? x : sh->warpScan[warp];
+        // Exclusive prefix for this thread: prior warps' max, and prior lanes'
+        // max within the warp. Applied over the thread-local inclusive run.
+        const int up = DSG_SHFL_UP(x, 1);
+        const int pre = sh->warpScan[warp] > ((lane == 0) ? -1 : up)
+                      ? sh->warpScan[warp] : ((lane == 0) ? -1 : up);
+#pragma unroll
+        for (int k = 0; k < BR_SCAN_ITEMS; k++) {
+            if (i0 + k < n) a[i0 + k] = v[k] > pre ? v[k] : pre;
+        }
         __syncthreads();
     }
 }

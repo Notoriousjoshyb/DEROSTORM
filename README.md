@@ -4,6 +4,64 @@ An AstroBWTv3 miner for DERO. Mines on the CPU and, when an NVIDIA or AMD card
 is present, on the GPU as well. Full-screen themed console, guided first-run
 setup.
 
+### 1.9.2 — a faster CPU sort, a flat GPU, an honest round
+
+The CPU descriptor sort is ~13% faster and the miner keeps most of it: one
+worker mines ~6% faster on the complete workload. The GPU sort is unchanged in
+speed — four independent optimization attempts all measured at or below zero
+and were reverted, with the numbers recorded where the code is so nobody
+rebuilds them to find out. Same guarantee as always: the suffix array is
+unique, so a faster route either produces exactly what libsais produces or it
+is wrong. `native\sabench.exe` checks all 512 real texts against libsais, and
+`gpu\hash_parallel_test.exe` checks all 512 final GPU hashes against the CPU.
+
+| Suffix sort, one thread | Before (1.9.1) | After | Median |
+|---|---:|---:|---:|
+| `native\sabench.exe gpu\vectors.bin` | ~7,230 texts/s | 8,199 texts/s | **+13%** |
+
+| Complete mining workload, one worker | Before | After | Median |
+|---|---:|---:|---:|
+| CPU, `BenchmarkMiningCPU -cpu=1` | 4,007 H/s | 4,243 H/s | **+6%** |
+
+| CUDA search vs 1.9.1 library, interleaved A/B, five rounds | Before | After | Median |
+|---|---:|---:|---:|
+| 336 blocks | 213,576 H/s | 213,425 H/s | -0.07%, within noise |
+| 420 blocks | 208,820 H/s | 208,778 H/s | -0.02%, within noise |
+| 504 blocks (device default) | 209,160 H/s | 209,140 H/s | -0.01%, within noise |
+
+**The CPU: colliding pairs merge straight from their arena slices, and long
+singletons store eight at a time.** Measured over the 512 real texts, 65% of
+colliding key groups are exactly two lists; those now merge directly into
+their final places with one cached key per live head — no gather into merge
+buffers, no insertion sort, no copy-out. Longer singleton runs (one group in
+nine, carrying two positions in five) go out with one unmasked vector store
+per eight positions plus a single masked tail, instead of a branch per
+element. The general paths are kept for everything else. The portable Go sort
+gains the same shape of win in miniature: scratch buffers grow only where
+they fell short, and the hot key/word loads are manual instead of
+`encoding/binary` (2→0 allocs on the paired-hash path, 0 allocs hot).
+
+**The host: the GPU feeder gets its own CPU, and the tuner tells the truth.**
+The feeder goroutine pins to the last logical CPU, which the default thread
+count leaves free; a floating feeder waits a scheduler quantum per batch
+while the card idles. Thread affinity guards now check the mapped CPU, not
+the slot, on Windows and Linux (odd-count rigs mis-pinned before). Starting
+GPUs with a thread on every CPU warns once. `gpu_bench` no longer suggests a
+sweep mining never runs, and the first batches report their latency so
+`--gpu-batch` can be sized against job latency.
+
+**The GPU: measured, reverted, recorded.** The shipped kernels are
+performance-neutral by measurement, not by hope: widening the radix scans to
+eight items a thread cost 1.1% (register budget beats barrier savings);
+reserving descriptors once per column instead of once each cost 0.4% (the
+extra shared-memory scan costs more than the saved atomics); three seed
+tweaks (rank len-3 runs, key-first len-2 order, 4-byte LCP tail) were neutral
+and removed as weightless. What stays is zero-risk: aliasing promises for
+the compiler, one dropped no-op barrier, a default-off L1-prefetch arm for a
+future A/B. No Linux, AMD or macOS speedup is claimed — those need their own
+hardware. CPU and GPU were measured separately, never as simultaneous
+throughput.
+
 ### 1.9.1 — a smaller sort on both devices
 
 Two further changes on top of the batched emission below. Both keep the same

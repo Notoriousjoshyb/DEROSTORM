@@ -29,32 +29,10 @@ func Pair(a, b []byte, outA, outB *[32]byte) bool {
 }
 
 func hashPairStd(a, b []byte, outA, outB *[32]byte) bool {
-	ha, hb := sha256.New(), sha256.New()
-	na, nb := len(a), len(b)
-	ba, bb := na/64, nb/64
-	common := ba
-	if bb < common {
-		common = bb
-	}
-	for i := 0; i < common; i++ {
-		off := i * 64
-		ha.Write(a[off : off+64])
-		hb.Write(b[off : off+64])
-	}
-	if ba > common {
-		ha.Write(a[common*64 : ba*64])
-	}
-	if bb > common {
-		hb.Write(b[common*64 : bb*64])
-	}
-	if rem := ba * 64; rem < na {
-		ha.Write(a[rem:])
-	}
-	if rem := bb * 64; rem < nb {
-		hb.Write(b[rem:])
-	}
-	var sa, sb [32]byte
-	copy(outA[:], ha.Sum(sa[:0]))
-	copy(outB[:], hb.Sum(sb[:0]))
+	// Single-shot digests. The lockstep 64-byte interleave only pays on the
+	// arm64 SHA-unit path; here two Hash objects plus a Write per block are
+	// pure alloc and dispatch overhead for identical bytes out.
+	*outA = sha256.Sum256(a)
+	*outB = sha256.Sum256(b)
 	return true
 }

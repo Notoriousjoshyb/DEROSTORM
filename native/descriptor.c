@@ -1796,8 +1796,62 @@ retry:
 #endif
 
             } else {
-                for (uint32_t z = 0; z < len; z++)
-                    sa[out + z] = (int32_t)DSA_POS(src[z], rel);
+                /* Longer singletons are whole-run columns of long runs: one in
+                 * nine singleton groups, carrying two positions in five. The
+                 * scalar loop is a branch per element on those; full groups of
+                 * eight go out with one unmasked store each and only the final
+                 * partial group needs the mask, so consecutive stores still
+                 * abut exactly like the len <= 8 path above. The tail reads at
+                 * most seven arena words past len, inside its slack, and writes
+                 * exactly rem lanes, so the last group cannot run past sa. */
+                uint32_t done = 0;
+                uint32_t rem = len;
+                for (; rem > 8; rem -= 8, done += 8) {
+#if DSA_MABLATE == 1
+                    const __m256i w = _mm256_set1_epi32((int32_t)rel);
+#elif DSA_COMPACT_ARENA
+                    const __m256i w = _mm256_or_si256(
+                        _mm256_slli_epi32(
+                            _mm256_cvtepu16_epi32(
+                                _mm_loadu_si128((const __m128i*)(src + done))), 8),
+                        _mm256_set1_epi32((int32_t)rel));
+#else
+                    const __m256i w = _mm256_loadu_si256((const __m256i*)(src + done));
+#endif
+#if DSA_MABLATE == 2
+                    (void)w;
+                    if (out == (size_t)-1)
+                        _mm256_storeu_si256((__m256i*)(sa + out + done), w);
+#else
+                    _mm256_storeu_si256((__m256i*)(sa + out + done), w);
+#endif
+                }
+#if DSA_MABLATE == 1
+                const __m256i u = _mm256_set1_epi32((int32_t)rel);
+#elif DSA_COMPACT_ARENA
+                const __m256i u = _mm256_or_si256(
+                    _mm256_slli_epi32(
+                        _mm256_cvtepu16_epi32(
+                            _mm_loadu_si128((const __m128i*)(src + done))), 8),
+                    _mm256_set1_epi32((int32_t)rel));
+#else
+                const __m256i u = _mm256_loadu_si256((const __m256i*)(src + done));
+#endif
+                /* The tail mask from a compare rather than the table: three ALU
+                 * instructions and no dependent load, the len <= 8 path's
+                 * MSTYLE 1 shape. Kept as __m256i on every MSTYLE so the
+                 * scaffolding combinations below keep compiling. */
+                const __m256i f = _mm256_cmpgt_epi32(
+                    _mm256_set1_epi32((int32_t)rem),
+                    _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+#if DSA_MABLATE == 2
+                if (out == (size_t)-1) _mm256_maskstore_epi32(sa + out + done, f, u);
+#elif DSA_MSTYLE == 2
+                (void)f;
+                _mm256_mask_storeu_epi32(sa + out + done, (__mmask8)((1u << rem) - 1u), u);
+#else
+                _mm256_maskstore_epi32(sa + out + done, f, u);
+#endif
             }
 #else
             /* No AVX2: four unconditional stores, which is still better than a
@@ -1840,6 +1894,71 @@ retry:
              * be wrong: the buffer holds several separately sorted lists, not
              * one sorted array, so nothing can be inserted into it.
              */
+            /* Two descriptors sharing a key merge straight from their arena
+             * slices into sa, with one cached ekey per live head.
+             *
+             * Measured over the 512 real texts, 65% of colliding groups are
+             * exactly two lists (37% of the colliding positions), and every one
+             * of them is small. The general path below would gather both lists
+             * into merge[] with an ekey per position, insertion sort the
+             * concatenation, and copy it out -- three passes over the positions
+             * plus the ekey traffic. Here each ekey is loaded once into a
+             * cursor register and reloaded only when its cursor advances, and
+             * the heads merge directly into their final places with no gather
+             * and no copy.
+             *
+             * The comparison is exactly the merge's: the ekey first, then
+             * suffix_less_from past the key and the ekey on a tie. Equal ekeys
+             * fall through to the full comparison, which is also what settles
+             * the near-EOF padding clamp the general path relies on. */
+            if (j == i + 2) {
+                const Desc* d0 = &ds[i];
+                const Desc* d1 = &ds[i + 1];
+                const uint32_t l0 = dsa_len(*d0);
+                const uint32_t l1 = dsa_len(*d1);
+                const size_t total2 = (size_t)l0 + (size_t)l1;
+                if (total2 > DSA_GROUP_CAP) return -6;
+                PROF_MAX(ST_MAXMERGE, total2);
+                PROF_MAX(ST_MAXLIST, 2);
+                {
+                    const Arena* a0 = s->arena + dsa_off(*d0);
+                    const Arena* a1 = s->arena + dsa_off(*d1);
+                    const uint32_t r0 = DSA_REL_OF(d0->key);
+                    const uint32_t r1 = DSA_REL_OF(d1->key);
+                    uint32_t p0 = 0, p1 = 0;
+                    uint32_t q0 = (uint32_t)DSA_POS(a0[0], r0);
+                    uint32_t q1 = (uint32_t)DSA_POS(a1[0], r1);
+                    uint64_t h0 = ekey64(t, n, (size_t)q0 + DSA_KEY_BYTES);
+                    uint64_t h1 = ekey64(t, n, (size_t)q1 + DSA_KEY_BYTES);
+                    int32_t* dst = sa + out;
+                    for (;;) {
+                        const int take1 = (h1 != h0) ? (h1 < h0)
+                            : suffix_less_from(t, n, q1, q0, DSA_KEY_BYTES + 8);
+                        if (take1) {
+                            *dst++ = (int32_t)q1;
+                            if (++p1 == l1) {
+                                while (p0 < l0) *dst++ = (int32_t)DSA_POS(a0[p0++], r0);
+                                break;
+                            }
+                            q1 = (uint32_t)DSA_POS(a1[p1], r1);
+                            h1 = ekey64(t, n, (size_t)q1 + DSA_KEY_BYTES);
+                        } else {
+                            *dst++ = (int32_t)q0;
+                            if (++p0 == l0) {
+                                while (p1 < l1) *dst++ = (int32_t)DSA_POS(a1[p1++], r1);
+                                break;
+                            }
+                            q0 = (uint32_t)DSA_POS(a0[p0], r0);
+                            h0 = ekey64(t, n, (size_t)q0 + DSA_KEY_BYTES);
+                        }
+                    }
+                    out += total2;
+                }
+                PROF_STAT(ST_MERGED, total2);
+                PROF_ADD(PH_COLL, _t0);
+                i = j;
+                continue;
+            }
             uint32_t* a = s->merge;
             uint32_t* b = s->merge2;
             uint64_t* ka = s->mkey;
