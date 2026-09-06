@@ -29,9 +29,10 @@ import (
 	"github.com/deroproject/derohe/astrobwt/astrobwtv3"
 	"github.com/deroproject/derohe/globals"
 	"github.com/docopt/docopt-go"
+	"github.com/notoriousjoshyb/derostorm/internal/ui"
 )
 
-const version = "1.9.2"
+const version = "1.9.4"
 
 const usage = `DeroStorm ` + version + `
 AstroBWTv3 miner for DERO. Mines on the CPU, and on NVIDIA or AMD GPUs as well
@@ -69,14 +70,22 @@ Options:
   --gpu-batch=<n>                 Nonces per GPU launch. Default: fill VRAM.
   --gpu-blocks=<n>                Grid blocks in the GPU suffix kernel.
                                   Default: runtime occupancy ceiling (504 on a 5080).
-  --theme=<name>                  cyber, default, copper, aurora, ember or
-                                  mono.
-  --tui                           Force the full-screen console. It is already
-                                  the default on an interactive terminal.
+  --theme=<name>                  storm, cyber, default, copper, aurora, ember
+                                  or mono.
+  --tui                           Force the full-screen console, even when
+                                  stdout is not a terminal. It is already the
+                                  default on an interactive terminal.
   --no-tui                        Plain scrolling output, no console at all.
   --classic                       The compact in-place panel instead of the
                                   full-screen console.
   --no-dashboard                  Same as --no-tui.
+  --tui-refresh=<fps>             Console frames per second, 2 to 30.
+                                  Default 8. Lower it to give the last of the
+                                  CPU to hashing; it changes nothing else.
+  --no-animation                  Draw the console without its moving parts.
+  --no-title                      Do not rewrite the terminal window title.
+  --color=<mode>                  auto, truecolor, 256, 16 or none. Default
+                                  auto, which reads COLORTERM and TERM.
   --rpc-address=<host:port>       derod JSON-RPC, for peer count, network
                                   hashrate and block interval. Default: the
                                   getwork host with the port two higher, which
@@ -98,7 +107,8 @@ Options:
                                   exit. Use it to compare themes and to check
                                   a layout at a size you do not have.
   --size=<WxH>                    Size for --preview. Default: this terminal.
-  --screen=<name>                 Screen for --preview: dashboard, mining,
+  --screen=<name>                 Which screen to open on, and which one the
+                                  preview draws. One of: dashboard, mining,
                                   stats, network, threads, config, logs, pools
                                   or help.
   --preview-classic               Preview the compact panel in every theme.
@@ -108,17 +118,28 @@ Options:
 
 Console keys:
   M S N T C L P H  mining, statistics, network, threads, config, logs, pools,
-                   help.  Esc or D returns to the dashboard, Tab cycles.
-  arrows/PgUp/PgDn scroll the event log; End returns it to live
+                   help.  Esc or D returns to the dashboard, Tab cycles,
+                   Shift-Tab goes back.
+  ↑ ↓ PgUp PgDn    scroll the event log; End returns it to live
+  ← → or [ ]       hashrate chart window: 5M 15M 1H 6H 24H
+  Space            pause and resume the event log
+  F                cycle the log filter; X clears the view
+  G                next GPU, on a rig with more than one
+  A                turn the animation on and off
+  ? or H           help
   :                open the command line
   Q or Ctrl-C      stop mining and exit
 
 Runtime commands (press : first, then type and press Enter):
-  threads <n>   change the thread count live, also accepts +2 or -4
-  theme <name>  switch colour theme
-  save          write current settings to the config file
-  config        show the active settings
-  quit          stop mining and exit
+  threads <n>       change the thread count live, also accepts +2 or -4
+  theme <name>      switch colour theme
+  filter <text>     show only log lines containing this; "filter off" clears
+  range <5m..24h>   hashrate chart window
+  refresh <fps>     console frames per second, 2 to 30
+  animation on|off  decorative animation
+  save              write current settings to the config file
+  config            show the active settings
+  quit              stop mining and exit
 `
 
 func main() {
@@ -163,11 +184,25 @@ func main() {
 	vtOK := EnableVirtualTerminal()
 	isTTY := StdoutIsTTY() && vtOK
 
+	// The colour depth decides how every theme is spelled, so it has to be
+	// settled before the first theme is looked up -- including the one the
+	// setup wizard and the error paths use.
+	if v := optString(opts, "--color"); v != "" {
+		d, ok := parseColorMode(v)
+		if !ok {
+			fmt.Fprintln(os.Stderr, "--color wants auto, truecolor, 256, 16 or none")
+			os.Exit(2)
+		}
+		if v != "auto" {
+			ui.SetDepth(d)
+		}
+	}
+
 	// The previews need no config, no node and no wallet: they exist so the
 	// themes and the layout can be looked at before committing to either.
 	if optBool(opts, "--preview") {
 		runTUIPreview(optString(opts, "--theme"), optString(opts, "--size"),
-			optString(opts, "--screen"), isTTY)
+			optString(opts, "--screen"), isTTY, !optBool(opts, "--no-animation"))
 		return
 	}
 	if optBool(opts, "--preview-classic") {
@@ -362,11 +397,57 @@ func main() {
 	}
 
 	mode := consoleFull
+	forceTUI := optBool(opts, "--tui")
 	switch {
 	case optBool(opts, "--no-tui") || optBool(opts, "--no-dashboard"):
-		mode = consolePlain
+		mode, forceTUI = consolePlain, false
 	case optBool(opts, "--classic"):
-		mode = consoleClassic
+		mode, forceTUI = consoleClassic, false
+	}
+	// --tui has always been documented as forcing the console and has never
+	// done it: the run loop drops to plain output whenever stdout is not a
+	// terminal, and nothing overrode that. It matters for the two cases the
+	// flag exists for -- capturing a session with script(1), and measuring
+	// the console's own cost against a run without it.
+	if forceTUI {
+		isTTY = true
+		if theme.Name == "mono" {
+			theme, themeNote = ui.Themes[ui.DefaultTheme], ""
+			if name := optString(opts, "--theme"); name != "" {
+				theme, themeNote = PickTheme(name, true)
+			} else if cfg.Theme != "" {
+				theme, themeNote = PickTheme(cfg.Theme, true)
+			}
+		}
+	}
+
+	// ---- console preferences: the flag wins, then the config, then the
+	// default. None of these can change what the miner does.
+	fps := defaultRefreshFPS
+	if cfg.UI.Refresh > 0 {
+		fps = cfg.UI.Refresh
+	}
+	if v := optString(opts, "--tui-refresh"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < minRefreshFPS || n > maxRefreshFPS {
+			fmt.Fprintf(os.Stderr, "--tui-refresh must be between %d and %d\n", minRefreshFPS, maxRefreshFPS)
+			os.Exit(2)
+		}
+		fps = n
+	}
+	cfg.UI.Refresh = fps
+
+	anim := prefOn(cfg.UI.Animate)
+	if optBool(opts, "--no-animation") {
+		anim = false
+	}
+	title := prefOn(cfg.UI.Title)
+	if optBool(opts, "--no-title") {
+		title = false
+	}
+	startScreen := cfg.UI.Screen
+	if v := optString(opts, "--screen"); v != "" {
+		startScreen = v
 	}
 
 	run(runOpts{
@@ -375,7 +456,29 @@ func main() {
 		rpcAddress: optString(opts, "--rpc-address"),
 		logFile:    logFile.Name(),
 		statsFile:  statsFile,
+		renderFPS:  fps,
+		tui: TUIOpts{
+			Anim: anim, Title: title,
+			Screen: startScreen, HistRange: cfg.UI.Range,
+		},
 	})
+}
+
+// parseColorMode turns the --color value into a depth.
+func parseColorMode(s string) (ui.Depth, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "auto":
+		return ui.CurrentDepth(), true
+	case "truecolor", "true", "24bit", "24":
+		return ui.DepthTrue, true
+	case "256":
+		return ui.Depth256, true
+	case "16", "ansi", "basic":
+		return ui.Depth16, true
+	case "none", "off", "0":
+		return ui.DepthNone, true
+	}
+	return 0, false
 }
 
 // buildDeviceRows turns the engine's counters and the last sensor poll into the

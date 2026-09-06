@@ -474,6 +474,28 @@ typedef struct {
 #endif
 static DSA_TLS Scratch* g_scratch = NULL;
 
+#ifdef DSA_LCP
+/* LCP prototype: bucket suffix_less_from decisions by bytes walked past the
+ * already-known-equal `from` prefix. b[0] <= 11B, b[1] <= 32B, b[2] <= 128B,
+ * b[3] beyond. Plain globals: instrumentation runs are single-threaded. */
+unsigned long long dsa_lcp_b[4] = {0, 0, 0, 0};
+static inline void dsa_lcp_record(size_t examined)
+{
+    dsa_lcp_b[examined <= 11 ? 0 : examined <= 32 ? 1 : examined <= 128 ? 2 : 3]++;
+}
+void dsa_lcp_reset(void) { dsa_lcp_b[0] = dsa_lcp_b[1] = dsa_lcp_b[2] = dsa_lcp_b[3] = 0; }
+#endif
+
+#ifdef DSA_LCP
+/* Bytes-walked base for the bucket macro below. `from` bytes are known equal
+ * on entry; what matters for the rolling-hash question is how far past them
+ * each decision walks. */
+#define DSA_LCP_BASE ((i >= (size_t)from) ? (i - (size_t)from) : (size_t)0)
+#define DSA_LCP_RET(ex, expr) do { dsa_lcp_record(ex); return (expr); } while (0)
+#else
+#define DSA_LCP_RET(ex, expr) return (expr)
+#endif
+
 static void scratch_free(Scratch* s)
 {
     if (!s) return;
@@ -625,7 +647,7 @@ static inline int suffix_less_from(const uint8_t* t, size_t n, uint32_t a, uint3
         uint64_t x, y;
         memcpy(&x, t + a + i, 8);
         memcpy(&y, t + b + i, 8);
-        if (x != y) return DSA_BSWAP64(x) < DSA_BSWAP64(y);
+        if (x != y) DSA_LCP_RET(DSA_LCP_BASE + 8, DSA_BSWAP64(x) < DSA_BSWAP64(y));
         i += 8;
     }
 
@@ -636,7 +658,7 @@ static inline int suffix_less_from(const uint8_t* t, size_t n, uint32_t a, uint3
         const __mmask64 eq = _mm512_cmpeq_epi8_mask(x, y);
         if (eq != ~(__mmask64)0) {
             const uint32_t tz = (uint32_t)DSA_CTZ64((unsigned long long)~eq);
-            return t[a + i + tz] < t[b + i + tz];
+            DSA_LCP_RET(DSA_LCP_BASE + tz + 1, t[a + i + tz] < t[b + i + tz]);
         }
     }
 #endif
@@ -650,7 +672,7 @@ static inline int suffix_less_from(const uint8_t* t, size_t n, uint32_t a, uint3
             (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y));
         if (eq != 0xFFFFFFFFu) {
             const uint32_t tz = DSA_CTZ32(~eq);
-            return t[a + i + tz] < t[b + i + tz];
+            DSA_LCP_RET(DSA_LCP_BASE + tz + 1, t[a + i + tz] < t[b + i + tz]);
         }
     }
 #elif defined(DSA_NEON)
@@ -663,11 +685,11 @@ static inline int suffix_less_from(const uint8_t* t, size_t n, uint32_t a, uint3
             const uint64_t lo = vgetq_lane_u64(eq64, 0);
             if (lo != ~0ull) {
                 const uint32_t tz = (uint32_t)__builtin_ctzll(~lo);
-                return t[a + i + tz / 8] < t[b + i + tz / 8];
+                DSA_LCP_RET(DSA_LCP_BASE + tz / 8 + 1, t[a + i + tz / 8] < t[b + i + tz / 8]);
             }
             const uint64_t hi = vgetq_lane_u64(eq64, 1);
             const uint32_t tz = (uint32_t)__builtin_ctzll(~hi);
-            return t[a + i + 8 + tz / 8] < t[b + i + 8 + tz / 8];
+            DSA_LCP_RET(DSA_LCP_BASE + 8 + tz / 8 + 1, t[a + i + 8 + tz / 8] < t[b + i + 8 + tz / 8]);
         }
     }
 #endif
@@ -678,11 +700,11 @@ static inline int suffix_less_from(const uint8_t* t, size_t n, uint32_t a, uint3
         uint64_t x, y;
         memcpy(&x, t + a + i + k, 8);
         memcpy(&y, t + b + i + k, 8);
-        if (x != y) return DSA_BSWAP64(x) < DSA_BSWAP64(y);
+        if (x != y) DSA_LCP_RET(DSA_LCP_BASE + k + 8, DSA_BSWAP64(x) < DSA_BSWAP64(y));
     }
     const int c = memcmp(t + a + i + q, t + b + i + q, remain - q);
-    if (c != 0) return c < 0;
-    return la < lb;   /* a prefix sorts before what it prefixes */
+    if (c != 0) DSA_LCP_RET(m >= (size_t)from ? m - (size_t)from : 0, c < 0);
+    DSA_LCP_RET(m >= (size_t)from ? m - (size_t)from : 0, la < lb);
 }
 
 static inline int suffix_less(const uint8_t* t, size_t n, uint32_t a, uint32_t b)
@@ -980,8 +1002,8 @@ static inline void emit_uniform_span(Desc* d, const uint8_t* t, size_t n,
 #endif
 
 static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
-                    uint32_t blocks, Scratch* s,
-                    size_t* arena_len, size_t* desc_len)
+                    uint32_t blocks, const uint32_t run_variable[DSA_BLOCK / 32],
+                    Scratch* s, size_t* arena_len, size_t* desc_len)
 {
     /* Each column emits at most `blocks` descriptors, so checking once per
      * column keeps the check off the inner loop. */
@@ -1104,43 +1126,30 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
     }
     for (uint32_t i = 0; i < blocks; i++) order[i] -= 255;
 
-    /* Which columns are constant across every block of the run.
-     *
-     * Done a column at a time this is 256 short loops with a data-dependent
-     * break, which is the worst shape a branch predictor can be given: ~46% of
-     * the columns run to the end and the rest stop after one or two blocks, with
-     * nothing to predict from. Done 32 columns at a time it is a compare and an
-     * AND per block, no branches at all, and the whole table costs
-     * 8 * (blocks - 1) vector operations.
-     *
-     * Runs only ever cover whole blocks -- the caller's full_blocks is n/256 and
-     * the remainder is handled as single-suffix descriptors -- so every one of
-     * these 32-byte loads is inside the text. */
+    /* Which columns are constant across every block of the run. The AVX2 run
+     * discovery already accumulated the differing columns for each accepted
+     * adjacent pair. By transitivity, a column is constant across the run
+     * exactly when its bit in that bitmap is clear. Scalar and NEON builds keep
+     * their existing local discovery. */
+#if defined(DSA_AVX2)
+#if defined(DSA_ABLATE) && DSA_ABLATE >= 1
+    /* Ablation, for measurement only: pretend every column is constant. The
+     * suffix array it produces is wrong. Never defined in a shipped build. */
+    const uint32_t ablate_variable[DSA_BLOCK / 32] = {0};
+    const uint32_t* const variable = ablate_variable;
+#else
+    const uint32_t* const variable = run_variable;
+#endif
+#define DSA_IS_CONSTANT(column) \
+    ((variable[(uint32_t)(column) >> 5] & \
+      (UINT32_C(1) << ((uint32_t)(column) & 31))) == 0)
+#else
     uint8_t constant[DSA_BLOCK];
-    uint32_t variable[DSA_BLOCK / 32];
 #if defined(DSA_ABLATE) && DSA_ABLATE >= 1
     /* Ablation, for measurement only: pretend every column is constant. Removes
      * both the table and every column_step, and the suffix array it produces is
      * wrong. Never defined in a shipped build. */
     memset(constant, 1, sizeof(constant));
-#elif defined(DSA_AVX2)
-    {
-        const uint8_t* const b0 = t + base;
-        const __m256i one = _mm256_set1_epi8(1);
-        for (uint32_t off = 0; off < DSA_BLOCK; off += 32) {
-            const __m256i v0 = _mm256_loadu_si256((const __m256i*)(b0 + off));
-            __m256i acc = _mm256_set1_epi8((char)0xFF);
-            for (uint32_t g = 1; g < blocks; g++) {
-                const __m256i vg =
-                    _mm256_loadu_si256((const __m256i*)(b0 + g * DSA_BLOCK + off));
-                acc = _mm256_and_si256(acc, _mm256_cmpeq_epi8(v0, vg));
-            }
-            /* cmpeq leaves 0xFF where equal; the AND turns that into a 1. */
-            variable[off / 32] = ~(uint32_t)_mm256_movemask_epi8(acc);
-            _mm256_storeu_si256((__m256i*)(constant + off),
-                                _mm256_and_si256(acc, one));
-        }
-    }
 #elif defined(DSA_NEON)
     {
         const uint8_t* const b0 = t + base;
@@ -1164,6 +1173,8 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
         constant[rel] = same;
     }
 #endif
+#define DSA_IS_CONSTANT(column) (constant[(uint32_t)(column)] != 0)
+#endif
 
 #if !DSA_UNIFORM
     /* Columns where the next DSA_KEY_BYTES are all constant.
@@ -1178,12 +1189,14 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
      * With a DSA_KEY_BYTES=3 key this only needs three constant columns, not the
      * four below; the old same4 was a leftover of the four-byte-key era and let
      * column 253 (whose bytes 253..255 are all inside this block) fall off the
-     * fast path. The last two columns are still excluded because constant[]
-     * only covers this block; column 254 and 255 would read past it. */
+     * fast path. The last two columns are still excluded because the
+     * constant-column data covers only this block; column 254 and 255 would
+     * read past it. */
     uint8_t same_key[DSA_BLOCK];
     for (uint32_t rel = 0; rel + DSA_KEY_BYTES <= DSA_BLOCK; rel++) {
-        uint8_t s = constant[rel];
-        for (uint32_t k = 1; k < DSA_KEY_BYTES; k++) s &= constant[rel + k];
+        uint8_t s = (uint8_t)DSA_IS_CONSTANT(rel);
+        for (uint32_t k = 1; k < DSA_KEY_BYTES; k++)
+            s &= (uint8_t)DSA_IS_CONSTANT(rel + k);
         same_key[rel] = s;
     }
     for (uint32_t rel = DSA_BLOCK - DSA_KEY_BYTES + 1; rel < DSA_BLOCK; rel++)
@@ -1273,7 +1286,7 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
                 d->key = DSA_KEYREL(k0, r);
                 d->packed = packed;
                 d++;
-                if (rel == 0 || !constant[r - 1]) break;
+                if (rel == 0 || !DSA_IS_CONSTANT(r - 1)) break;
                 r--;
                 rel--;
                 k0 = ((uint32_t)t[base + r] << key_shift) | (k0 >> 8);
@@ -1340,7 +1353,7 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
         const uint32_t col = r - 1;
         uint32_t x = 0;
 #if DSA_UNIFORM
-        if (constant[col]) {
+        if (DSA_IS_CONSTANT(col)) {
             /* One byte for the whole run, not one per block. */
             const uint32_t c = t[base + col];
             if (uniform) {
@@ -1403,7 +1416,7 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
 #endif
         }
 #else
-        if (!constant[col]) {
+        if (!DSA_IS_CONSTANT(col)) {
             column_step_keys(order, keys, s->order2, blocks);
 #if DSA_ARENA_REUSE
             /* The order may have moved, so the slice it lives in stops
@@ -1415,6 +1428,7 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
 #endif
 #endif
     }
+#undef DSA_IS_CONSTANT
     return 1;
 }
 
@@ -1567,11 +1581,15 @@ retry:
     uint32_t g = 0;
     while (g < full_blocks) {
         uint32_t len = 1;
+#if defined(DSA_AVX2)
+        uint32_t run_variable[DSA_BLOCK / 32] = {0};
+#endif
         while (len < DSA_RUN_MAX && g + len < full_blocks) {
             const uint8_t* a = t + (size_t)(g + len - 1) * DSA_BLOCK;
             const uint8_t* b = t + (size_t)(g + len) * DSA_BLOCK;
             int diff = 0;
 #if defined(DSA_AVX2)
+            uint32_t candidate_variable[DSA_BLOCK / 32];
             /* How many of the 256 bytes differ, counted 32 at a time.
              *
              * The scalar version below reads a byte, compares, and checks the
@@ -1586,7 +1604,9 @@ retry:
                 const __m256i vb = _mm256_loadu_si256((const __m256i*)(b + o));
                 const uint32_t eq =
                     (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb));
-                diff += 32 - (int)_mm_popcnt_u32(eq);
+                const uint32_t ne = ~eq;
+                candidate_variable[o / 32] = ne;
+                diff += (int)_mm_popcnt_u32(ne);
             }
 #elif defined(DSA_NEON)
             for (uint32_t o = 0; o < DSA_BLOCK; o += 16) {
@@ -1601,11 +1621,23 @@ retry:
             }
 #endif
             if (diff > DSA_RUN_SPLIT) break;
+#if defined(DSA_AVX2)
+            /* Commit only accepted adjacency masks: the pair that terminates
+             * this run belongs to neither its constant-column proof nor walk. */
+            for (uint32_t word = 0; word < DSA_BLOCK / 32; word++)
+                run_variable[word] |= candidate_variable[word];
+#endif
             len++;
         }
         PROF_LAP(PH_RUNS);
         PROF_STAT(ST_RUNS, 1);
-        if (!emit_run(t, n, g, len, s, &arena_len, &desc_len)) {
+        if (!emit_run(t, n, g, len,
+#if defined(DSA_AVX2)
+                      len >= 3 ? run_variable : NULL,
+#else
+                      NULL,
+#endif
+                      s, &arena_len, &desc_len)) {
             const size_t full = desc_bound(n);
             if (s->desc_cap >= full) return -3;
             s = scratch_get(n, full);

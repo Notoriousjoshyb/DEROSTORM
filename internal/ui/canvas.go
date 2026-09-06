@@ -56,6 +56,17 @@ type Cell struct {
 type Canvas struct {
 	W, H  int
 	cells []Cell
+
+	// BG is the background painted behind every cell that does not name one
+	// of its own.
+	//
+	// It lives here rather than in each Style so that a widget can keep
+	// setting only a foreground and still land on the themed ground. Without
+	// it, giving the console a deep-navy background would mean touching the BG
+	// field of every one of the several hundred Style literals in this
+	// program, and any one that was missed would show as a black hole in the
+	// middle of a panel.
+	BG string
 }
 
 func NewCanvas(w, h int) *Canvas {
@@ -297,6 +308,17 @@ type Screen struct {
 	buf  strings.Builder
 }
 
+// SetBG sets the background painted behind cells that do not name one, and
+// forces a full repaint so the change reaches the whole window rather than
+// only the cells that happened to change this frame.
+func (s *Screen) SetBG(bg string) {
+	if s.cur.BG == bg && s.prev.BG == bg {
+		return
+	}
+	s.cur.BG, s.prev.BG = bg, bg
+	s.full = true
+}
+
 func NewScreen(out io.Writer, w, h int, colour bool) *Screen {
 	return &Screen{
 		out:    out,
@@ -342,7 +364,13 @@ func (s *Screen) Invalidate() { s.full = true }
 // scrollback is untouched while it runs and is exactly as they left it when it
 // exits, instead of holding fifty thousand frames of dashboard.
 func (s *Screen) Enter() {
-	io.WriteString(s.out, "\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[2J\x1b[H")
+	// The last of the five is focus reporting: the terminal is asked to send
+	// ESC [ I and ESC [ O as the window gains and loses focus, which is what
+	// lets the console stop animating while nobody is looking at it. A
+	// terminal that does not understand it sends nothing and the console
+	// assumes it is focused, which is the right answer for a terminal that
+	// cannot say otherwise.
+	io.WriteString(s.out, "\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[?1004h\x1b[2J\x1b[H")
 	s.full = true
 }
 
@@ -353,7 +381,7 @@ func (s *Screen) Enter() {
 // the same reason it went off: every command run after this one would
 // otherwise be in a terminal that silently truncates its long lines.
 func (s *Screen) Leave() {
-	io.WriteString(s.out, "\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l")
+	io.WriteString(s.out, "\x1b[0m\x1b[?1004l\x1b[?7h\x1b[?25h\x1b[?1049l")
 }
 
 // Flush writes the difference between the previous frame and the current one,
@@ -423,7 +451,14 @@ func (s *Screen) writeSpan(y, first, last int) {
 			if c.S.Bold {
 				s.buf.WriteString("\x1b[1m")
 			}
-			s.buf.WriteString(c.S.BG)
+			// A cell that names no background of its own gets the canvas's,
+			// which is what puts the theme's ground behind every widget
+			// without any widget having to know there is one.
+			if c.S.BG != "" {
+				s.buf.WriteString(c.S.BG)
+			} else {
+				s.buf.WriteString(cv.BG)
+			}
 			s.buf.WriteString(c.S.FG)
 		}
 		cur, started = c.S, true
@@ -478,7 +513,11 @@ func (c *Canvas) Lines(colour bool) []string {
 				if cell.S.Bold {
 					b.WriteString("\x1b[1m")
 				}
-				b.WriteString(cell.S.BG)
+				if cell.S.BG != "" {
+					b.WriteString(cell.S.BG)
+				} else {
+					b.WriteString(c.BG)
+				}
 				b.WriteString(cell.S.FG)
 			}
 			cur, started = cell.S, true
@@ -491,7 +530,11 @@ func (c *Canvas) Lines(colour bool) []string {
 		if colour && started {
 			b.WriteString("\x1b[0m")
 		}
-		out = append(out, strings.TrimRight(b.String(), " "))
+		if c.BG == "" {
+			out = append(out, strings.TrimRight(b.String(), " "))
+		} else {
+			out = append(out, b.String())
+		}
 	}
 	return out
 }

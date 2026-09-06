@@ -320,6 +320,27 @@ int main(int argc, char** argv)
     }
     printf("\n");
 
+#ifdef DSA_LCP
+    /* LCP prototype: bucket ST_CMP decisions by bytes walked past `from`.
+     * Covers the correctness pass plus every timing round above. Shares, so
+     * the extra samples only tighten it. Single-threaded runs only: the
+     * counters are plain globals. */
+    {
+        extern unsigned long long dsa_lcp_b[4];
+        unsigned long long tot = dsa_lcp_b[0] + dsa_lcp_b[1] + dsa_lcp_b[2] + dsa_lcp_b[3];
+        const double tail = tot ? 100.0 * (double)(tot - dsa_lcp_b[0]) / (double)tot : 0.0;
+        printf("  lcp buckets (bytes past `from` per ST_CMP decision, %llu decisions):\n", tot);
+        printf("    <=11B %llu (%4.1f%%)  <=32B %llu (%4.1f%%)"
+               "  <=128B %llu (%4.1f%%)  >128B %llu (%4.1f%%)\n",
+               dsa_lcp_b[0], tot ? 100.0 * dsa_lcp_b[0] / tot : 0.0,
+               dsa_lcp_b[1], tot ? 100.0 * dsa_lcp_b[1] / tot : 0.0,
+               dsa_lcp_b[2], tot ? 100.0 * dsa_lcp_b[2] / tot : 0.0,
+               dsa_lcp_b[3], tot ? 100.0 * dsa_lcp_b[3] / tot : 0.0);
+        printf("  past-11B share %.1f%% (threshold 10%%) -> %s\n", tail,
+               tail > 10.0 ? "SHIP rolling-hash onward" : "KILL rolling-hash");
+    }
+#endif
+
 #ifdef DSA_PROF
     /* The phase table. Built with DSA_PROF, so the timers are themselves in the
      * measurement: absolute cycles are inflated and only the shares matter. */

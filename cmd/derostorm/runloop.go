@@ -53,16 +53,60 @@ type runOpts struct {
 	mode       consoleMode
 	testnet    bool
 	runFor     int
+	renderFPS  int
 	rpcAddress string
 	logFile    string
 	statsFile  string
+
+	// tui is the console's own settings: animation, title updates, and which
+	// screen and chart window to open on. Purely presentational.
+	tui TUIOpts
+	// renderTick is how often a frame is drawn. Separate from the sampling
+	// tick below it, because they answer different questions: how often the
+	// counters are read, and how often the screen is repainted.
+	renderTick time.Duration
 }
 
-// renderTick is how often a frame is built. Eight a second: fast enough that
-// the animated pieces move smoothly and a changing hashrate does not step,
-// slow enough that the cost is invisible next to mining. Every frame writes
-// only the cells that changed, so a still screen costs almost nothing.
-const renderTick = 125 * time.Millisecond
+// sampleTick is how often the engine's counters are read and a Snapshot is
+// built. Eight a second, and fixed: every rolling window and every history
+// series in the sampler is sized in units of it, so it is not a display
+// setting and changing it would change what a "one minute average" means.
+const sampleTick = 125 * time.Millisecond
+
+// renderTick is the name the sampler still knows the sampling period by. The
+// two used to be the same number and the sampler's window arithmetic is
+// written in terms of it.
+const renderTick = sampleTick
+
+// The console's frame rate, which is a display setting and is separate from
+// the sampling above.
+//
+// Eight a second by default: fast enough that a changing hashrate does not
+// visibly step and the animated pieces move smoothly, slow enough that the
+// cost is invisible next to mining. Every frame writes only the cells that
+// changed, so a still screen costs almost nothing -- but a still screen is
+// not free, and on a machine where every last CPU cycle is wanted for hashing
+// there is a reason to turn it down.
+//
+// The floor is two rather than one because at one frame a second the clock in
+// the header visibly stutters, and the ceiling is thirty because past that a
+// terminal is the bottleneck and the extra frames are dropped by the emulator
+// rather than by this program.
+const (
+	defaultRefreshFPS = 8
+	minRefreshFPS     = 2
+	maxRefreshFPS     = 30
+)
+
+func refreshInterval(fps int) time.Duration {
+	if fps < minRefreshFPS {
+		fps = minRefreshFPS
+	}
+	if fps > maxRefreshFPS {
+		fps = maxRefreshFPS
+	}
+	return time.Second / time.Duration(fps)
+}
 
 func run(o runOpts) {
 	cfg := o.cfg
@@ -80,7 +124,16 @@ func run(o runOpts) {
 	// goes into this ring and is drawn as part of a frame. Keeping 400 is what
 	// makes the log screen worth having: scrolling back to the connect message
 	// after an hour needs the connect message still to be there.
+	//
+	// The ring is append-only and is never written in place, which is what
+	// lets a Snapshot carry the slice itself instead of a copy of it. A reader
+	// holding a slice of length L only ever reads indices below L; an append
+	// writes at L and beyond, and a trim allocates a fresh array and leaves
+	// the old one to whoever still has it. So the console gets a consistent
+	// view of the log for nothing, and the run loop stopped copying four
+	// hundred entries eight times a second to achieve the same thing.
 	const logRingSize = 400
+	const logRingKeep = 300 // what survives a trim
 
 	var plainConsole *Console
 	if o.mode != consoleFull {
@@ -90,10 +143,15 @@ func run(o runOpts) {
 
 	addLog := func(e LogEntry) {
 		logMu.Lock()
-		logRing = append(logRing, e)
-		if len(logRing) > logRingSize {
-			logRing = logRing[len(logRing)-logRingSize:]
+		if len(logRing) >= logRingSize {
+			// Trim by building a new array rather than by resliceing, so any
+			// Snapshot still holding the old one is unaffected. Once every
+			// hundred lines, which is nothing next to writing the log file.
+			fresh := make([]LogEntry, 0, logRingSize)
+			fresh = append(fresh, logRing[len(logRing)-logRingKeep:]...)
+			logRing = fresh
 		}
+		logRing = append(logRing, e)
 		logMu.Unlock()
 		if o.mode == consolePlain && plainConsole != nil {
 			plainConsole.PlainLog(e)
@@ -113,7 +171,7 @@ func run(o runOpts) {
 	switch o.mode {
 	case consoleFull:
 		cols, rows := prepareWindow(o.theme, o.themeNote)
-		tui = NewTUI(os.Stdout, o.theme, cols, rows)
+		tui = NewTUI(os.Stdout, o.theme, cols, rows, o.tui)
 	case consoleClassic:
 		if !fitClassicPanel(plainConsole, o.theme, o.themeNote, cfg) {
 			o.mode = consolePlain
@@ -162,19 +220,23 @@ func run(o runOpts) {
 		editor = &Editor{}
 	}
 
+	// refresh is the console's frame interval, changed by the "refresh"
+	// command. It is read by the loop below through a channel rather than
+	// shared, because a ticker cannot be re-armed from another goroutine
+	// safely and the loop is the only thing that owns it.
+	refreshReq := make(chan int, 4)
+
 	cmdCtx := CommandContext{
 		Engine: engine, Console: plainConsole, Config: cfg, Path: o.cfgPath,
-		Quit: quit, Log: logf,
+		Quit: quit, Log: logf, TUI: tui,
+		SetRefresh: func(fps int) {
+			select {
+			case refreshReq <- fps:
+			default:
+			}
+		},
 	}
-	// The full-screen console has its own theme switch to make, because it
-	// holds a second copy of the pointer for its own drawing.
-	dispatch := func(line string) {
-		if plainConsole == nil {
-			runTUICommand(cmdCtx, tui, line)
-			return
-		}
-		RunCommand(cmdCtx, line)
-	}
+	dispatch := func(line string) { RunCommand(cmdCtx, line) }
 
 	keys := make(chan keyEvent, 64)
 	switch {
@@ -226,10 +288,20 @@ func run(o runOpts) {
 	}()
 
 	// ---- start mining
+	//
+	// The splash is drawn between the startup steps, not before them. Each
+	// call is one frame into the alternate buffer -- well under a millisecond
+	// -- and nothing waits on it, so the sequence below takes exactly as long
+	// as it would with no splash at all. A start-up animation that held the
+	// first hash back even for a second would be the most expensive decoration
+	// in the program.
+	sp := newSplash(tui)
 	go engine.RunGetWork()
+	sp.step("NODE")
 	if err := engine.SetThreads(cfg.Threads); err != nil {
 		logf(LogError, "threads", "%v", err)
 	}
+	sp.step("CPU")
 	if saFast {
 		logf(LogGood, "start", "%s", saNote)
 	} else {
@@ -237,6 +309,7 @@ func run(o runOpts) {
 	}
 	if len(cfg.GPUs) > 0 {
 		engine.SetGPUs(cfg.GPUs, cfg.GPUBatch, cfg.GPUBlocks)
+		sp.step("GPU")
 		// The GPU feeder must wake the instant a batch lands to keep the
 		// depth-2 pipeline full (see gpu_worker.go). With a miner on every
 		// logical CPU it waits a scheduler quantum for that while the card
@@ -251,6 +324,7 @@ func run(o runOpts) {
 			logf(LogInfo, "start", "mining with %d threads and %d GPU(s)", cfg.Threads, len(cfg.GPUs))
 		}
 	} else {
+		sp.skip("GPU")
 		logf(LogInfo, "start", "mining with %d threads", cfg.Threads)
 	}
 	if o.mode == consoleFull {
@@ -275,6 +349,8 @@ func run(o runOpts) {
 
 	sysmon := NewSysMonitor()
 	defer sysmon.Close()
+	sp.step("TELEMETRY")
+	sp.finish()
 
 	nodes := NewNodeWatcher(cfg.Node, o.rpcAddress)
 	defer nodes.Close()
@@ -298,8 +374,15 @@ func run(o runOpts) {
 	stats := newStatsWriter(o.statsFile)
 	defer stats.Remove()
 
-	ticker := time.NewTicker(renderTick)
-	defer ticker.Stop()
+	sampler := time.NewTicker(sampleTick)
+	defer sampler.Stop()
+	painter := time.NewTicker(refreshInterval(o.renderFPS))
+	defer painter.Stop()
+
+	// Everything about the run that cannot change is worked out once. It ends
+	// up in every Snapshot, and a Snapshot is built eight times a second for
+	// as long as the miner runs.
+	uiSummary := uiNote(o)
 
 	build := func(now time.Time) Snapshot {
 		job := engine.Job()
@@ -315,7 +398,7 @@ func run(o runOpts) {
 		}
 
 		logMu.Lock()
-		logCopy := append([]LogEntry(nil), logRing...)
+		logSlice := logRing // see logRingSize: the slice is safe to share
 		logMu.Unlock()
 
 		sensed := sensors.Sample()
@@ -363,7 +446,7 @@ func run(o runOpts) {
 			Uptime:      now.Sub(start),
 			Node:        cfg.Node,
 			Testnet:     o.testnet,
-			Log:         logCopy,
+			Log:         logSlice,
 			Frame:       frame,
 
 			ConfigPath: o.cfgPath,
@@ -372,6 +455,7 @@ func run(o runOpts) {
 			GPUBatch:   cfg.GPUBatch,
 			GPUBlocks:  cfg.GPUBlocks,
 			ThemeName:  o.theme.Name,
+			UINote:     uiSummary,
 			SANote:     saNote,
 			NodeNote:   nodes.Note(),
 			SensorNote: sensorNotes,
@@ -382,6 +466,16 @@ func run(o runOpts) {
 		}
 		return s
 	}
+
+	// latest is the most recent Snapshot. The sampler produces it eight times
+	// a second; the painter consumes whatever is there when it fires.
+	//
+	// Two tickers rather than one, because they answer different questions.
+	// The sampler's period is baked into every rolling average in the program
+	// and must not move. The painter's is a preference: someone who wants the
+	// console out of the way can set it to two frames a second and every
+	// number on screen still means exactly what it meant before.
+	latest := build(start)
 
 	for {
 		select {
@@ -406,8 +500,10 @@ func run(o runOpts) {
 				dispatch(line)
 			}
 
-		case now := <-ticker.C:
-			frame++
+		case fps := <-refreshReq:
+			painter.Reset(refreshInterval(fps))
+
+		case now := <-sampler.C:
 			st.tick(now, engine)
 
 			// The node watcher's verdict is worth exactly one log line, once,
@@ -424,37 +520,27 @@ func run(o runOpts) {
 				}
 			}
 
-			s := build(now)
-			stats.Write(s, version, false)
-			switch {
-			case tui != nil:
-				if err := tui.Render(s); err != nil && err.Error() != lastRenderErr {
-					// Report it once and carry on. The machine is still
-					// mining, and a console that dies quietly is worse than
-					// one that says what happened.
-					lastRenderErr = err.Error()
-					logf(LogError, "console", "%v", err)
-				}
-			case plainConsole != nil:
+			latest = build(now)
+			stats.Write(latest, version, false)
+			if tui == nil && plainConsole != nil {
 				plainConsole.Adapt()
-				plainConsole.Draw(s)
+				plainConsole.Draw(latest)
+			}
+
+		case <-painter.C:
+			if tui == nil {
+				continue
+			}
+			frame++
+			latest.Frame = frame
+			if err := tui.Render(latest); err != nil && err.Error() != lastRenderErr {
+				// Report it once and carry on. The machine is still mining,
+				// and a console that dies quietly is worse than one that says
+				// what happened.
+				lastRenderErr = err.Error()
+				logf(LogError, "console", "%v", err)
 			}
 		}
-	}
-}
-
-// runTUICommand is RunCommand with the console's own theme kept in step. The
-// full-screen console holds its own pointer to the theme for drawing, so a
-// "theme copper" that only updated the config would change the saved setting
-// and nothing on screen.
-func runTUICommand(ctx CommandContext, t *TUI, line string) {
-	before := ctx.Config.Theme
-	RunCommand(ctx, line)
-	if t == nil || ctx.Config.Theme == before {
-		return
-	}
-	if th, ok := ui.Themes[ctx.Config.Theme]; ok && th.Name != "mono" {
-		t.SetTheme(th)
 	}
 }
 
@@ -515,6 +601,24 @@ func fitClassicPanel(c *Console, theme *Theme, themeNote string, cfg *Config) bo
 		"terminal is %d x %d and the compact panel needs %d x %d — using plain output for this run\n",
 		gotCols, gotRows, wantCols, wantRows)
 	return false
+}
+
+// uiNote is the console's own settings as one line for the config screen.
+func uiNote(o runOpts) string {
+	note := fmt.Sprintf("%d fps", o.renderFPS)
+	if !o.tui.Anim {
+		note += " · no animation"
+	}
+	if !o.tui.Title {
+		note += " · no window title"
+	}
+	switch o.mode {
+	case consoleClassic:
+		note += " · compact panel"
+	case consolePlain:
+		note += " · plain output"
+	}
+	return note
 }
 
 func maxInt(a, b int) int {

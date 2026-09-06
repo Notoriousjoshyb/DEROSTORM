@@ -613,6 +613,16 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
         return DSG_ERR_STATE;
     }
 #endif
+    // Half the shared/L1 carveout to L1, overriding the prefer-shared hint
+    // above. The suffix kernels stream text from global memory and keep only
+    // ~7 KB in shared, so they read faster with a real L1: measured on a 5080
+    // at 336 blocks, suffix 66.9 -> 61.0 ms, +5% whole-hash, and the curve
+    // stays flat where prefer-shared sags past 336. Best effort: supported
+    // splits differ by architecture, and a card that refuses it mines on
+    // exactly as before rather than not at all.
+    e = cudaFuncSetAttribute((const void*)suffix_kernel,
+                             cudaFuncAttributePreferredSharedMemoryCarveout, 50);
+    (void)e;
 
     // Ask the runtime about the kernel actually loaded for this architecture.
     // The Blackwell image is deliberately compiled for five blocks per SM;

@@ -212,6 +212,11 @@ type Snapshot struct {
 	GPUBatch   int
 	GPUBlocks  int
 	ThemeName  string
+	// UINote is how the console itself is configured this run: frame rate and
+	// whether the decoration is running. It is a display setting and it is
+	// shown on the config screen for exactly one reason -- somebody who has
+	// turned the frame rate down to two should be able to see that they did.
+	UINote     string
 	SANote     string
 	NodeNote   string
 	SensorNote []string

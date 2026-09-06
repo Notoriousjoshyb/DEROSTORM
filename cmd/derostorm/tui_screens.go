@@ -27,7 +27,20 @@ func screenTitle(cv *ui.Canvas, r ui.Rect, title, sub string, t *Theme) ui.Rect 
 	if r.H < 3 {
 		return r
 	}
-	cv.Text(r.X+2, r.Y, ui.TrackedCaps(title), ui.Style{FG: t.Accent, Bold: true})
+	// The title carries the wordmark's gradient across its letters. It is the
+	// same three lines of arithmetic as the header and it is what makes a
+	// screen read as part of one design rather than as a different program
+	// that happens to have been opened.
+	caps := ui.TrackedCaps(title)
+	x := r.X + 2
+	for i, ch := range caps {
+		if ch == ' ' {
+			x++
+			continue
+		}
+		cv.Set(x, r.Y, ch, ui.Style{FG: t.Ramp(float64(i) / float64(maxInt(len([]rune(caps))-1, 1))), Bold: true})
+		x++
+	}
 	if sub != "" {
 		cv.TextRight(r.Right()-2, r.Y, sub, ui.Style{FG: t.Muted})
 	}
@@ -37,7 +50,7 @@ func screenTitle(cv *ui.Canvas, r ui.Rect, title, sub string, t *Theme) ui.Rect 
 
 // ---------------------------------------------------------------- mining
 
-func drawMiningScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme, frame int) {
+func drawMiningScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme, frame int, o frameOpts) {
 	body = screenTitle(cv, body.Inset2(1, 0), "MINING", "AstroBWTv3", t)
 	if body.H < 6 {
 		return
@@ -46,7 +59,7 @@ func drawMiningScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme, frame i
 
 	top := rows[0].Cols(38, 34, 28)
 	panelMining(cv, top[0], s, t, frame)
-	panelHistory(cv, top[1], s, t)
+	panelHistory(cv, top[1], s, t, o.histRange)
 	panelStatus(cv, top[2], s, t, frame)
 
 	bottom := rows[1].Cols(50, 50)
@@ -63,7 +76,7 @@ func drawMiningScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme, frame i
 // here immediately rather than as a headline figure that is quietly a third
 // lower than it was an hour ago.
 func panelDevices(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "HASHING DEVICES", Mark: "◈"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "HASHING DEVICES", Mark: markGPU})
 	if in.Empty() {
 		return
 	}
@@ -132,28 +145,24 @@ func drawStatsScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme) {
 		return
 	}
 
-	// Four windows, drawn only where there is data. A 24-hour chart on a miner
-	// that has been up for eleven minutes is twenty-three hours of blank with
-	// a smudge at the right-hand end, which says less than not drawing it.
+	// The same five windows the dashboard offers, from the same table, so the
+	// two screens cannot drift apart -- and drawn only where there is data. A
+	// 24-hour chart on a miner that has been up for eleven minutes is
+	// twenty-three hours of blank with a smudge at the right-hand end, which
+	// says less than not drawing it at all.
 	type win struct {
 		title  string
 		labels []string
 		vals   []float64
 	}
-	wins := []win{
-		{"5 MIN", []string{"5m", "4m", "3m", "2m", "1m", "Now"}, s.History},
-		{"15 MIN", []string{"15m", "10m", "5m", "Now"}, s.Hist15m},
-		{"1 HOUR", []string{"1h", "45m", "30m", "15m", "Now"}, s.Hist1h},
-		{"24 HOUR", []string{"24h", "18h", "12h", "6h", "Now"}, s.Hist24h},
-	}
 	var live []win
-	for _, w := range wins {
-		if len(w.vals) >= 2 {
-			live = append(live, w)
+	for _, r := range histRanges {
+		if v := r.pick(s); len(v) >= 2 {
+			live = append(live, win{r.label, r.xaxis, v})
 		}
 	}
 	if len(live) == 0 {
-		live = wins[:1]
+		live = []win{{histRanges[0].label, histRanges[0].xaxis, histRanges[0].pick(s)}}
 	}
 
 	rows := body.Rows(body.H*2/3, -1)
@@ -182,7 +191,7 @@ func drawStatsScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme) {
 			weights[j] = 1
 		}
 		cell := strips[ri].Cols(weights...)[ci]
-		in := ui.Panel(cv, cell, t, ui.PanelOpts{Title: "HASHRATE", Mark: "◈", Right: w.title})
+		in := ui.Panel(cv, cell, t, ui.PanelOpts{Title: "HASHRATE", Mark: markHistory, Right: w.title})
 		if !in.Empty() {
 			ui.Chart(cv, in, t, ui.ChartOpts{Values: w.vals, XLabels: w.labels, Fill: in.H >= 6})
 		}
@@ -195,7 +204,7 @@ func drawStatsScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme) {
 }
 
 func panelSessionTotals(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "SESSION", Mark: "◈"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "SESSION", Mark: markQuick})
 	if in.Empty() {
 		return
 	}
@@ -212,7 +221,7 @@ func panelSessionTotals(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 }
 
 func panelRateSummary(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "HASHRATE", Mark: "◈"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "HASHRATE", Mark: markMining})
 	if in.Empty() {
 		return
 	}
@@ -252,12 +261,12 @@ func drawNetworkScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme, frame 
 	panelConnection(cv, top[2], s, t, frame)
 
 	bottom := rows[1].Cols(45, 55)
-	panelBlockchain(cv, bottom[0], s, t)
+	panelBlockchain(cv, bottom[0], s, t, frame)
 	panelJob(cv, bottom[1], s, t)
 }
 
 func panelNodeDetail(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "NODE", Mark: "◈"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "NODE", Mark: markNetwork})
 	if in.Empty() {
 		return
 	}
@@ -295,7 +304,7 @@ func panelNodeDetail(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 }
 
 func panelJob(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "CURRENT JOB", Mark: "◈"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "CURRENT JOB", Mark: markChain})
 	if in.Empty() {
 		return
 	}
@@ -333,7 +342,7 @@ func drawThreadsScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme) {
 	rows := body.Rows(-1, 7)
 
 	in := ui.Panel(cv, rows[0], t, ui.PanelOpts{
-		Title: "PER-THREAD UTILISATION", Mark: "◈", Right: "share of the fastest thread"})
+		Title: "PER-THREAD UTILISATION", Mark: markThreads, Right: "share of the fastest thread"})
 	if !in.Empty() {
 		drawThreadGrid(cv, in, s, t)
 	}
@@ -350,7 +359,7 @@ func drawThreadsScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme) {
 }
 
 func panelThreadSummary(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "THREAD SUMMARY", Mark: "◈"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "THREAD SUMMARY", Mark: markCPU})
 	if in.Empty() {
 		return
 	}
@@ -402,7 +411,7 @@ func drawConfigScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme) {
 	rows := body.Rows(body.H/2, -1)
 	top := rows[0].Cols(50, 50)
 
-	in := ui.Panel(cv, top[0], t, ui.PanelOpts{Title: "SETTINGS", Mark: "◈"})
+	in := ui.Panel(cv, top[0], t, ui.PanelOpts{Title: "SETTINGS", Mark: markSystem})
 	if !in.Empty() {
 		gpus := "off"
 		if len(s.GPUList) > 0 {
@@ -435,6 +444,8 @@ func drawConfigScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme) {
 			{"GPU BATCH", batch},
 			{"GPU BLOCKS", blocks},
 			{"THEME", s.ThemeName},
+			{"COLOUR", ui.CurrentDepth().String()},
+			{"CONSOLE", s.UINote},
 			{"CONFIG FILE", s.ConfigPath},
 			{"LOG FILE", s.LogFile},
 		}, t, nil)
@@ -445,7 +456,7 @@ func drawConfigScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme) {
 		"",
 	}, configCommandHelp...))
 
-	in = ui.Panel(cv, rows[1], t, ui.PanelOpts{Title: "START-UP NOTES", Mark: "◈"})
+	in = ui.Panel(cv, rows[1], t, ui.PanelOpts{Title: "START-UP NOTES", Mark: markLog})
 	if !in.Empty() {
 		notes := append([]string{}, s.SensorNote...)
 		if s.SANote != "" {
@@ -472,17 +483,21 @@ func drawConfigScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme) {
 }
 
 var configCommandHelp = []string{
-	"threads <n>    change the thread count live",
-	"theme <name>   switch colour theme",
-	"save           write settings to the config file",
-	"config         print the active settings to the log",
-	"quit           stop mining and exit",
+	"threads <n>      change the thread count live",
+	"theme <name>     switch colour theme",
+	"filter <text>    show only matching log lines",
+	"range <5m..24h>  hashrate chart window",
+	"refresh <fps>    console frames per second",
+	"animation on|off decorative animation",
+	"save             write settings to the config file",
+	"config           print the active settings to the log",
+	"quit             stop mining and exit",
 	"",
 	"themes: " + strings.Join(ui.ThemeNames(), ", "),
 }
 
 func panelHint(cv *ui.Canvas, r ui.Rect, t *Theme, lines []string) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "COMMANDS", Mark: "◈"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "COMMANDS", Mark: markStorm})
 	if in.Empty() {
 		return
 	}
@@ -502,21 +517,31 @@ func panelHint(cv *ui.Canvas, r ui.Rect, t *Theme, lines []string) {
 
 // ---------------------------------------------------------------- logs
 
-func drawLogScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme, scroll int) {
-	sub := "↑ ↓ PgUp PgDn to scroll · End for live"
-	if scroll > 0 {
-		sub = fmt.Sprintf("scrolled back %d · End for live", scroll)
+func drawLogScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme, v logView) {
+	sub := "↑↓ PgUp PgDn scroll · End live · F filter · X clear · Space pause"
+	switch {
+	case v.scroll > 0:
+		sub = fmt.Sprintf("scrolled back %d · End returns to live", v.scroll)
+	case v.paused:
+		sub = "paused · Space or End returns to live"
 	}
 	body = screenTitle(cv, body.Inset2(1, 0), "LOGS", sub, t)
 	if body.H < 3 {
 		return
 	}
-	in := ui.Panel(cv, body, t, ui.PanelOpts{
-		Title: "EVENT LOG", Mark: "◈", Right: fmt.Sprintf("%d events held", len(s.Log))})
+	shown := v.apply(nil, s.Log)
+	// Two counts, because they answer different questions: how much the run
+	// loop is holding, and how much of it this filter lets through. One number
+	// cannot say "the filter is hiding almost everything".
+	right := fmt.Sprintf("%d events held", len(s.Log))
+	if len(shown) != len(s.Log) {
+		right = fmt.Sprintf("%d of %d shown · %s", len(shown), len(s.Log), v.filterName())
+	}
+	in := ui.Panel(cv, body, t, ui.PanelOpts{Title: "EVENT LOG", Mark: markLog, Right: right})
 	if in.Empty() {
 		return
 	}
-	drawLogLines(cv, in, s.Log, t, scroll)
+	drawLogLines(cv, in, shown, t, v.scroll)
 }
 
 // ---------------------------------------------------------------- pools
@@ -535,7 +560,7 @@ func drawPoolsScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme) {
 	rows := body.Rows(body.H/2, -1)
 	cols := rows[0].Cols(55, 45)
 
-	in := ui.Panel(cv, cols[0], t, ui.PanelOpts{Title: "WORK SOURCE", Mark: "◈"})
+	in := ui.Panel(cv, cols[0], t, ui.PanelOpts{Title: "WORK SOURCE", Mark: markNetwork})
 	if !in.Empty() {
 		colour, label := connLabel(s, t)
 		y := in.Y
@@ -562,7 +587,7 @@ func drawPoolsScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme) {
 		}, t, nil)
 	}
 
-	in = ui.Panel(cv, cols[1], t, ui.PanelOpts{Title: "ABOUT SOLO MINING", Mark: "◈"})
+	in = ui.Panel(cv, cols[1], t, ui.PanelOpts{Title: "ABOUT SOLO MINING", Mark: markConn})
 	if !in.Empty() {
 		y := in.Y
 		for _, line := range wrapText(
@@ -582,7 +607,7 @@ func drawPoolsScreen(cv *ui.Canvas, body ui.Rect, s Snapshot, t *Theme) {
 		}
 	}
 
-	panelLog(cv, rows[1], s, t, 0)
+	panelLog(cv, rows[1], s, t, logView{})
 }
 
 // ---------------------------------------------------------------- help
@@ -592,35 +617,40 @@ func drawHelpScreen(cv *ui.Canvas, body ui.Rect, t *Theme) {
 	if body.H < 5 {
 		return
 	}
-	cols := body.Cols(34, 33, 33)
+	cols := body.Cols(30, 34, 36)
 
-	in := ui.Panel(cv, cols[0], t, ui.PanelOpts{Title: "SCREENS", Mark: "◈"})
+	in := ui.Panel(cv, cols[0], t, ui.PanelOpts{Title: "SCREENS", Mark: markQuick})
 	if !in.Empty() {
-		rows := make([][2]string, 0, len(navItems)+3)
+		rows := make([][2]string, 0, len(navItems)+4)
 		rows = append(rows, [2]string{"D  or  Esc", "dashboard"})
 		for _, n := range navItems {
 			rows = append(rows, [2]string{string(n.key), strings.ToLower(n.label)})
 		}
 		rows = append(rows,
 			[2]string{"Tab", "next screen"},
+			[2]string{"Shift-Tab", "previous screen"},
 			[2]string{"Q  or  Ctrl-C", "quit"})
 		kvRows(cv, in, in.Y, rows, t, nil)
 	}
 
-	in = ui.Panel(cv, cols[1], t, ui.PanelOpts{Title: "KEYS", Mark: "◈"})
+	in = ui.Panel(cv, cols[1], t, ui.PanelOpts{Title: "KEYS", Mark: markThreads})
 	if !in.Empty() {
 		kvRows(cv, in, in.Y, [][2]string{
 			{"↑ ↓  or  j k", "scroll the log"},
 			{"PgUp PgDn", "scroll a page"},
-			{"Home", "oldest event"},
-			{"End", "back to live"},
+			{"Home / End", "oldest / back to live"},
+			{"Space", "pause the log"},
+			{"F", "cycle the log filter"},
+			{"X", "clear the log view"},
+			{"← →  or  [ ]", "chart window"},
+			{"G", "next GPU"},
+			{"A", "animation on / off"},
 			{":  or  /", "command line"},
-			{"Esc", "cancel / dashboard"},
 			{"Ctrl-U", "clear the command"},
 		}, t, nil)
 	}
 
-	in = ui.Panel(cv, cols[2], t, ui.PanelOpts{Title: "COMMANDS", Mark: "◈"})
+	in = ui.Panel(cv, cols[2], t, ui.PanelOpts{Title: "COMMANDS", Mark: markLog})
 	if !in.Empty() {
 		y := in.Y
 		for _, l := range configCommandHelp {
@@ -630,8 +660,20 @@ func drawHelpScreen(cv *ui.Canvas, body ui.Rect, t *Theme) {
 			cv.TextIn(in.X, y, in.W, l, ui.Style{FG: t.Muted})
 			y++
 		}
-		if y+1 < in.Bottom() {
-			cv.TextIn(in.X, y+1, in.W, "start with --no-tui for plain output", ui.Style{FG: t.Dim})
+		if y < in.Bottom() {
+			y++
+		}
+		for _, l := range []string{
+			"--no-tui          plain scrolling output",
+			"--tui-refresh=<n> console frames per second",
+			"--no-animation    no moving parts",
+			"--color=<mode>    truecolor, 256, 16, none",
+		} {
+			if y >= in.Bottom() {
+				break
+			}
+			cv.TextIn(in.X, y, in.W, l, ui.Style{FG: t.Dim})
+			y++
 		}
 	}
 }

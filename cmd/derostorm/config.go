@@ -35,7 +35,32 @@ type Config struct {
 	// GPUBlocks pins the suffix kernel's grid-block count. 0 uses the
 	// runtime-derived occupancy/VRAM ceiling.
 	GPUBlocks int `json:"gpu_blocks,omitempty"`
+
+	// UI is the console's own remembered preferences. Nothing in it can
+	// change how the miner mines, which is why it is a separate object: a
+	// person editing this file by hand should be able to see at a glance
+	// which half of it matters.
+	UI UIPrefs `json:"ui,omitempty"`
 }
+
+// UIPrefs is the harmless part of the config: what the console looked like
+// when it was last saved.
+//
+// The two booleans are pointers so that "absent" and "false" are different
+// things. Both default to on, and a config written before they existed must
+// keep getting the defaults rather than silently turning the animation off.
+type UIPrefs struct {
+	Screen  string `json:"screen,omitempty"`  // dashboard, mining, stats...
+	Range   string `json:"range,omitempty"`   // 5M, 30M, 1H, 6H, 24H
+	Refresh int    `json:"refresh,omitempty"` // console frames per second
+	Animate *bool  `json:"animation,omitempty"`
+	Title   *bool  `json:"title,omitempty"`
+}
+
+// On is the value of an optional boolean preference, defaulting to true.
+func prefOn(p *bool) bool { return p == nil || *p }
+
+func boolPtr(v bool) *bool { return &v }
 
 // ConfigPath returns where the config lives: beside the executable, falling
 // back to the working directory if the executable path cannot be resolved.

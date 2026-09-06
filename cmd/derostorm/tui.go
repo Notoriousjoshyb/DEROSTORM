@@ -83,6 +83,16 @@ func (s screenID) title() string {
 	return "DASHBOARD"
 }
 
+// name is the screen as --screen and the saved preference spell it: the same
+// vocabulary screenByName parses, so a preference written by one run is
+// understood by the next.
+func (s screenID) name() string {
+	if s == screenDashboard {
+		return "dashboard"
+	}
+	return strings.ToLower(s.title())
+}
+
 // ---------------------------------------------------------------- keys
 
 type keyCode int
@@ -93,6 +103,7 @@ const (
 	keyEnter
 	keyBackspace
 	keyTab
+	keyBackTab
 	keyUp
 	keyDown
 	keyLeft
@@ -102,6 +113,12 @@ const (
 	keyHome
 	keyEnd
 	keyCtrlC
+	// keyFocusIn and keyFocusOut are not keys. They are what a terminal that
+	// understands focus reporting sends when its window gains or loses focus,
+	// and they arrive on stdin mixed in with the key presses, so this is where
+	// they have to be decoded.
+	keyFocusIn
+	keyFocusOut
 )
 
 type keyEvent struct {
@@ -153,6 +170,12 @@ func decodeKeys(b []byte) []keyEvent {
 				continue
 			}
 			switch final {
+			case 'I':
+				out = append(out, keyEvent{code: keyFocusIn})
+			case 'O':
+				out = append(out, keyEvent{code: keyFocusOut})
+			case 'Z':
+				out = append(out, keyEvent{code: keyBackTab})
 			case 'A':
 				out = append(out, keyEvent{code: keyUp})
 			case 'B':
@@ -227,11 +250,34 @@ type TUI struct {
 	theme *Theme
 
 	screen screenID
-	// logScroll is how many lines back from the newest the log view is
-	// scrolled. Zero means pinned to the bottom, which is where it returns
+	// log is the event view's own state: where it is scrolled, whether it is
+	// following, and what it is filtered to. The scroll returns to the bottom
 	// whenever the user changes screen -- a log frozen at the position it
-	// happened to be left at three screens ago is a trap.
-	logScroll int
+	// happened to be left at three screens ago is a trap -- but the filter
+	// does not, because a filter is a decision and a scroll position is not.
+	log logView
+
+	// histRange is which window the hashrate chart is showing, and gpuSel
+	// which card the GPU panel is on. Both are indices into tables that
+	// cannot be empty, and both are wrapped rather than clamped so holding
+	// the key down cycles instead of sticking at an end.
+	histRange int
+	gpuSel    int
+
+	// anim is whether decorative animation runs, and focused whether the
+	// terminal window currently has focus. Animation needs both: there is no
+	// point spending frames turning a globe in a window nobody is looking at.
+	//
+	// focused starts true, because a terminal that does not support focus
+	// reporting will never say either way and "assume it is being watched" is
+	// the only answer that cannot leave a visible console frozen.
+	anim    bool
+	focused bool
+
+	// title, titleAt and lastTitle drive the window title. See setTitle.
+	title     bool
+	titleAt   time.Time
+	lastTitle string
 
 	// cmd is the runtime command line, shown only while it is open. Keeping it
 	// behind a key rather than always on screen buys back a row for the
@@ -251,12 +297,40 @@ type TUI struct {
 	entered bool
 }
 
-func NewTUI(out *os.File, theme *Theme, w, h int) *TUI {
-	return &TUI{
-		out:   out,
-		theme: theme,
-		scr:   ui.NewScreen(out, w, h, theme.Name != "mono"),
+// TUIOpts is what a run's flags and saved preferences say the console should
+// start as. Everything in it is a display decision; none of it reaches mining.
+type TUIOpts struct {
+	Anim      bool   // decorative animation
+	Title     bool   // rewrite the terminal's title bar
+	Screen    string // the screen to open on
+	HistRange string // the hashrate window to open on
+}
+
+func NewTUI(out *os.File, theme *Theme, w, h int, o TUIOpts) *TUI {
+	t := &TUI{
+		out:     out,
+		theme:   theme,
+		scr:     ui.NewScreen(out, w, h, theme.Name != "mono"),
+		anim:    o.Anim,
+		title:   o.Title,
+		focused: true,
 	}
+	t.screen = screenByName(o.Screen)
+	for i, r := range histRanges {
+		if strings.EqualFold(r.label, o.HistRange) {
+			t.histRange = i
+		}
+	}
+	t.scr.SetBG(theme.PanelBG)
+	return t
+}
+
+// Prefs is the console state worth remembering between runs. Read by the
+// "save" command; nothing here can change how the miner mines.
+func (t *TUI) Prefs() (screen, histRange string, anim bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.screen.name(), histRanges[t.histRange].label, t.anim
 }
 
 // Enter switches to the alternate screen buffer.
@@ -291,6 +365,7 @@ func (t *TUI) SetTheme(th *Theme) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.theme = th
+	t.scr.SetBG(th.PanelBG)
 	t.scr.Invalidate()
 }
 
@@ -298,6 +373,37 @@ func (t *TUI) Screen() screenID {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.screen
+}
+
+// SetLogFilter is the "filter" runtime command: show only lines containing
+// this text. An empty string clears it.
+func (t *TUI) SetLogFilter(text string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.log.text = text
+	t.log.min = LogInfo
+	t.log.scroll = 0
+}
+
+// SetRange is the "range" runtime command: pick the chart window by name.
+func (t *TUI) SetRange(label string) bool {
+	for i, r := range histRanges {
+		if strings.EqualFold(r.label, label) {
+			t.mu.Lock()
+			t.histRange = i
+			t.mu.Unlock()
+			return true
+		}
+	}
+	return false
+}
+
+// SetAnimation is the "animation on|off" runtime command.
+func (t *TUI) SetAnimation(on bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.anim = on
+	t.scr.Invalidate()
 }
 
 // CommandOpen reports whether the command line has the keyboard.
@@ -327,6 +433,19 @@ func (t *TUI) Key(k keyEvent) (cmd string, quit bool) {
 		return "", true
 	}
 
+	// Focus is not a key press and must not be treated as one: it arrives
+	// while the user is typing in another window, and letting it through the
+	// switch below would mean alt-tabbing away scrolled the log.
+	switch k.code {
+	case keyFocusIn:
+		t.focused = true
+		t.scr.Invalidate()
+		return "", false
+	case keyFocusOut:
+		t.focused = false
+		return "", false
+	}
+
 	if t.cmdOpen {
 		switch k.code {
 		case keyEsc:
@@ -349,38 +468,51 @@ func (t *TUI) Key(k keyEvent) (cmd string, quit bool) {
 		return "", false
 	}
 
+	// Scrolling back pauses the follow, and returning to the bottom resumes
+	// it. Anything else is a trap: a user who scrolls up to read a line and
+	// then watches it get pushed off the top has been given a scrollbar that
+	// does not work.
+	scrollBy := func(n int) {
+		t.log.scroll += n
+		if t.log.scroll < 0 {
+			t.log.scroll = 0
+		}
+		t.log.paused = t.log.scroll > 0
+	}
+
 	switch k.code {
 	case keyEsc:
-		t.screen, t.logScroll = screenDashboard, 0
-		t.scr.Invalidate()
+		t.goTo(screenDashboard)
 		return "", false
 	case keyUp:
-		t.logScroll++
+		scrollBy(1)
 		return "", false
 	case keyDown:
-		if t.logScroll > 0 {
-			t.logScroll--
-		}
+		scrollBy(-1)
 		return "", false
 	case keyPgUp:
-		t.logScroll += 10
+		scrollBy(10)
 		return "", false
 	case keyPgDn:
-		t.logScroll -= 10
-		if t.logScroll < 0 {
-			t.logScroll = 0
-		}
+		scrollBy(-10)
 		return "", false
 	case keyHome:
-		t.logScroll = 1 << 20 // clamped against the real length when drawn
+		scrollBy(1 << 20) // clamped against the real length when drawn
 		return "", false
 	case keyEnd:
-		t.logScroll = 0
+		t.log.scroll, t.log.paused = 0, false
+		return "", false
+	case keyLeft:
+		t.histRange = clampRange(t.histRange - 1)
+		return "", false
+	case keyRight:
+		t.histRange = clampRange(t.histRange + 1)
 		return "", false
 	case keyTab:
-		t.screen = screenID((int(t.screen) + 1) % (int(screenHelp) + 1))
-		t.logScroll = 0
-		t.scr.Invalidate()
+		t.goTo(screenID((int(t.screen) + 1) % (int(screenHelp) + 1)))
+		return "", false
+	case keyBackTab:
+		t.goTo(screenID((int(t.screen) + int(screenHelp)) % (int(screenHelp) + 1)))
 		return "", false
 	case keyRune:
 		switch k.r {
@@ -391,32 +523,76 @@ func (t *TUI) Key(k keyEvent) (cmd string, quit bool) {
 		case 'q', 'Q':
 			return "", true
 		case 'd', 'D':
-			t.screen, t.logScroll = screenDashboard, 0
-			t.scr.Invalidate()
+			t.goTo(screenDashboard)
 			return "", false
 		case 'j':
-			t.logScroll++
+			scrollBy(1)
 			return "", false
 		case 'k':
-			if t.logScroll > 0 {
-				t.logScroll--
+			scrollBy(-1)
+			return "", false
+		case '[', '<', ',':
+			t.histRange = clampRange(t.histRange - 1)
+			return "", false
+		case ']', '>', '.':
+			t.histRange = clampRange(t.histRange + 1)
+			return "", false
+		case 'g':
+			t.gpuSel++
+			return "", false
+		case 'a', 'A':
+			t.anim = !t.anim
+			t.scr.Invalidate()
+			return "", false
+		case 'f', 'F':
+			// All -> shares and better -> warnings and better -> errors only.
+			t.log.text = ""
+			switch t.log.min {
+			case LogInfo:
+				t.log.min = LogGood
+			case LogGood:
+				t.log.min = LogWarn
+			case LogWarn:
+				t.log.min = LogError
+			default:
+				t.log.min = LogInfo
 			}
+			t.log.scroll = 0
+			return "", false
+		case 'x', 'X':
+			t.log.clearedAt = time.Now()
+			t.log.scroll = 0
+			return "", false
+		case ' ':
+			t.log.paused = !t.log.paused
+			if !t.log.paused {
+				t.log.scroll = 0
+			}
+			return "", false
+		case '?':
+			t.goTo(screenHelp)
 			return "", false
 		}
 		for _, n := range navItems {
 			if k.r == n.key || k.r == n.key+32 { // upper or lower case
 				if t.screen == n.id {
-					t.screen = screenDashboard // pressing it again comes back
+					t.goTo(screenDashboard) // pressing it again comes back
 				} else {
-					t.screen = n.id
+					t.goTo(n.id)
 				}
-				t.logScroll = 0
-				t.scr.Invalidate()
 				return "", false
 			}
 		}
 	}
 	return "", false
+}
+
+// goTo changes screen, unpins the log and forces a repaint. Every navigation
+// path goes through it so none of them can forget one of the three.
+func (t *TUI) goTo(id screenID) {
+	t.screen = id
+	t.log.scroll, t.log.paused = 0, false
+	t.scr.Invalidate()
 }
 
 // Render draws one frame.
@@ -459,14 +635,18 @@ func (t *TUI) Render(s Snapshot) (err error) {
 	renderFrame(cv, s, t.theme, frameOpts{
 		screen:    t.screen,
 		frame:     t.frame,
-		logScroll: t.logScroll,
 		cmd:       string(t.cmd),
 		cmdOpen:   t.cmdOpen,
+		anim:      t.anim && t.focused,
+		histRange: t.histRange,
+		gpuSel:    t.gpuSel,
+		log:       t.log,
 	})
 
 	if time.Now().Before(t.blockUntil) {
 		drawBlockBanner(cv, cv.Bounds(), s, t.theme, t.frame)
 	}
+	t.updateTitle(s)
 
 	t.scr.Flush()
 	return nil
@@ -476,11 +656,22 @@ func (t *TUI) Render(s Snapshot) (err error) {
 // frame can be rendered without a console at all -- which is what --preview
 // does, and what the layout tests do.
 type frameOpts struct {
-	screen    screenID
-	frame     int
-	logScroll int
-	cmd       string
-	cmdOpen   bool
+	screen  screenID
+	frame   int
+	cmd     string
+	cmdOpen bool
+
+	// anim is whether decorative animation runs. When it is off, every widget
+	// that would have cycled a frame is handed a frozen counter instead of
+	// being given a flag of its own -- one place decides, and no widget has to
+	// remember to check.
+	anim bool
+
+	// histRange is the hashrate window on show, gpuSel the card the GPU panel
+	// is on, and log the event view's filter and follow state.
+	histRange int
+	gpuSel    int
+	log       logView
 }
 
 // renderFrame draws one complete frame -- header, screen, footer -- into cv.
@@ -500,31 +691,53 @@ func renderFrame(cv *ui.Canvas, s Snapshot, th *Theme, o frameOpts) {
 	if o.cmdOpen {
 		footH = 2
 	}
+	// af is the animation clock. It is the frame counter when decoration is
+	// running and a constant when it is not, so --no-animation costs one
+	// assignment here instead of a conditional inside every widget that moves.
+	af := 0
+	if o.anim {
+		af = o.frame
+	}
 	rows := full.Rows(headerHeight(full.W, full.H), -1, footH)
-	drawHeader(cv, rows[0], s, th, o.frame)
+	drawHeader(cv, rows[0], s, th, af)
 	drawFooter(cv, rows[2], s, th, o)
 
 	body := rows[1]
 	switch o.screen {
 	case screenDashboard:
-		drawDashboard(cv, body, s, th, o.frame)
+		drawDashboard(cv, body, s, th, af, o)
 	case screenMining:
-		drawMiningScreen(cv, body, s, th, o.frame)
+		drawMiningScreen(cv, body, s, th, af, o)
 	case screenStats:
 		drawStatsScreen(cv, body, s, th)
 	case screenNetwork:
-		drawNetworkScreen(cv, body, s, th, o.frame)
+		drawNetworkScreen(cv, body, s, th, af)
 	case screenThreads:
 		drawThreadsScreen(cv, body, s, th)
 	case screenConfig:
 		drawConfigScreen(cv, body, s, th)
 	case screenLogs:
-		drawLogScreen(cv, body, s, th, o.logScroll)
+		drawLogScreen(cv, body, s, th, o.log)
 	case screenPools:
 		drawPoolsScreen(cv, body, s, th)
 	case screenHelp:
 		drawHelpScreen(cv, body, th)
 	}
+}
+
+// footerBrands are the run's signature, longest first. The footer takes the
+// longest one that still leaves the key bar whole.
+//
+// Longest-that-fits rather than a width breakpoint. A breakpoint has to be
+// guessed against a key bar whose width depends on how many screens there are,
+// and the guess was wrong: at 170 columns the full signature fitted the test
+// and then pushed HELP and QUIT off the end of the row. Measuring the keys
+// first and spending what is left cannot be wrong that way.
+var footerBrands = []string{
+	" │ ASTROBWTv3 │ DERO │ PRIVACY · FREEDOM · DECENTRALISATION",
+	" │ ASTROBWTv3 │ DERO",
+	" │ DERO",
+	"",
 }
 
 func drawFooter(cv *ui.Canvas, r ui.Rect, s Snapshot, th *Theme, o frameOpts) {
@@ -544,20 +757,33 @@ func drawFooter(cv *ui.Canvas, r ui.Rect, s Snapshot, th *Theme, o frameOpts) {
 		}
 	}
 
-	right := "DEROSTORM v" + version
-	if s.Testnet {
-		right = "DEROSTORM v" + version + " · testnet"
+	// How wide the key bar would like to be, measured before anything is
+	// drawn. The keys are the only thing on this row anyone acts on, so they
+	// are laid out first and the signature gets the remainder.
+	keysW := 1
+	for _, n := range navItems {
+		keysW += ui.Width(n.label) + 7
 	}
-	// Where the key bar has to stop. Measured from the wordmark rather than
-	// set to a fixed margin -- the margin was fourteen columns and the
-	// wordmark is sixteen, so on a narrow window the last key ran into it and
-	// the footer read "[Q] QUITDEROSTORM v1.4.1". On a window too narrow for
-	// both, the keys win: they are the only thing on the row anyone acts on.
+	keysW += 8 // [Q] QUIT
+
+	base := "DEROSTORM v" + version
+	if s.Testnet {
+		base += " · testnet"
+	}
+	right := ""
+	for _, brand := range footerBrands {
+		if keysW+ui.Width(base)+ui.Width(brand)+3 <= r.W {
+			right = base + brand
+			break
+		}
+	}
+	if right == "" && r.W > keysW+ui.Width(base)+3 {
+		right = base
+	}
+
 	limit := r.Right() - 1
-	if r.W > ui.Width(right)+22 {
+	if right != "" {
 		limit -= ui.Width(right) + 2
-	} else {
-		right = ""
 	}
 
 	// The key bar. Drawn from the left and simply stopped when the width runs
@@ -571,13 +797,22 @@ func drawFooter(cv *ui.Canvas, r ui.Rect, s Snapshot, th *Theme, o frameOpts) {
 		}
 		active := o.screen == n.id
 		kfg, lfg := th.Accent, th.Muted
+		st := ui.Style{}
 		if active {
-			kfg, lfg = th.Accent, th.Accent
+			// The selected screen is painted rather than only brightened. On a
+			// screen with this much colour on it a hue change alone does not
+			// read as "you are here", and the fill survives the drop to
+			// sixteen colours where several accents collapse together.
+			lfg = th.Accent
+			st = ui.Style{BG: th.SelBG}
+			for i := -1; i < ui.Width(item)+1; i++ {
+				cv.Set(x+i, y, ' ', st)
+			}
 		}
-		cv.Set(x, y, '[', ui.Style{FG: th.Dim})
-		cv.Set(x+1, y, n.key, ui.Style{FG: kfg, Bold: true})
-		cv.Set(x+2, y, ']', ui.Style{FG: th.Dim})
-		cv.Text(x+4, y, n.label, ui.Style{FG: lfg, Bold: active})
+		cv.Set(x, y, '[', ui.Style{FG: th.Dim, BG: st.BG})
+		cv.Set(x+1, y, n.key, ui.Style{FG: kfg, Bold: true, BG: st.BG})
+		cv.Set(x+2, y, ']', ui.Style{FG: th.Dim, BG: st.BG})
+		cv.Text(x+4, y, n.label, ui.Style{FG: lfg, Bold: active, BG: st.BG})
 		x += ui.Width(item) + 3
 	}
 	if x+8 <= limit {
@@ -587,8 +822,20 @@ func drawFooter(cv *ui.Canvas, r ui.Rect, s Snapshot, th *Theme, o frameOpts) {
 		cv.Text(x+4, y, "QUIT", ui.Style{FG: th.Muted})
 	}
 	if right != "" {
-		cv.TextRight(r.Right()-1, y, right, ui.Style{FG: th.Dim})
+		drawBrand(cv, r.Right()-1, y, right, th)
 	}
+}
+
+// drawBrand writes the signature with the product name in the wordmark
+// gradient and the rest of it quiet, so the footer carries the identity
+// without shouting a version number at anyone.
+func drawBrand(cv *ui.Canvas, right, y int, s string, th *Theme) {
+	x := right - ui.Width(s)
+	name := "DEROSTORM"
+	for i, ch := range name {
+		cv.Set(x+i, y, ch, ui.Style{FG: th.Ramp(float64(i) / float64(len(name)-1)), Bold: true})
+	}
+	cv.Text(x+ui.Width(name), y, s[len(name):], ui.Style{FG: th.Dim})
 }
 
 func drawTooSmall(cv *ui.Canvas, r ui.Rect, th *Theme) {

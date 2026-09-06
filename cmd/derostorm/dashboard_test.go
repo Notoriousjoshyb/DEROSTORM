@@ -122,7 +122,13 @@ func TestMonoThemeEmitsNoEscapes(t *testing.T) {
 
 func TestPickThemeRespectsEnvironment(t *testing.T) {
 	// the developer's own shell may set NO_COLOR; clear it for the colour cases
-	// (t.Setenv restores whatever was there when the test finishes).
+	// (t.Setenv restores whatever was there when the test finishes). The depth
+	// has to be set too: it is detected once at package init, so a shell with
+	// NO_COLOR set leaves it at DepthNone and every colour theme falls back to
+	// mono however clean the environment looks by the time this runs.
+	saved := ui.CurrentDepth()
+	ui.SetDepth(ui.DepthTrue)
+	t.Cleanup(func() { ui.SetDepth(saved) })
 	t.Setenv("NO_COLOR", "")
 	os.Unsetenv("NO_COLOR")
 

@@ -26,7 +26,7 @@ import (
 )
 
 // runTUIPreview prints one frame at the given size and returns.
-func runTUIPreview(themeName, size, screen string, isTTY bool) {
+func runTUIPreview(themeName, size, screen string, isTTY, anim bool) {
 	cols, rows := TerminalWidth(), TerminalHeight()
 	if cols <= 0 {
 		cols = 160
@@ -43,11 +43,23 @@ func runTUIPreview(themeName, size, screen string, isTTY bool) {
 		}
 	}
 
-	theme, _ := PickTheme(themeName, isTTY)
+	// The preview exists so a theme can be looked at before it is chosen, so
+	// it takes the theme it was asked for even when stdout is a pipe. Piping
+	// it into a file and cat-ing the file is a normal thing to do with it, and
+	// a preview that answered "mono, because you piped me" would be useless
+	// for the one job it has.
+	theme, _ := PickTheme(themeName, true)
+	if !isTTY && themeName == "" {
+		theme, _ = PickTheme("", isTTY)
+	}
 	sc := screenByName(screen)
 
 	cv := ui.NewCanvas(cols, rows)
-	renderFrame(cv, previewSnapshot(), theme, frameOpts{screen: sc, frame: 7})
+	// The preview paints the themed ground the same way the live console does,
+	// so what is dumped here is what the terminal would show rather than the
+	// same frame over whatever background the shell happens to have.
+	cv.BG = theme.PanelBG
+	renderFrame(cv, previewSnapshot(), theme, frameOpts{screen: sc, frame: 7, anim: anim})
 
 	for _, line := range cv.Lines(theme.Name != "mono") {
 		fmt.Println(line)

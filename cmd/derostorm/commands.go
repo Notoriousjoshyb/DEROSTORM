@@ -65,9 +65,19 @@ type CommandContext struct {
 	Path    string
 	Quit    func()
 	Log     func(LogLevel, string, string, ...interface{})
+
+	// TUI is the full-screen console, or nil when this run is using the
+	// compact panel or plain output. Every command that touches it checks,
+	// because exactly which console a run has is decided by the terminal and
+	// not by the command being typed.
+	TUI *TUI
+	// SetRefresh changes the console frame rate. Separate from TUI because the
+	// ticker it drives lives in the run loop, not in the console.
+	SetRefresh func(fps int)
 }
 
-const commandHelp = "threads <n> · theme <name> · save · config · help · quit"
+const commandHelp = "threads <n> · theme <name> · filter <text> · range <5m..24h> · " +
+	"refresh <fps> · animation on|off · save · config · help · quit"
 
 // RunCommand executes one typed line.
 func RunCommand(ctx CommandContext, line string) {
@@ -94,22 +104,27 @@ func RunCommand(ctx CommandContext, line string) {
 			ctx.Log(LogError, "threads", "%v", err)
 			return
 		}
-	ctx.Config.Threads = n
-	if n == 0 {
-		if ctx.Engine.GPUs() == 0 {
-			ctx.Log(LogWarn, "threads", "now 0 with no GPU workers running — nothing is mining")
+		ctx.Config.Threads = n
+		if n == 0 {
+			if ctx.Engine.GPUs() == 0 {
+				ctx.Log(LogWarn, "threads", "now 0 with no GPU workers running — nothing is mining")
+			} else {
+				ctx.Log(LogGood, "threads", "CPU off — GPU only")
+			}
+		} else if cpus := DefaultThreads(); n > cpus {
+			ctx.Log(LogWarn, "threads", "now %d — more than the %d CPUs available, expect this to be slower", n, cpus)
 		} else {
-			ctx.Log(LogGood, "threads", "CPU off — GPU only")
+			ctx.Log(LogGood, "threads", "now %d", n)
 		}
-	} else if cpus := DefaultThreads(); n > cpus {
-		ctx.Log(LogWarn, "threads", "now %d — more than the %d CPUs available, expect this to be slower", n, cpus)
-	} else {
-		ctx.Log(LogGood, "threads", "now %d", n)
-	}
 
 	case "theme":
 		if len(args) == 0 {
-			ctx.Log(LogInfo, "theme", "%s — available: %s", ctx.Console.Theme().Name, strings.Join(themeNames(), ", "))
+			// Console is nil on a run using the full-screen console, which is
+			// most of them. Reaching through it for the current theme name is
+			// how "theme" used to take the whole miner down with a nil
+			// dereference on the one console where it is easiest to type.
+			ctx.Log(LogInfo, "theme", "%s — available: %s",
+				ctx.Config.Theme, strings.Join(themeNames(), ", "))
 			return
 		}
 		name := strings.ToLower(args[0])
@@ -119,13 +134,90 @@ func RunCommand(ctx CommandContext, line string) {
 			return
 		}
 		ctx.Config.Theme = name // remember the preference either way
-		if !ctx.Console.SetTheme(th) {
+		switch {
+		case ctx.TUI != nil:
+			ctx.TUI.SetTheme(th)
+		case ctx.Console != nil && !ctx.Console.SetTheme(th):
 			ctx.Log(LogWarn, "theme", "saved %s as your preference, but this output has no colour (not a terminal, or NO_COLOR)", name)
 			return
 		}
 		ctx.Log(LogGood, "theme", "switched to %s", name)
 
+	case "filter":
+		if ctx.TUI == nil {
+			ctx.Log(LogWarn, "filter", "only the full-screen console has an event view to filter")
+			return
+		}
+		text := strings.Join(args, " ")
+		if strings.EqualFold(text, "off") || strings.EqualFold(text, "none") {
+			text = ""
+		}
+		ctx.TUI.SetLogFilter(text)
+		if text == "" {
+			ctx.Log(LogGood, "filter", "cleared — showing every event")
+		} else {
+			ctx.Log(LogGood, "filter", "showing events matching %q", text)
+		}
+
+	case "range":
+		if ctx.TUI == nil {
+			ctx.Log(LogWarn, "range", "only the full-screen console has a chart")
+			return
+		}
+		if len(args) == 0 {
+			ctx.Log(LogInfo, "range", "available: %s", strings.Join(rangeLabels, ", "))
+			return
+		}
+		if !ctx.TUI.SetRange(args[0]) {
+			ctx.Log(LogError, "range", "unknown window %q — available: %s",
+				args[0], strings.Join(rangeLabels, ", "))
+			return
+		}
+		ctx.Config.UI.Range = strings.ToUpper(args[0])
+		ctx.Log(LogGood, "range", "chart window is now %s", strings.ToUpper(args[0]))
+
+	case "animation", "anim":
+		on := true
+		if len(args) > 0 {
+			switch strings.ToLower(args[0]) {
+			case "off", "no", "0", "false":
+				on = false
+			case "on", "yes", "1", "true":
+			default:
+				ctx.Log(LogError, "animation", "expected on or off")
+				return
+			}
+		}
+		ctx.Config.UI.Animate = boolPtr(on)
+		if ctx.TUI != nil {
+			ctx.TUI.SetAnimation(on)
+		}
+		ctx.Log(LogGood, "animation", "%s", onOff(on))
+
+	case "refresh":
+		if len(args) == 0 || ctx.SetRefresh == nil {
+			ctx.Log(LogInfo, "refresh", "%d frames per second — use \"refresh <%d-%d>\"",
+				ctx.Config.UI.Refresh, minRefreshFPS, maxRefreshFPS)
+			return
+		}
+		n, err := strconv.Atoi(args[0])
+		if err != nil || n < minRefreshFPS || n > maxRefreshFPS {
+			ctx.Log(LogError, "refresh", "expected a number between %d and %d", minRefreshFPS, maxRefreshFPS)
+			return
+		}
+		ctx.Config.UI.Refresh = n
+		ctx.SetRefresh(n)
+		ctx.Log(LogGood, "refresh", "console now redraws %d times a second", n)
+
 	case "save":
+		// The console's own state is folded in at the moment of saving rather
+		// than written back on every key press, so a session spent flicking
+		// between screens does not keep rewriting a file on disk.
+		if ctx.TUI != nil {
+			screen, rng, anim := ctx.TUI.Prefs()
+			ctx.Config.UI.Screen, ctx.Config.UI.Range = screen, rng
+			ctx.Config.UI.Animate = boolPtr(anim)
+		}
 		if err := ctx.Config.Save(ctx.Path); err != nil {
 			ctx.Log(LogError, "save", "%v", err)
 			return
@@ -149,6 +241,13 @@ func RunCommand(ctx CommandContext, line string) {
 	default:
 		ctx.Log(LogError, "command", "unknown command %q — %s", cmd, commandHelp)
 	}
+}
+
+func onOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
 }
 
 // parseThreadArg accepts an absolute count or a relative adjustment (+2, -4).

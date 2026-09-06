@@ -100,26 +100,36 @@ var WordmarkSmall = []string{
 
 // ---------------------------------------------------------------- big digits
 
-// bigDigits is a three-row numeral set in heavy box characters, for the
-// headline hashrate. Three rows is the largest a number can be and still leave
-// room for anything else in a panel eleven rows tall.
+// bigDigits is a three-row numeral set for the headline hashrate. Three rows
+// is the largest a number can be and still leave room for anything else in a
+// panel eleven rows tall.
+//
+// Block characters rather than the light box-drawing set this used to use.
+// The box set draws a numeral as a one-pixel outline, and next to a five-row
+// wordmark made of solid blocks the headline figure -- which is the single
+// most important number on the screen -- read as the faintest thing on it.
+// The block set has the weight the hierarchy needs, and it is the same set the
+// wordmark is drawn in, so the two look like they belong to one design.
+//
+// Four cells wide, because three cannot distinguish 6 from 8 in a font whose
+// only tool is a filled cell.
 var bigDigits = map[rune][3]string{
-	'0': {"┏━┓", "┃ ┃", "┗━┛"},
-	'1': {" ╻ ", " ┃ ", " ╹ "},
-	'2': {"╺━┓", "┏━┛", "┗━╸"},
-	'3': {"╺━┓", " ━┫", "╺━┛"},
-	'4': {"╻ ╻", "┗━┫", "  ╹"},
-	'5': {"┏━╸", "┗━┓", "╺━┛"},
-	'6': {"┏━╸", "┣━┓", "┗━┛"},
-	'7': {"╺━┓", "  ┃", "  ╹"},
-	'8': {"┏━┓", "┣━┫", "┗━┛"},
-	'9': {"┏━┓", "┗━┫", "╺━┛"},
-	'.': {"  ", "  ", "▄ "},
+	'0': {"█▀▀█", "█  █", "█▄▄█"},
+	'1': {" ▀█ ", "  █ ", " ▄█▄"},
+	'2': {"▀▀▀█", " ▄▄▀", "█▄▄▄"},
+	'3': {"▀▀▀█", " ▀▀█", "▄▄▄█"},
+	'4': {"█  █", "▀▀▀█", "   █"},
+	'5': {"█▀▀▀", "▀▀▀█", "▄▄▄█"},
+	'6': {"█▀▀▀", "█▀▀█", "█▄▄█"},
+	'7': {"▀▀▀█", "  ▄▀", " █  "},
+	'8': {"█▀▀█", "█▀▀█", "█▄▄█"},
+	'9': {"█▀▀█", "▀▀▀█", "▄▄▄█"},
+	'.': {"  ", "  ", "█ "},
 	',': {"  ", "  ", "▖ "},
-	':': {"  ", "▪ ", "▪ "},
-	'-': {"   ", "╺━╸", "   "},
+	':': {"  ", "█ ", "█ "},
+	'-': {"    ", "▄▄▄ ", "    "},
 	' ': {"  ", "  ", "  "},
-	'%': {"▘ ▗", " ╱ ", "▖ ▝"},
+	'%': {"█ ▄", " ▄▀", "▀ █"},
 }
 
 // BigTextWidth is how many cells BigText will occupy.
@@ -157,6 +167,77 @@ func BigText(cv *Canvas, x, y int, s string, st Style) int {
 		dx--
 	}
 	return dx
+}
+
+// BigTextGradient is BigText with the wordmark ramp swept across it.
+//
+// The sweep runs across the whole number rather than per glyph, so a rate that
+// gains a digit does not make the colours jump: every character keeps the
+// colour of the position it is at, and the ramp simply gets one stop longer.
+func BigTextGradient(cv *Canvas, x, y int, s string, t *Theme) int {
+	total := BigTextWidth(s)
+	if total < 1 {
+		return 0
+	}
+	dx := 0
+	for _, r := range s {
+		g, ok := bigDigits[r]
+		if !ok {
+			g = bigDigits[' ']
+		}
+		st := Style{FG: t.Ramp(float64(dx) / float64(total)), Bold: true}
+		for row := 0; row < 3; row++ {
+			cv.Text(x+dx, y+row, g[row], st)
+		}
+		dx += Width(g[0]) + 1
+	}
+	if dx > 0 {
+		dx--
+	}
+	return dx
+}
+
+// SignalRamp is the ascending bar chart the reference puts beside the aerial:
+// a staircase of columns, lit up to the current strength.
+//
+// A staircase rather than five equal bars, because the height carries the same
+// information as the count and the two together are readable at a glance from
+// across a room, which is the actual use for a connection indicator on a rig.
+func SignalRamp(cv *Canvas, r Rect, bars int, t *Theme, ok bool) {
+	if r.W < 5 || r.H < 2 {
+		return
+	}
+	const n = 5
+	// Two-cell columns with a gap where there is room, one-cell columns with a
+	// gap where there is not. A column and its gap the same width is the only
+	// arrangement that reads as a bar chart rather than as a dotted line.
+	colW, gap := 2, 1
+	switch {
+	case n*(colW+gap)-gap <= r.W:
+	case n*colW <= r.W:
+		gap = 0
+	default:
+		colW, gap = 1, 1
+	}
+	pitch := colW + gap
+	x0 := r.X + (r.W-(n*pitch-gap))/2
+	for i := 0; i < n; i++ {
+		h := (i + 1) * r.H / n
+		if h < 1 {
+			h = 1
+		}
+		fg := t.Track
+		if ok && i < bars {
+			// Along the ramp rather than one flat colour: the tallest bar is
+			// the one that means "excellent", and it should look like it.
+			fg = t.Ramp(float64(i) / float64(n-1))
+		}
+		for c := 0; c < colW; c++ {
+			for y := r.Bottom() - h; y < r.Bottom(); y++ {
+				cv.Set(x0+i*pitch+c, y, BlockFull, Style{FG: fg})
+			}
+		}
+	}
 }
 
 // ---------------------------------------------------------------- fixed art

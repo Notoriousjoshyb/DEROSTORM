@@ -114,6 +114,8 @@
 #define cudaFuncSetAttribute           hipFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize \
                                        hipFuncAttributeMaxDynamicSharedMemorySize
+#define cudaFuncAttributePreferredSharedMemoryCarveout \
+                                       hipFuncAttributePreferredSharedMemoryCarveout
 #define cudaFuncSetCacheConfig         hipFuncSetCacheConfig
 #define cudaFuncCachePreferShared      hipFuncCachePreferShared
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor \

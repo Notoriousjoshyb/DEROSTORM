@@ -120,7 +120,15 @@ func Chart(cv *Canvas, r Rect, t *Theme, o ChartOpts) {
 		o.LineFG = t.Accent
 	}
 	if o.FillFG == "" {
-		o.FillFG = t.Glow
+		o.FillFG = t.Fill
+	}
+	// The area fill only works because it is a colour: a dark wash under a
+	// bright trace. With no colour at all it is the same braille characters as
+	// the trace, covering most of the plot, and the line -- the entire point
+	// of the chart -- becomes impossible to pick out. So the mono theme gets
+	// the line and nothing else.
+	if t.Mono() {
+		o.Fill = false
 	}
 	if o.Empty == "" {
 		o.Empty = "collecting samples…"
@@ -268,11 +276,27 @@ func Chart(cv *Canvas, r Rect, t *Theme, o ChartOpts) {
 		prevY = y
 
 		if o.Fill {
-			// Every third sub-row, not every one. A solid fill under a trace
-			// that sits near the top of the plot is a large block with a line
-			// on it, and the shape -- the thing the chart is for -- stops being
-			// what the eye lands on. A dither reads as shading instead.
-			for yy := y + 2; yy < g.subH; yy += 3 {
+			// The fill thins with depth: solid for the first few sub-rows
+			// under the trace, then a half dither, then a third.
+			//
+			// A flat solid fill was tried and is wrong for this chart. A miner
+			// holding a steady rate puts the trace near the top of the plot,
+			// so a solid fill is nine tenths of the panel and the shape -- the
+			// only thing the chart is for -- becomes the outline of a large
+			// block. Fading it keeps the area readable as "under the line"
+			// while leaving the line itself the brightest edge in the panel.
+			for yy := y + 1; yy < g.subH; yy++ {
+				switch d := yy - y; {
+				case d <= 3:
+				case d <= 9:
+					if (sx+yy)%2 != 0 {
+						continue
+					}
+				default:
+					if (sx+yy)%3 != 0 {
+						continue
+					}
+				}
 				g.set(sx, yy, false)
 			}
 		}

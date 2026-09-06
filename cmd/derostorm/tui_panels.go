@@ -20,11 +20,59 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/notoriousjoshyb/derostorm/internal/ui"
 )
+
+// Panel marks. One glyph per panel, all from the geometric-shapes block so
+// every one of them is a single cell in every terminal this runs in.
+//
+// A distinct mark per panel rather than the same diamond twelve times. On a
+// screen with a dozen boxes on it the marks are what the eye navigates by:
+// somebody looking for the GPU panel finds its mark without reading a title.
+const (
+	markMining  = "◈"
+	markHistory = "▨"
+	markNetwork = "◉"
+	markCPU     = "▣"
+	markGPU     = "▤"
+	markShares  = "◍"
+	markChain   = "▩"
+	markSystem  = "▦"
+	markLog     = "▥"
+	markThreads = "▧"
+	markStorm   = "◆"
+	markQuick   = "◧"
+	markConn    = "◨"
+)
+
+// sensorStaleAfter is how old a hardware poll has to be before the console
+// stops presenting it as current.
+//
+// Twelve seconds, against a poll interval of about two. A sensor source can
+// stop answering without failing -- a monitoring program is closed, a driver
+// call starts blocking -- and the last value it gave simply sits there looking
+// like a live reading. A dashboard that shows a stale temperature as a current
+// one is worse than one that shows nothing, because the whole point of the
+// number is to notice when it moves.
+const sensorStaleAfter = 12 * time.Second
+
+// staleMark is the suffix put on a reading that has stopped being updated, or
+// the empty string when it is current.
+func staleMark(at time.Time) string {
+	if at.IsZero() || time.Since(at) < sensorStaleAfter {
+		return ""
+	}
+	return " ·stale"
+}
+
+// stale reports whether a poll timestamp is too old to present as current.
+func stale(at time.Time) bool {
+	return !at.IsZero() && time.Since(at) >= sensorStaleAfter
+}
 
 // ringWidth is how wide to make a round gauge that is h rows tall.
 //
@@ -60,7 +108,7 @@ func kvRows(cv *ui.Canvas, r ui.Rect, y int, rows [][2]string, t *Theme, fg func
 // ---------------------------------------------------------------- mining
 
 func panelMining(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "MINING PERFORMANCE", Mark: "◈"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "MINING PERFORMANCE", Mark: markMining})
 	if in.Empty() {
 		return
 	}
@@ -72,8 +120,24 @@ func panelMining(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
 	}
 	num, unit := ui.SplitRate(s.Hashrate)
 
-	if in.H >= 5 && in.W >= 30 {
-		w := ui.BigText(cv, in.X, y, num, ui.Style{FG: t.Accent, Bold: true})
+	// How many hashing sources the split has to show, decided before the
+	// headline is drawn because it is what decides whether there is room for
+	// the headline at all.
+	//
+	// The big numerals cost four rows. Spending them and then running out
+	// before the GPU row is the worst of both: a panel that looks impressive
+	// and has silently dropped the one figure that says the card is alive.
+	// So on a short panel the headline gives way and the sources are drawn.
+	nSources := 1
+	if s.GPUs > 0 || s.GPURate > 0 {
+		nSources = 2
+	}
+
+	if in.H >= 4+nSources && in.W >= 30 {
+		// The headline carries the gradient, and it is the only number on the
+		// screen that does. That is the point of it: one figure answers "is
+		// this machine working", and it should be findable without reading.
+		w := ui.BigTextGradient(cv, in.X, y, num, t)
 		cv.Text(in.X+w+2, y+2, unit, ui.Style{FG: t.Accent})
 		// The state sits at the top right of the headline, where it is read in
 		// the same glance as the number it qualifies.
@@ -149,12 +213,20 @@ func panelMining(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
 		pct := row.rate / total
 		head := fmt.Sprintf("%s %s", row.name, ui.HumanRate(row.rate))
 		share := fmt.Sprintf("%.0f%%", pct*100)
-		if hw := in.W - ui.Width(share) - 1; hw > 0 {
+		// The share is set in a filled chip rather than as bare text. It is
+		// the only number on the row that is a proportion rather than a rate,
+		// and a chip says that faster than a per-cent sign does.
+		shareW := ui.Width(share) + 2
+		if hw := in.W - shareW - 1; hw > 0 {
 			cv.TextIn(in.X, y, hw, head, ui.Style{FG: t.Muted})
 		}
-		cv.TextRight(in.Right(), y, share, ui.Style{FG: row.fg})
+		chip := ui.Style{FG: row.fg, BG: t.SelBG, Bold: true}
+		for i := 0; i < shareW; i++ {
+			cv.Set(in.Right()-shareW+i, y, ' ', chip)
+		}
+		cv.Text(in.Right()-shareW+1, y, share, chip)
 
-		inline := in.W - ui.Width(head) - ui.Width(share) - 4
+		inline := in.W - ui.Width(head) - shareW - 4
 		switch {
 		case ownRow:
 			y++
@@ -193,15 +265,35 @@ func panelMining(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
 
 // ---------------------------------------------------------------- history
 
-func panelHistory(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "HASHRATE HISTORY", Mark: "◈", Right: "5 MIN"})
+func panelHistory(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, sel int) {
+	sel = clampRange(sel)
+	win := histRanges[sel]
+
+	// The range strip is drawn over the top border after the panel is built,
+	// because it is wider than a PanelOpts.Right label and it has a selected
+	// state a plain string cannot carry. Where there is no room for the strip
+	// the panel falls back to naming the window it is showing, which is the
+	// one thing the strip has to communicate.
+	tabsW := 0
+	for _, l := range rangeLabels {
+		tabsW += ui.Width(l) + 2
+	}
+	right := ""
+	if r.W < tabsW+ui.Width("HASHRATE HISTORY")+10 {
+		tabsW, right = 0, win.label
+	}
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "HASHRATE HISTORY", Mark: markHistory, Right: right})
 	if in.Empty() {
 		return
+	}
+	if tabsW > 0 {
+		ui.Tabs(cv, r.Right()-2-tabsW, r.Y, rangeLabels, sel, t)
 	}
 	// Chart wants four rows: an axis, and a plot with something in it. Handed
 	// three it draws nothing, and an empty bordered box reads as a panel that
 	// has failed rather than one that was given three rows -- so below that
 	// the panel changes shape instead of going blank.
+	vals := win.pick(s)
 	if in.H < 4 || in.W < 10 {
 		y := in.Y
 		if in.W >= 24 {
@@ -210,27 +302,23 @@ func panelHistory(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 			y++
 		}
 		if y < in.Bottom() {
-			ui.Spectrum(cv, ui.Rect{X: in.X, Y: y, W: in.W, H: in.Bottom() - y}, s.History, t, t.Accent)
+			ui.Spectrum(cv, ui.Rect{X: in.X, Y: y, W: in.W, H: in.Bottom() - y}, vals, t, t.Accent)
 		}
 		return
 	}
 
-	// No area fill. On a machine holding a steady rate the trace sits near the
-	// top of the plot, so the fill would be most of the panel and the shape --
-	// the thing the chart is for -- would be the boundary of a large solid
-	// block rather than a line.
 	ui.Chart(cv, in, t, ui.ChartOpts{
-		Values:  s.History,
-		XLabels: []string{"5m", "4m", "3m", "2m", "1m", "Now"},
+		Values:  vals,
+		XLabels: win.xaxis,
 		Fill:    in.H >= 6,
-		Empty:   "collecting samples…",
+		Empty:   "collecting " + win.label + " samples…",
 	})
 }
 
 // ---------------------------------------------------------------- network
 
 func panelNetwork(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "NETWORK STATUS", Mark: "◈"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "NETWORK STATUS", Mark: markNetwork})
 	if in.Empty() {
 		return
 	}
@@ -240,8 +328,30 @@ func panelNetwork(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
 	text := in
 	if in.W >= 52 && in.H >= 6 {
 		gw := ringWidth(in.H, 20)
-		globe := ui.Rect{X: in.Right() - gw, Y: in.Y, W: gw, H: in.H}
+		// A caption under the globe, at whatever length the rows allow. A
+		// turning wireframe sphere with no words beside it is decoration; with
+		// them it is a statement about what the network is.
+		//
+		// The rows come out of the globe, so the caption is only taken as far
+		// as the sphere can afford: four lines on a tall panel, one on a
+		// short one, none at all when the globe would be left too small to
+		// turn convincingly.
+		caption := []string(nil)
+		switch {
+		case in.H >= 11 && gw >= 14:
+			caption = []string{"DERO", "GLOBAL", "PRIVATE", "DECENTRALISED"}
+		case in.H >= 8 && gw >= 14:
+			caption = []string{"DERO · PRIVATE"}
+		}
+		globe := ui.Rect{X: in.Right() - gw, Y: in.Y, W: gw, H: in.H - len(caption)}
 		ui.Globe(cv, globe, t, float64(frame)*0.05)
+		for i, l := range caption {
+			st := ui.Style{FG: t.Muted}
+			if i == 0 && len(caption) > 1 {
+				st = ui.Style{FG: t.Accent2, Bold: true}
+			}
+			cv.TextCenter(in.Right()-gw, globe.Bottom()+i, gw, ui.Clip(l, gw), st)
+		}
 		text = ui.Rect{X: in.X, Y: in.Y, W: in.W - gw - 2, H: in.H}
 	}
 
@@ -299,7 +409,8 @@ func shareDiffText(s Snapshot) string {
 // ---------------------------------------------------------------- cpu
 
 func panelCPU(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "CPU PERFORMANCE", Mark: "◈"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "CPU PERFORMANCE", Mark: markCPU,
+		Right: ui.HumanRate(cpuRow(s).Rate)})
 	if in.Empty() {
 		return
 	}
@@ -317,6 +428,13 @@ func panelCPU(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 	loadText := ui.NA
 	if s.Sys.HaveLoad {
 		loadText = fmt.Sprintf("%.0f%%", s.Sys.LoadPct)
+	}
+	if stale(s.Sys.At) {
+		// The gauge is left where it was and the reading says why. Zeroing it
+		// would be inventing a measurement; hiding it would lose the last one
+		// that was real.
+		loadText = ui.NA
+		load = 0
 	}
 
 	text := body
@@ -343,7 +461,7 @@ func panelCPU(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 	}
 	rows := [][2]string{
 		{"THREADS", fmt.Sprint(s.Threads)},
-		{"TEMP", tempOr(cpu.TempC)},
+		{"TEMP", tempOr(cpu.TempC) + staleMark(s.Sensors.At)},
 		{"FREQ", freq},
 		// No platform this runs on exposes a package power figure without a
 		// kernel driver, so this is honest rather than absent: the row is worth
@@ -365,13 +483,17 @@ func panelCPU(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 
 // ---------------------------------------------------------------- gpu
 
-func panelGPU(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
+func panelGPU(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, sel int) {
 	gpus := gpuRows(s)
-	right := ""
-	if len(gpus) > 1 {
-		right = fmt.Sprintf("%d DEVICES", len(gpus))
+	right := ui.HumanRate(s.GPURate)
+	if n := len(gpus); n > 1 {
+		// The header carries the selected card's own detail, because on a rig
+		// the rows below are a comparison and the header is the only place
+		// with room to say anything about one device in particular. It is
+		// also what makes the G key visibly do something.
+		right = fmt.Sprintf("%d DEVICES · %s%s", n, right, gpuDetail(s, ((sel%n)+n)%n))
 	}
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "GPU PERFORMANCE", Mark: "◈", Right: right})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "GPU PERFORMANCE", Mark: markGPU, Right: right})
 	if in.Empty() {
 		return
 	}
@@ -388,7 +510,7 @@ func panelGPU(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 	// than useless: it averages away the one card that has stopped, which is
 	// the entire reason to look at this panel.
 	if len(gpus) > 1 {
-		panelGPUList(cv, in, gpus, s, t)
+		panelGPUList(cv, in, gpus, s, t, sel)
 		return
 	}
 
@@ -442,10 +564,16 @@ func panelGPU(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 		}
 	}
 	rows := [][2]string{
-		{"TEMP", tempOr(g.TempC)},
+		{"TEMP", tempOr(g.TempC) + staleMark(s.Sensors.At)},
 		{"VRAM", vram},
 		{"CLOCK", clock},
 		{"POWER", power},
+	}
+	// The card's own name, where the panel is wide enough for it to be worth
+	// more than the row it costs. On a single-card machine it is the one thing
+	// on this panel that says which machine you are looking at.
+	if sensor != nil && sensor.Name != "" && text.W >= 30 && text.Bottom()-y > len(rows) {
+		rows = append(rows, [2]string{"DEVICE", sensor.Name})
 	}
 	colours := func(i int) string {
 		if i == 0 {
@@ -462,7 +590,10 @@ func panelGPU(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 
 // panelGPUList is the multi-card view: a row per device, sized so a six-card
 // rig still fits.
-func panelGPUList(cv *ui.Canvas, in ui.Rect, gpus []DeviceStat, s Snapshot, t *Theme) {
+func panelGPUList(cv *ui.Canvas, in ui.Rect, gpus []DeviceStat, s Snapshot, t *Theme, sel int) {
+	if len(gpus) > 0 {
+		sel = ((sel % len(gpus)) + len(gpus)) % len(gpus)
+	}
 	peak := 0.0
 	for _, g := range gpus {
 		if g.Rate > peak {
@@ -489,9 +620,17 @@ func panelGPUList(cv *ui.Canvas, in ui.Rect, gpus []DeviceStat, s Snapshot, t *T
 		noteAt := in.Right() - noteW
 		tempAt := noteAt - tempW
 		rateAt := tempAt - rateW
-		cv.TextIn(in.X, y, 6, g.Label, ui.Style{FG: t.Muted})
+		label := ui.Style{FG: t.Muted}
+		if i == sel {
+			// The selected card is the one the G key steps through. On a rig
+			// the rows are otherwise interchangeable, and a caret costs one
+			// cell to say which one a per-device figure elsewhere refers to.
+			label = ui.Style{FG: t.Accent, Bold: true}
+			cv.Set(in.X-1, y, ui.Caret, ui.Style{FG: t.Accent})
+		}
+		cv.TextIn(in.X, y, 6, g.Label, label)
 		if barW := rateAt - in.X - 8; barW > 4 {
-			ui.DrawBar(cv, in.X+7, y, barW, g.Rate/peak, fg, t.Dim)
+			ui.DrawBar(cv, in.X+7, y, barW, g.Rate/peak, fg, t.Track)
 		}
 		cv.TextRight(rateAt+rateW-1, y, ui.HumanRate(g.Rate), ui.Style{FG: t.Text})
 		cv.TextRight(tempAt+tempW-1, y, tempOr(g.TempC), ui.Style{FG: ui.TempColour(t, g.TempC)})
@@ -506,7 +645,7 @@ func panelGPUList(cv *ui.Canvas, in ui.Rect, gpus []DeviceStat, s Snapshot, t *T
 // ---------------------------------------------------------------- shares
 
 func panelShares(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "SHARE STATS", Mark: "◈", Right: "ALL TIME"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "SHARE STATS", Mark: markShares, Right: "ALL TIME"})
 	if in.Empty() {
 		return
 	}
@@ -560,12 +699,21 @@ func panelShares(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 		if l.value == ui.NA {
 			fg = t.Dim
 		}
+		// A colour swatch in front of each label, matching the ring beside it.
+		// Four counts in four colours is a legend whether or not it is drawn
+		// as one, and drawing it as one is what makes the ring readable.
+		x := text.X
+		swW := 0
+		if text.W >= 22 {
+			swW = ui.Swatch(cv, x, y, fg) + 1
+			x += swW
+		}
 		// The same rule ui.Row applies, by hand because these labels carry a
 		// colour of their own. Writing the label unbounded and then painting
 		// the value over it, which is what this did, produced rows reading
 		// "ACCEP1,245  (99.0%)".
-		if lw := text.W - ui.Width(l.value) - 1; lw >= ui.MinLabel {
-			cv.TextIn(text.X, y, lw, l.label, ui.Style{FG: fg})
+		if lw := text.W - swW - ui.Width(l.value) - 1; lw >= ui.MinLabel {
+			cv.TextIn(x, y, lw, l.label, ui.Style{FG: fg})
 		}
 		cv.TextRight(text.Right(), y, ui.Clip(l.value, text.W), ui.Style{FG: fg})
 		y++
@@ -581,6 +729,37 @@ func panelShares(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 	}, t, nil)
 }
 
+// gpuDetail is the selected card's clock and power, for the multi-device
+// header. Empty when nothing is known about it, rather than a row of dashes:
+// the header is not a table and a dash there reads as a broken value.
+func gpuDetail(s Snapshot, sel int) string {
+	rows := gpuRows(s)
+	if sel < 0 || sel >= len(rows) {
+		return ""
+	}
+	out := "  ·  " + rows[sel].Label
+	var g *GPUSensor
+	for i := range s.Sensors.GPUs {
+		if "GPU "+strconv.Itoa(s.Sensors.GPUs[i].Index) == rows[sel].Label {
+			g = &s.Sensors.GPUs[i]
+			break
+		}
+	}
+	if g == nil {
+		return out
+	}
+	if g.HaveClock {
+		out += fmt.Sprintf(" · %d MHz", g.ClockMHz)
+	}
+	if g.HavePower {
+		out += fmt.Sprintf(" · %.0f W", g.PowerW)
+	}
+	if g.HaveMem && g.MemTotalMB > 0 {
+		out += fmt.Sprintf(" · %.1f/%.1f GB", float64(g.MemUsedMB)/1024, float64(g.MemTotalMB)/1024)
+	}
+	return out
+}
+
 func sharesPerMin(s Snapshot) string {
 	if s.Uptime < 10*time.Second || s.Submitted == 0 {
 		return ui.NA
@@ -590,16 +769,24 @@ func sharesPerMin(s Snapshot) string {
 
 // ---------------------------------------------------------------- blockchain
 
-func panelBlockchain(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "BLOCKCHAIN STATUS", Mark: "◈"})
+func panelBlockchain(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "BLOCKCHAIN STATUS", Mark: markChain})
 	if in.Empty() {
 		return
 	}
 
 	text := in
-	if aw := ui.ArtWidth(ui.CubeArt); in.W >= aw+24 && in.H >= len(ui.CubeArt) {
-		ui.DrawArt(cv, in.X, in.Y+(in.H-len(ui.CubeArt))/2, ui.CubeArt, ui.Shade(t), t.Accent2)
-		text = ui.Rect{X: in.X + aw + 2, Y: in.Y, W: in.W - aw - 2, H: in.H}
+	// A turning wire block rather than the old shaded lump. It is the one
+	// piece of artwork on the screen that is also a statement of what the
+	// panel is about, and at twelve cells wide the wireframe reads as a block
+	// where a solid reads as a smudge.
+	//
+	// It turns at a fifth of the frame rate. A cube spinning eight times a
+	// second beside a column of figures is a distraction; one that moves
+	// visibly but slowly is a sign of life.
+	if cw := 13; in.W >= cw+24 && in.H >= 5 {
+		ui.WireCube(cv, ui.Rect{X: in.X, Y: in.Y, W: cw, H: in.H}, t, float64(frame)*0.035)
+		text = ui.Rect{X: in.X + cw + 2, Y: in.Y, W: in.W - cw - 2, H: in.H}
 	}
 
 	netDiff, interval := ui.NA, ui.NA
@@ -637,7 +824,7 @@ func panelBlockchain(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 // ---------------------------------------------------------------- system
 
 func panelSystem(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "SYSTEM OVERVIEW", Mark: "◈"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "SYSTEM OVERVIEW", Mark: markSystem})
 	if in.Empty() {
 		return
 	}
@@ -800,16 +987,41 @@ func tileMemory(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 
 // ---------------------------------------------------------------- log
 
-func panelLog(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, scroll int) {
+func panelLog(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, v logView) {
+	// The header says what the view is doing, and only when it is doing
+	// something. A log that is simply following the newest line needs no
+	// annotation; one that is paused, scrolled or filtered absolutely does,
+	// because all three look identical to a log that has gone quiet.
 	right := ""
-	if scroll > 0 {
-		right = fmt.Sprintf("↑ %d", scroll)
+	switch {
+	case v.scroll > 0:
+		right = fmt.Sprintf("↑ %d  PAUSED", v.scroll)
+	case v.paused:
+		right = "PAUSED"
 	}
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "LIVE MINING LOG", Mark: "◈", Right: right})
+	if v.min != LogInfo || v.text != "" {
+		if right != "" {
+			right += "  ·  "
+		}
+		right += v.filterName()
+	}
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "LIVE MINING LOG", Mark: markLog, Right: right,
+		Accent: logAccent(t, right)})
 	if in.Empty() {
 		return
 	}
-	drawLogLines(cv, in, s.Log, t, scroll)
+	drawLogLines(cv, in, v.apply(nil, s.Log), t, v.scroll)
+}
+
+// logAccent brightens the log panel's border while it is not simply
+// following. It is the cheapest possible answer to "why has the log stopped",
+// which is otherwise a question someone asks for a minute before noticing
+// they left it paused.
+func logAccent(t *Theme, right string) string {
+	if right == "" {
+		return ""
+	}
+	return t.Warn
 }
 
 // drawLogLines renders the newest entries that fit, newest at the top.
@@ -894,7 +1106,8 @@ func levelColour(t *Theme, l LogLevel) string {
 
 func panelThreads(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 	in := ui.Panel(cv, r, t, ui.PanelOpts{
-		Title: "ACTIVE THREADS", Mark: "◈", Right: fmt.Sprintf("%d CPU", s.Threads)})
+		Title: "ACTIVE THREADS", Mark: markThreads,
+		Right: fmt.Sprintf("%d CPU", s.Threads)})
 	if in.Empty() {
 		return
 	}
@@ -957,7 +1170,12 @@ func drawThreadGrid(cv *ui.Canvas, in ui.Rect, s Snapshot, t *Theme) {
 			frac = s.ThreadRates[i] / peak
 			text = fmt.Sprintf("%3.0f%%", frac*100)
 		}
-		fg := t.Accent
+		// The healthy case is coloured along the wordmark gradient by slot
+		// number, which is what turns a column of identical bars into
+		// something the eye can count along. A thread that has fallen behind
+		// leaves the gradient for the warning colours, so the exception is
+		// still the only thing on the panel that is not cyan-to-violet.
+		fg := t.Ramp(float64(i) / float64(maxInt(n-1, 1)))
 		if peak > 0 && frac < 0.8 {
 			fg = t.Warn
 		}
@@ -967,7 +1185,7 @@ func drawThreadGrid(cv *ui.Canvas, in ui.Rect, s Snapshot, t *Theme) {
 		label := fmt.Sprintf("T%02d", i+1)
 		cv.Text(x, y, label, ui.Style{FG: t.Muted})
 		if barW := cellW - len(label) - 7; barW > 2 {
-			ui.DrawBar(cv, x+len(label)+1, y, barW, frac, fg, t.Dim)
+			ui.DrawBar(cv, x+len(label)+1, y, barW, frac, fg, t.Track)
 		}
 		cv.TextRight(x+cellW-1, y, text, ui.Style{FG: t.Text})
 	}
@@ -981,7 +1199,7 @@ func drawThreadGrid(cv *ui.Canvas, in ui.Rect, s Snapshot, t *Theme) {
 // ---------------------------------------------------------------- status
 
 func panelStatus(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "MINING STATUS", Mark: "◈"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "MINING STATUS", Mark: markStorm})
 	if in.Empty() {
 		return
 	}
@@ -989,10 +1207,16 @@ func panelStatus(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
 	active := s.State == StateMining
 
 	if in.W >= 24 && in.H >= 4 {
-		// The swirl is drawn first and the words over it, so the text stays
-		// readable and the artwork reads as being behind the panel rather than
-		// beside it.
-		ui.Storm(cv, in, t, float64(frame)*0.06, active)
+		// A wire ridgeline rather than the spiral this used to draw. The
+		// spiral said "something is turning"; the ridge says what the program
+		// is called, and the caption over it lands on a horizon instead of in
+		// the middle of a vortex.
+		ui.RidgeWire(cv, in, t, 0.9)
+		if in.W >= 40 && in.H >= 6 {
+			mw := ui.ArtWidth(ui.DeroMarkSmall)
+			ui.DrawArt(cv, in.X+(in.W-mw)/2, in.Y, ui.DeroMarkSmall,
+				ui.ArtPalette{}, t.Accent)
+		}
 	}
 
 	// Each line of text clears its own row before it is written. The swirl is
@@ -1040,7 +1264,7 @@ func engineWord(active bool) string {
 // ---------------------------------------------------------------- quick
 
 func panelQuick(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "QUICK STATS", Mark: "◈"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "QUICK STATS", Mark: markQuick})
 	if in.Empty() {
 		return
 	}
@@ -1075,26 +1299,52 @@ func panelQuick(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme) {
 // ---------------------------------------------------------------- connection
 
 func panelConnection(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) {
-	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "CONNECTION", Mark: "◈"})
+	in := ui.Panel(cv, r, t, ui.PanelOpts{Title: "CONNECTION", Mark: markConn})
 	if in.Empty() {
 		return
 	}
 	bars := signalBars(s)
 	ok := bars > 0
 	colour, label := connLabel(s, t)
+	ping := ui.NA
+	if s.Info.OK {
+		ping = fmt.Sprintf("%d ms", s.Info.Latency.Milliseconds())
+	}
 
 	// The mast needs five rows to be a mast. Below that the panel drops it and
 	// spends the rows on the latency and peer count instead, which is more use
 	// than a two-row drawing of an aerial.
 	if in.W >= 10 && in.H >= len(ui.MastArt)+3 {
-		ui.Mast(cv, ui.Rect{X: in.X, Y: in.Y, W: in.W, H: in.H - 2}, t, bars, frame, ok)
-		y := in.Bottom() - 2
-		cv.Text(in.X, y, "SIGNAL", ui.Style{FG: t.Muted})
-		if in.W >= 14 {
-			ui.SignalBars(cv, in.Right()-5, y, bars, t)
+		// The aerial on the left and the strength meter on the right, which is
+		// the arrangement that lets the two words underneath -- how good, how
+		// far away -- sit under the thing each of them describes.
+		// The aerial on the left and the strength meter on the right, so the
+		// two words under them -- how strong, how far -- each sit under the
+		// thing they describe. Both need five rows to be worth drawing, which
+		// is what decides how many rows are left for the words.
+		artH := in.H - 2
+		if artH > len(ui.MastArt)+3 {
+			artH = len(ui.MastArt) + 3
 		}
-		cv.TextCenter(in.X, in.Bottom()-1, in.W, signalWord(bars),
-			ui.Style{FG: signalColour(t, bars), Bold: true})
+		artW := in.W
+		if in.W >= 22 {
+			artW = in.W / 2
+			ui.SignalRamp(cv, ui.Rect{X: in.X + artW, Y: in.Y, W: in.W - artW, H: artH}, bars, t, ok)
+		}
+		ui.Mast(cv, ui.Rect{X: in.X, Y: in.Y, W: artW, H: artH}, t, bars, frame, ok)
+
+		y := in.Bottom() - 2
+		if in.W >= 22 {
+			cv.TextCenter(in.X, y, artW, "SIGNAL", ui.Style{FG: t.Muted})
+			cv.TextCenter(in.X+artW, y, in.W-artW, signalWord(bars),
+				ui.Style{FG: signalColour(t, bars), Bold: true})
+			ui.Row(cv, in, in.Bottom()-1, "PING", ping, t, t.Text)
+		} else {
+			cv.Text(in.X, y, "SIGNAL", ui.Style{FG: t.Muted})
+			ui.SignalBars(cv, in.Right()-5, y, bars, t)
+			cv.TextCenter(in.X, in.Bottom()-1, in.W, signalWord(bars),
+				ui.Style{FG: signalColour(t, bars), Bold: true})
+		}
 		return
 	}
 
@@ -1107,20 +1357,24 @@ func panelConnection(cv *ui.Canvas, r ui.Rect, s Snapshot, t *Theme, frame int) 
 		ui.SignalBars(cv, in.Right()-5, y, bars, t)
 		y++
 	}
-	latency, peers := ui.NA, ui.NA
+	peers := ui.NA
 	if s.Info.OK {
-		latency = fmt.Sprintf("%d ms", s.Info.Latency.Milliseconds())
 		peers = fmt.Sprint(s.Info.Peers)
 	}
-	kvRows(cv, ui.Rect{X: in.X, Y: y, W: in.W, H: in.Bottom() - y - 1}, y, [][2]string{
-		{"LATENCY", latency},
-		{"PEERS", peers},
-		{"LAST JOB", naDur(s.LastJob)},
-	}, t, nil)
-	if in.H >= 4 {
+	// The strength word only gets its own row when there is one to spare.
+	// Below that the rows go to the figures, because "GOOD" is a summary of
+	// the ping and the ping is the thing worth reading.
+	rows := ui.Rect{X: in.X, Y: y, W: in.W, H: in.Bottom() - y}
+	if in.H >= 5 {
+		rows.H--
 		cv.TextCenter(in.X, in.Bottom()-1, in.W, signalWord(bars),
 			ui.Style{FG: signalColour(t, bars), Bold: true})
 	}
+	kvRows(cv, rows, y, [][2]string{
+		{"PING", ping},
+		{"PEERS", peers},
+		{"LAST JOB", naDur(s.LastJob)},
+	}, t, nil)
 }
 
 func signalColour(t *Theme, bars int) string {

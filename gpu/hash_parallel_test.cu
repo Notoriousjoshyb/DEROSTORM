@@ -50,6 +50,12 @@
 #ifndef DESC_PREFER_SHARED
 #define DESC_PREFER_SHARED 1
 #endif
+// Shared-memory carveout for the suffix kernel, percent. -1 leaves the
+// preference untouched (the cudaFuncCachePreferShared above rules); otherwise
+// the fine-grained carveout overrides it. Swept with -DHP_CARVEOUT=.
+#ifndef HP_CARVEOUT
+#define HP_CARVEOUT -1
+#endif
 
 struct Pool {
     int32_t*  words;      // 8 int32 arrays per block, back to back
@@ -238,6 +244,14 @@ int main(int argc, char** argv)
 #elif DESC_PREFER_SHARED
     CK(cudaFuncSetCacheConfig(suffix_kernel, cudaFuncCachePreferShared));
 #endif
+#if HP_CARVEOUT >= 0
+    CK(cudaFuncSetAttribute(suffix_kernel,
+                            cudaFuncAttributePreferredSharedMemoryCarveout, HP_CARVEOUT));
+#endif
+    // Stage 1 sizes its tile by S1_BLOCK at launch; past 48 KB that needs the
+    // same opt-in the suffix kernel gets above. A no-op for the small cells.
+    CK(cudaFuncSetAttribute(stage1_kernel,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * S1_STRIDE));
 
     size_t freeB, totB; CK(cudaMemGetInfo(&freeB, &totB));
     size_t budget = freeB > (size_t)1500e6 ? freeB - (size_t)1500e6 : 0;
