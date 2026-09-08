@@ -135,7 +135,12 @@ What to report if something goes wrong:
   for this rig's ROCm generation, or the HIP runtime is not installed. From
   1.7.3 `--gpu=all` says which: the error carries what each backend reported,
   and an unresolved `libamdhip64.so.N` names the generation that is missing.
-  `ls /opt/rocm/lib/libamdhip64.so.*` says which one the rig has.
+  `ls /opt/rocm/lib/libamdhip64.so.*` says which one the rig has. A binary
+  built from source on a machine that *has* the runtime but never ran
+  `gpu/buildlib_hip.sh` now says so directly: "no kernels for the ROCm N
+  runtime installed here — run `sh gpu/buildlib_hip.sh` and rebuild". This is
+  what a Strix Halo (Radeon 8060S, gfx1151) owner hit as an unusable-HIP-runtime
+  message: the runtime was fine, the kernels were simply not in that build.
 - **A wrong hash** — the interesting one. `gpu/gpuapi.cuh` has a
   `DSG_BYTE_PERM_FALLBACK` switch (build with `-DDSG_BYTE_PERM_FALLBACK=1`) that
   replaces the one intrinsic whose AMD semantics were taken on trust with a slow

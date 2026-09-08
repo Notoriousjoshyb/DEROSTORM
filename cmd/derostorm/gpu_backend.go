@@ -67,6 +67,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -348,6 +350,47 @@ func gpuDeviceList() []gpuDevice {
 // Zero is not an error: it just means this machine mines on the CPU.
 func GPUDeviceCount() int { return len(gpuDeviceList()) }
 
+// amdRuntimeMajor is the ROCm runtime generation installed on this machine --
+// the highest major of libamdhip64.so.N in the usual places -- or zero when
+// there is none. A directory listing rather than a dlopen of the soname on
+// purpose: dlopen is the exact truth but drags the runtime into a process that
+// is about to print a message and exit, and the listing cannot fail.
+//
+// Linux only. On Windows the runtime ships inside the Adrenalin driver under a
+// different name (amdhip64_6.dll) and the HIP library is one candidate that is
+// either embedded or not, so the generic message is right there.
+func amdRuntimeMajor() int {
+	if runtime.GOOS != "linux" {
+		return 0
+	}
+	dirs := []string{
+		"/opt/rocm/lib", "/usr/lib", "/usr/lib64",
+		"/usr/lib/x86_64-linux-gnu", "/usr/local/lib",
+	}
+	if p := os.Getenv("ROCM_PATH"); p != "" {
+		dirs = append([]string{filepath.Join(p, "lib")}, dirs...)
+	}
+	best := 0
+	for _, dir := range dirs {
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range ents {
+			rest, ok := strings.CutPrefix(e.Name(), "libamdhip64.so.")
+			if !ok {
+				continue
+			}
+			n, err := strconv.Atoi(rest)
+			if err != nil || n <= best {
+				continue
+			}
+			best = n
+		}
+	}
+	return best
+}
+
 // GPUBackendStatus is one line per vendor saying what happened when its library
 // was loaded, for the message a user sees when they asked for a GPU and got
 // none.
@@ -362,6 +405,23 @@ func GPUBackendStatus() []string {
 	for _, b := range gpuBackends {
 		switch {
 		case errors.Is(b.err, errLibAbsent):
+			// Two ways to arrive here, and only one is the user's problem.
+			// No runtime at all means ROCm is not installed and the generic
+			// line is right as it stands. A runtime with no kernels in the
+			// build means whoever compiled this binary skipped the HIP
+			// library -- the ordinary outcome of building from source on a
+			// machine that never ran gpu/buildlib_hip.sh, and one this rig
+			// can fix for itself. Saying so is the difference between "no
+			// card" and "rebuild", which is what a Strix Halo owner got as
+			// "no usable HIP runtime" from a build that had the runtime all
+			// along.
+			if b == hipBackend {
+				if maj := amdRuntimeMajor(); maj > 0 {
+					out = append(out, fmt.Sprintf("%s: no kernels for the ROCm %d runtime installed here -- "+
+						"run `sh gpu/buildlib_hip.sh` and rebuild the miner to add them", b.kind, maj))
+					continue
+				}
+			}
 			out = append(out, b.kind+": no library in this build")
 		case b.err != nil:
 			out = append(out, b.kind+": "+b.err.Error())
