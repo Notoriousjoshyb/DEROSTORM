@@ -456,9 +456,8 @@ func sortDesc(a, b []desc, count int) []desc {
 	var hist [rpass][rbins]uint32
 	for i := 0; i < count; i++ {
 		k := a[i].key
-		for p := 0; p < rpass; p++ {
-			hist[p][(k>>shift[p])&rmask]++
-		}
+		hist[0][k&rmask]++
+		hist[1][(k>>rbits)&rmask]++
 	}
 	for p := 0; p < rpass; p++ {
 		sum := uint32(0)
@@ -470,10 +469,12 @@ func sortDesc(a, b []desc, count int) []desc {
 	}
 	for p := 0; p < rpass; p++ {
 		sh := shift[p]
+		hp := &hist[p]
 		for i := 0; i < count; i++ {
-			slot := hist[p][(a[i].key>>sh)&rmask]
-			hist[p][(a[i].key>>sh)&rmask]++
-			b[int(slot)] = a[i]
+			ai := a[i]
+			slot := hp[(ai.key>>sh)&rmask]
+			hp[(ai.key>>sh)&rmask] = slot + 1
+			b[slot] = ai
 		}
 		a, b = b, a
 	}
@@ -591,6 +592,36 @@ retry:
 		}
 		if need > groupCap || (j-i) > groupCap {
 			return false
+		}
+		// Two lists can merge directly from the arena into their final output.
+		// Avoid gathering, boundary tables, and a second copy through scratch.
+		if j-i == 2 {
+			d1 := ds[i+1]
+			a := s.arena[int(off(d0)) : int(off(d0))+int(dlen(d0))]
+			b := s.arena[int(off(d1)) : int(off(d1))+int(dlen(d1))]
+			ca, cb := d0.key>>24, d1.key>>24
+			pa, pb := 0, 0
+			for pa < len(a) && pb < len(b) {
+				va, vb := a[pa]+ca, b[pb]+cb
+				if suffixLessFrom(text, n, vb, va, keyBytes) {
+					sa[out] = int32(vb)
+					pb++
+				} else {
+					sa[out] = int32(va)
+					pa++
+				}
+				out++
+			}
+			for ; pa < len(a); pa++ {
+				sa[out] = int32(a[pa] + ca)
+				out++
+			}
+			for ; pb < len(b); pb++ {
+				sa[out] = int32(b[pb] + cb)
+				out++
+			}
+			i = j
+			continue
 		}
 		a, b := s.merge, s.merge2
 		ba, bb := s.bnd, s.bnd2

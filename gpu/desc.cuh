@@ -554,7 +554,8 @@ typedef int32_t DescOrd;
 
 // Touch the whole text before the column walk's scattered loads. A PTX
 // L2 prefetch per 64-byte sector beat a coalesced byte touch by ~1% at 336
-// on a 5080, and a 64-byte stride beat 128 by a fraction more.
+// on a 5080, and a 32-byte stride then beat 64 by ~+0.3% at 336/504 (three
+// warmed interleaved 5-round sets, 23 of 26 pairs positive); 16 no better.
 #ifndef DESC_PREFETCH_TEXT
 #define DESC_PREFETCH_TEXT 1
 #endif
@@ -565,7 +566,7 @@ typedef int32_t DescOrd;
 #define DESC_PREFETCH_L1 0
 #endif
 #ifndef DESC_PREFETCH_STRIDE
-#define DESC_PREFETCH_STRIDE 64
+#define DESC_PREFETCH_STRIDE 32
 #endif
 
 // Copy the ~69 KB text into dynamic shared so the walk and merge hit SMEM
@@ -1043,37 +1044,98 @@ __device__ __forceinline__ uint32_t descBucketSub(uint32_t* a, int b)
     return (atomicSub(a + (b >> 1), 1u << shift) >> shift) & 0xffffu;
 }
 
-// Inclusive scan of the packed counters. One warp gives each lane a contiguous
-// 64-bucket slice, scans the 32 slice totals with shuffles, then revisits its
-// slice to write the prefixes.
-__device__ int descBucketScan(uint32_t* a, BlockRadixScratch* sh)
+// Each thread scans a contiguous slice, then the warp totals connect them.
+// Using the whole block avoids the 32-way shared-bank conflicts of 32 lanes
+// each walking 32 packed words at the shipped eleven-bit bucket width.
+// Complete searches on an RTX 5080 measured +0.8% at 16,384 hashes per batch
+// (five interleaved visits, 336 and 504 grid blocks).
+__device__ void descBucketScan(uint32_t* a, BlockRadixScratch* sh)
 {
     const int tid = threadIdx.x;
-    if (tid < 32) {
-        const int first = tid * (DESC_MSD_BINS / 64);
-        int total = 0;
-        for (int k = 0; k < DESC_MSD_BINS / 64; k++) {
-            const uint32_t w = a[first + k];
-            total += (int)(w & 0xffffu) + (int)(w >> 16);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int first = tid * (DESC_MSD_BINS / 2) / BR_BLOCK;
+    const int last = (tid + 1) * (DESC_MSD_BINS / 2) / BR_BLOCK;
+    int total = 0;
+    for (int k = first; k < last; k++) {
+        const uint32_t w = a[k];
+        total += (int)(w & 0xffffu) + (int)(w >> 16);
+    }
+    int inclusive = total;
+    for (int off = 1; off < 32; off <<= 1) {
+        const int v = DSG_SHFL_UP(inclusive, off);
+        if (lane >= off) inclusive += v;
+    }
+    if (lane == 31) sh->warpScan[warp] = inclusive;
+    __syncthreads();
+    int run = inclusive - total;
+    for (int w = 0; w < warp; w++) run += sh->warpScan[w];
+    for (int k = first; k < last; k++) {
+        const uint32_t w = a[k];
+        run += (int)(w & 0xffffu);
+        const uint32_t lo = (uint32_t)run;
+        run += (int)(w >> 16);
+        a[k] = lo | ((uint32_t)run << 16);
+    }
+    // The caller's barrier publishes these prefixes with the terminal cursor.
+}
+// Fused length-store + inclusive scan for step 4 (see step 4).
+//
+// The lengths live in the low DESC_LEN_BITS of the sorted descriptor words, so
+// this reads them there instead of a separate pass that first stores them to
+// offs and rereads them. Saves one full write plus one full read of nd words
+// and the store loop's barrier. The values written to offs[i] are exactly
+// blockScanFlags' inclusive scan: same tile width, same warp scan, same carry
+// handling, only the source differs.
+__device__ void descScanLens(const uint64_t* __restrict__ sorted,
+                             int32_t* __restrict__ offs, int n,
+                             BlockRadixScratch* sh)
+{
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int tile = BR_BLOCK * BR_SCAN_ITEMS;
+
+    if (tid == 0) sh->scanCarry = 0;
+    __syncthreads();
+
+    for (int base = 0; base < n; base += tile) {
+        const int i0 = base + tid * BR_SCAN_ITEMS;
+
+        int v[BR_SCAN_ITEMS];
+        int x = 0;
+#pragma unroll
+        for (int k = 0; k < BR_SCAN_ITEMS; k++) {
+            const int e = (i0 + k < n) ? (int)(sorted[i0 + k] & DESC_LEN_MASK) : 0;
+            x += e;
+            v[k] = x;
         }
 
-        int inclusive = total;
         for (int off = 1; off < 32; off <<= 1) {
-            const int v = DSG_SHFL_UP(inclusive, off);
-            if (tid >= off) inclusive += v;
+            const int y = DSG_SHFL_UP(x, off);
+            if (lane >= off) x += y;
         }
-        int run = inclusive - total;
-        for (int k = 0; k < DESC_MSD_BINS / 64; k++) {
-            const uint32_t w = a[first + k];
-            run += (int)(w & 0xffffu);
-            const uint32_t lo = (uint32_t)run;
-            run += (int)(w >> 16);
-            a[first + k] = lo | ((uint32_t)run << 16);
+        if (lane == 31) sh->warpScan[warp] = x;
+        __syncthreads();
+
+        if (tid == 0) {
+            int s = sh->scanCarry;
+            for (int w = 0; w < BR_WARPS; w++) {
+                const int t = sh->warpScan[w];
+                sh->warpScan[w] = s;
+                s += t;
+            }
+            sh->scanCarry = s;
         }
-        if (tid == 31) sh->scanCarry = inclusive;
+        __syncthreads();
+
+        const int pre = x - v[BR_SCAN_ITEMS - 1] + sh->warpScan[warp];
+#pragma unroll
+        for (int k = 0; k < BR_SCAN_ITEMS; k++) {
+            if (i0 + k < n) offs[i0 + k] = v[k] + pre;
+        }
+        __syncthreads();
     }
-    __syncthreads();
-    return sh->scanCarry;
 }
 #endif
 
@@ -1968,11 +2030,9 @@ __device__ int descSuffixArrayBlock(const uint8_t* __restrict__ t, int n, int32_
 
     // ---- 4. output offsets: an exclusive scan over the sorted lengths. A key
     // group's positions occupy one contiguous span whether or not it collides.
-    for (int i = tid; i < nd; i += BR_BLOCK) {
-        sc.offs[i] = (int32_t)(sorted[i] & DESC_LEN_MASK);
-    }
-    __syncthreads();
-    blockScanFlags(sc.offs, nd, sh);   // inclusive; exclusive = offs[i] - len
+    // descScanLens reads the lengths out of the sorted words, fusing the store
+    // pass into the scan: one less write plus one less read of nd words.
+    descScanLens(sorted, sc.offs, nd, sh);   // inclusive; exclusive = offs[i] - len
     PROF_ADD(PH_D_SCAN);
 
     // The radix sort leaves its result in one of its two arrays; the other is
@@ -2039,9 +2099,12 @@ __device__ int descSuffixArrayBlock(const uint8_t* __restrict__ t, int n, int32_
                 s_key[tid] = (uint32_t)(w >> 32);
                 if (tid == nt - 1) s_end = e;
 #if DESC_OWNER_MAP
-                if (tid == 0) {
-                    s_q0 = s_beg[0];
-                    s_fits = 1;
+                if (tid == nt - 1) {
+                    // The first offset and last end bound the entire window.
+                    // Decide once before painting: concurrent reads/writes of
+                    // s_fits by painters race and repeat the capacity check.
+                    s_q0 = sc.offs[dbase] - (int)(sorted[dbase] & DESC_LEN_MASK);
+                    s_fits = e - s_q0 <= DESC_OWN_CAP;
                 }
 #endif
             }
@@ -2049,9 +2112,8 @@ __device__ int descSuffixArrayBlock(const uint8_t* __restrict__ t, int n, int32_
 #if DESC_OWNER_MAP
             if (s_fits && tid < nt) {
                 const int b = s_beg[tid] - s_q0;
-                const int e = b + (int)(sorted[dbase + tid] & DESC_LEN_MASK);
-                if (e > DESC_OWN_CAP) s_fits = 0;
-                else for (int z = b; z < e; z++) s_own[z] = (uint8_t)tid;
+                const int e = (tid + 1 < nt ? s_beg[tid + 1] : s_end) - s_q0;
+                for (int z = b; z < e; z++) s_own[z] = (uint8_t)tid;
             }
             __syncthreads();
 #endif
@@ -2207,9 +2269,45 @@ __device__ int descSuffixArrayBlock(const uint8_t* __restrict__ t, int n, int32_
 
         const int nlist0 = j - i;
 
+#if DESC_COOP_SCATTER
+        // Two lists already have a total order within each arena slice. Merge
+        // their heads straight into the disjoint final output span, avoiding
+        // boundary allocation, ping-pong storage and a copy back to sa. This
+        // sits above the block-wide handoff on purpose: a serial two-way merge
+        // is one comparison per position with no barriers, so even a wide
+        // two-list group is cheaper here than on the whole block.
+        if (nlist0 == 2) {
+            const uint64_t w1 = sorted[i + 1];
+            const int len1 = (int)(w1 & DESC_LEN_MASK);
+            const uint16_t* a0 = sc.arena + ((w >> DESC_LEN_BITS) & 0xFFFFFu);
+            const uint16_t* a1 = sc.arena + ((w1 >> DESC_LEN_BITS) & 0xFFFFFu);
+            const uint32_t r0 = DESC_REL_OF(w >> 32), r1 = DESC_REL_OF(w1 >> 32);
+            int p0 = 0, p1 = 0, dst = o;
+            int q0 = ((uint32_t)a0[0] << 8) | r0;
+            int q1 = ((uint32_t)a1[0] << 8) | r1;
+            for (;;) {
+                if (descSuffixLessFrom(t, n, q1, q0, DESC_CMP_FROM)) {
+                    sa[dst++] = q1;
+                    if (++p1 == len1) {
+                        while (p0 < (int)len0) sa[dst++] = ((uint32_t)a0[p0++] << 8) | r0;
+                        break;
+                    }
+                    q1 = ((uint32_t)a1[p1] << 8) | r1;
+                } else {
+                    sa[dst++] = q0;
+                    if (++p0 == (int)len0) {
+                        while (p1 < len1) sa[dst++] = ((uint32_t)a1[p1++] << 8) | r1;
+                        break;
+                    }
+                    q0 = ((uint32_t)a0[p0] << 8) | r0;
+                }
+            }
+            continue;
+        }
+#endif
         // Large groups go to the block. offs is an inclusive scan of the
-        // lengths, so the group\'s total is known here without gathering it
-        // first. A group past the list\'s capacity falls through and is merged
+        // lengths, so the group's total is known here without gathering it
+        // first. A group past the list's capacity falls through and is merged
         // by this one thread, which is the old behaviour and still correct.
         if (sc.offs[j - 1] - o >= DESC_MERGE_WIDE) {
             const int bi = atomicAdd(&s_nbig, 1);
@@ -2264,28 +2362,34 @@ __device__ int descSuffixArrayBlock(const uint8_t* __restrict__ t, int n, int32_
         ba[nlist0] = total;
 
         // Merge adjacent pairs until one list is left. An odd list out is
-        // carried across unchanged.
+        // carried across unchanged. The final round -- nlist == 2 merges down
+        // to one -- writes straight into sa when its input already sits in the
+        // scratch half, removing the copy-back below for every group with an
+        // even round count. Only into the *other* array: merging a pair in
+        // place would feed its own output back as input, so when the input is
+        // still sa the round goes through the scratch as before.
         int nlist = nlist0;
         while (nlist > 1) {
             int outLists = 0, pos = 0;
+            int32_t* dst = (nlist == 2 && a != sa + o) ? sa + o : b;
             for (int l = 0; l < nlist; l += 2) {
                 bb[outLists++] = pos;
                 if (l + 1 == nlist) {
-                    for (int x = ba[l]; x < ba[l + 1]; x++) b[pos++] = a[x];
+                    for (int x = ba[l]; x < ba[l + 1]; x++) dst[pos++] = a[x];
                 } else {
                     int p0 = ba[l], e0 = ba[l + 1];
                     int p1 = ba[l + 1], e1 = ba[l + 2];
                     while (p0 < e0 && p1 < e1) {
                         // 4: every position here shares the group's key.
-                        b[pos++] = descSuffixLessFrom(t, n, a[p1], a[p0], DESC_CMP_FROM)
+                        dst[pos++] = descSuffixLessFrom(t, n, a[p1], a[p0], DESC_CMP_FROM)
                                        ? a[p1++] : a[p0++];
                     }
-                    while (p0 < e0) b[pos++] = a[p0++];
-                    while (p1 < e1) b[pos++] = a[p1++];
+                    while (p0 < e0) dst[pos++] = a[p0++];
+                    while (p1 < e1) dst[pos++] = a[p1++];
                 }
             }
             bb[outLists] = pos;
-            int32_t* tv = a; a = b; b = tv;
+            int32_t* tv = a; a = dst; b = tv;
             int32_t* tb = ba; ba = bb; bb = tb;
             nlist = outLists;
         }

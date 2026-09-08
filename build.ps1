@@ -53,7 +53,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$Version  = '1.9.4'
+$Version  = '1.9.5'
 $Pkg      = './cmd/derostorm'
 $BoundsPkg = 'github.com/deroproject/derohe/astrobwt/astrobwtv3'
 $LdFlags  = '-s -w'

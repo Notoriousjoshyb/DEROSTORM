@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/deroproject/derohe/astrobwt/astrobwtv3"
+	"github.com/notoriousjoshyb/derostorm/internal/dsa"
 )
 
 // BenchmarkMiningCPU measures the complete paired mining loop at GOMAXPROCS
@@ -19,6 +20,20 @@ import (
 // and scratch acquisition. Use -cpu to compare a fixed thread count.
 func BenchmarkMiningCPU(b *testing.B) {
 	installForBench(b)
+	benchmarkMiningCPU(b)
+}
+
+// Keep complete-hash measurements for the portable sorter separate from the
+// native library: a suffix-sort improvement need not improve mining throughput.
+func BenchmarkMiningCPUPortable(b *testing.B) {
+	installForBench(b)
+	saved := astrobwtv3.SuffixSort
+	astrobwtv3.SuffixSort = dsa.SuffixArray
+	defer func() { astrobwtv3.SuffixSort = saved }()
+	benchmarkMiningCPU(b)
+}
+
+func benchmarkMiningCPU(b *testing.B) {
 	threads := runtime.GOMAXPROCS(0)
 	benchRound(threads, 100)
 	b.ResetTimer()

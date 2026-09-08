@@ -976,6 +976,23 @@ static inline void emit_ord_plus(Arena* dst, const uint32_t* order,
 
 
 #if defined(DSA_AVX2) && DSA_ARENA_REUSE && DSA_KEY_BYTES == 3
+/* First column in a span whose prepends are all constant. */
+static inline uint32_t uniform_span_start(const uint32_t* variable, uint32_t r)
+{
+    if (!r) return 0;
+    int word = (int)((r - 1) / 32);
+    uint32_t bits = variable[word] & (uint32_t)((1ull << (((r - 1) & 31) + 1)) - 1);
+    while (!bits && word > 0) bits = variable[--word];
+    if (!bits) return 0;
+#if defined(_MSC_VER)
+    unsigned long highest;
+    _BitScanReverse(&highest, bits);
+#else
+    const uint32_t highest = 31u - (uint32_t)__builtin_clz(bits);
+#endif
+    return (uint32_t)word * 32 + (uint32_t)highest + 1;
+}
+
 /* Emit a span sharing one arena slice. Only full-block loads are vectorized;
  * key32 handles the final bytes and their possible end-of-text padding. */
 static inline void emit_uniform_span(Desc* d, const uint8_t* t, size_t n,
@@ -1083,14 +1100,72 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
             s->arena[(*arena_len)++] = (Arena)DSA_ARENA_VAL(second >> 8,
                                                       second + (uint32_t)rel);
 #endif
-
-            Desc* d = &s->desc[(*desc_len)++];
-            d->key = DSA_KEYREL(first_key, rel);
-            d->packed = desc_pack(off, first_key == second_key ? 2 : 1);
-            if (first_key != second_key) {
-                d = &s->desc[(*desc_len)++];
-                d->key = DSA_KEYREL(second_key, rel);
-                d->packed = desc_pack(off + 1, 1);
+#if defined(DSA_AVX2) && DSA_ARENA_REUSE && DSA_KEY_BYTES == 3
+            /* Equal keys stay equal through constant prepends. Reuse the
+             * general walk's span emitter instead of dispatching each column
+             * separately; the two-block order and arena slice do not change. */
+            if (first_key == second_key) {
+                const uint32_t last = uniform_span_start(run_variable, (uint32_t)rel);
+                emit_uniform_span(s->desc + *desc_len, t, n, base, last,
+                                  (uint32_t)rel, desc_pack(off, 2));
+                *desc_len += (uint32_t)rel - last + 1;
+                if (!last) return 1;
+                rel = (int)last;
+                key0 = key1 = key32(t, n, base + last);
+            } else
+#endif
+            {
+#if defined(DSA_AVX2) && DSA_ARENA_REUSE && DSA_KEY_BYTES == 3
+                /* Differing keys through a constant prepend keep their order, so
+                 * the arena slice written above stays valid for the whole run
+                 * of constant columns. Emit those pairs back to back with the
+                 * keys slid in registers: no per-column order select, arena
+                 * check, or length bump. Stops at the first column that can
+                 * move the order, or where the slide converges the keys; the
+                 * loop tail below and the equal-key span above take those. */
+                uint32_t fk = first_key, sk = second_key;
+                if (fk != sk) {
+                    Desc* d = s->desc + *desc_len;
+                    int r = rel;
+                    for (;;) {
+                        d->key = DSA_KEYREL(fk, r);
+                        d->packed = desc_pack(off, 1);
+                        d++;
+                        d->key = DSA_KEYREL(sk, r);
+                        d->packed = desc_pack(off + 1, 1);
+                        d++;
+                        if (r == 0) {
+                            *desc_len = (size_t)(d - s->desc);
+                            return 1;
+                        }
+                        const uint32_t col = (uint32_t)r - 1;
+                        const uint8_t c0 = t[b0 + col];
+                        const uint8_t c1 = t[b1 + col];
+                        if (c0 != c1) break;
+                        const uint32_t nk =
+                            (uint32_t)c0 << (8 * (DSA_KEY_BYTES - 1));
+                        fk = nk | (fk >> 8);
+                        sk = nk | (sk >> 8);
+                        if (fk == sk) break;
+                        r--;
+                    }
+                    *desc_len = (size_t)(d - s->desc);
+                    if (swapped) { key0 = sk; key1 = fk; }
+                    else { key0 = fk; key1 = sk; }
+                    rel = r;
+                } else {
+#endif
+                Desc* d = &s->desc[(*desc_len)++];
+                d->key = DSA_KEYREL(first_key, rel);
+                d->packed = desc_pack(off, first_key == second_key ? 2 : 1);
+                if (first_key != second_key) {
+                    d = &s->desc[(*desc_len)++];
+                    d->key = DSA_KEYREL(second_key, rel);
+                    d->packed = desc_pack(off + 1, 1);
+                }
+#if defined(DSA_AVX2) && DSA_ARENA_REUSE && DSA_KEY_BYTES == 3
+                }
+#endif
             }
 
             if (rel != 0) {
@@ -1261,21 +1336,7 @@ static int emit_run(const uint8_t* t, size_t n, uint32_t first_block,
 #if defined(DSA_AVX2) && DSA_KEY_BYTES == 3 && !defined(DSA_ABLATE)
             // Locate the nearest nonconstant prepend by words, then emit the
             // entire uniform span without a per-column dispatch or key chain.
-            uint32_t last = 0;
-            if (r) {
-                int word = (int)((r - 1) / 32);
-                uint32_t bits = variable[word] & (uint32_t)((1ull << (((r - 1) & 31) + 1)) - 1);
-                while (!bits && word > 0) bits = variable[--word];
-                if (bits) {
-#if defined(_MSC_VER)
-                    unsigned long highest;
-                    _BitScanReverse(&highest, bits);
-#else
-                    const uint32_t highest = 31u - (uint32_t)__builtin_clz(bits);
-#endif
-                    last = (uint32_t)word * 32 + (uint32_t)highest + 1;
-                }
-            }
+            const uint32_t last = uniform_span_start(variable, r);
             emit_uniform_span(d, t, n, base, last, r, packed);
             d += r - last + 1;
             rel = (int)last;
@@ -1633,7 +1694,7 @@ retry:
         PROF_STAT(ST_RUNS, 1);
         if (!emit_run(t, n, g, len,
 #if defined(DSA_AVX2)
-                      len >= 3 ? run_variable : NULL,
+                      run_variable,
 #else
                       NULL,
 #endif
@@ -1706,7 +1767,37 @@ retry:
     size_t i = 0;
     while (i < desc_len) {
         const Desc* d0 = &ds[i];
-
+#if defined(DSA_AVX2) && DSA_COMPACT_ARENA && DSA_MSTYLE == 0 && DSA_MABLATE == 0
+        /* Two independent short singleton groups share one loop iteration.
+         * Both arena loads and masks can be prepared before either store.
+         * Each mask writes exactly its group's span; the arena's eight-word
+         * slack makes the full vector reads safe even for one-position groups.
+         * Collisions, long runs and the final pair keep the general path. */
+        if (i + 2 < desc_len &&
+            !DSA_KEY_EQ(ds[i].key, ds[i + 1].key) &&
+            !DSA_KEY_EQ(ds[i + 1].key, ds[i + 2].key) &&
+            dsa_len(ds[i]) <= 8 && dsa_len(ds[i + 1]) <= 8) {
+            const Desc da = ds[i], db = ds[i + 1];
+            const uint32_t la = dsa_len(da), lb = dsa_len(db);
+            const __m256i va = _mm256_or_si256(
+                _mm256_slli_epi32(_mm256_cvtepu16_epi32(
+                    _mm_loadu_si128((const __m128i*)(s->arena + dsa_off(da)))), 8),
+                _mm256_set1_epi32((int)DSA_REL_OF(da.key)));
+            const __m256i vb = _mm256_or_si256(
+                _mm256_slli_epi32(_mm256_cvtepu16_epi32(
+                    _mm_loadu_si128((const __m128i*)(s->arena + dsa_off(db)))), 8),
+                _mm256_set1_epi32((int)DSA_REL_OF(db.key)));
+            const __m256i lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+            const __m256i ma = _mm256_cmpgt_epi32(_mm256_set1_epi32((int)la), lanes);
+            const __m256i mb = _mm256_cmpgt_epi32(_mm256_set1_epi32((int)lb), lanes);
+            _mm256_maskstore_epi32(sa + out, ma, va);
+            _mm256_maskstore_epi32(sa + out + la, mb, vb);
+            out += la + lb;
+            i += 2;
+            PROF_STAT(ST_KEYGRP, 2);
+            continue;
+        }
+#endif
 
         /* The overwhelmingly common case, and the one that decides the cost of
          * this loop: a key nothing else shares, so its positions go straight

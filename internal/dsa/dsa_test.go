@@ -95,7 +95,14 @@ func TestBlockDiffCountsEveryChangedByte(t *testing.T) {
 }
 
 func TestSuffixArrayMatchesNaive(t *testing.T) {
-	var cases [][]byte
+	// Exactly two occurrences of a key exercise the direct two-list merge.
+	// Include both head orders, long equal prefixes, and zero-padded EOF keys.
+	cases := [][]byte{
+		[]byte("abc0abc1"),
+		[]byte("abc1abc0"),
+		[]byte("abcdefghijklmnop1abcdefghijklmnop0"),
+		{1, 0, 0, 1, 0, 0, 0},
+	}
 	for n := 1; n <= 80; n++ {
 		b := make([]byte, n)
 		rand.Read(b)

@@ -4,97 +4,70 @@ An AstroBWTv3 miner for DERO. Mines on the CPU and, when an NVIDIA or AMD card
 is present, on the GPU as well. Full-screen themed console, guided first-run
 setup.
 
-### 1.9.4 — the console became a control centre
+### 1.9.5 — the sort gets tighter on both devices
 
-This release is the console. One thing outside it changed, and it is named
-here rather than left to be found: the CUDA suffix kernel now asks for half
-the shared/L1 carveout as L1. The suffix kernels stream text from global
-memory and keep only ~7 KB in shared, so they read faster with a real L1 --
-measured on an RTX 5080 at 336 blocks, the suffix stage went from 66.9 ms to
-61.0 ms, about +5% on the whole hash, and the curve stays flat where
-prefer-shared sagged past 336 blocks. It is a best-effort hint: the supported
-splits differ by architecture, and a card that refuses it mines exactly as it
-did before.
+Fourteen parallel hypotheses, five survivors, nine rejections with data. The
+CPU keeps about +2% on the complete workload across two span optimizations in
+the two-block path, the portable Go sort gains +7–9% for the platforms without
+the native library, and the GPU keeps about +3% at the shipped block count
+across four kernel trims. Same guarantee as always: the suffix array is
+unique, so a faster route either produces exactly what libsais produces or it
+is wrong. `native\sabench.exe` checks all 512 real texts against libsais, and
+the GPU hash/search/pipeline tests check every kernel change against the CPU
+on hardware.
 
-Nothing else in the mining path moved. Not the hash, not the suffix sort, not
-the share check, not the thread model, and no kernel arithmetic -- a cache
-hint changes how fast the same work is fed, not what it computes, so the
-hashes are the same hashes. The console itself was written against one rule:
-**the console is a low-priority observer and it is never allowed to cost a
-hash.**
+| Native CPU, complete hashes, interleaved A/B | Before | After | Median |
+|---|---:|---:|---:|
+| Two-block equal-key span, 1 worker, 5 rounds | 4,142 H/s | 4,197 H/s | **+1.3%**, 5/5 |
+| Two-block equal-key span, 15 workers, 5 rounds | 43,903 H/s | 44,560 H/s | **+1.5%**, 3/5 |
+| Two-block differ-key span, 1 worker, 9 rounds | 4,322 H/s | 4,359 H/s | **+0.9%**, 5/9 |
+| Two-block differ-key span, 15 workers, 9 rounds | 43,403 H/s | 43,898 H/s | **+1.1%**, 7/9 |
 
-What is new to look at:
+| Portable CPU, complete hashes, interleaved A/B | Before | After | Median |
+|---|---:|---:|---:|
+| `BenchmarkMiningCPUPortable`, 1 worker, 3+3 rounds | 2,638 H/s | 2,884 H/s | **+9.3%**, every round |
+| `BenchmarkMiningCPUPortable`, 15 workers, 3+2 rounds | 26,142 H/s | 27,985 H/s | **+7.1%**, every round |
 
-- A **storm** theme, and it is the default: neon cyan running into electric
-  violet on a deep navy ground, with magenta kept for the few things that have
-  to be louder than the violet. The old `cyber` is still there by name.
-- A proper crest instead of a wordmark: the DERO badge and what DERO stands
-  for on the left, DEROSTORM swept across a cyan-to-magenta gradient in the
-  middle, a moon and what this program is on the right, and a status strip
-  under it whose fields each carry their own mark so the eye can find "uptime"
-  without reading a label.
-- The headline hashrate is set in a heavy block face and carries the same
-  gradient. It is the only number on the screen that does, which is the point:
-  one figure answers "is the machine working", and it should be findable
-  without reading anything.
-- The hashrate chart has **five windows** — 5M, 15M, 1H, 6H, 24H — on a tab
-  strip, switched with `←` `→` or `[` `]`. Each one reads a series the sampler
-  already keeps at that resolution, so changing window is a slice selection
-  and the render thread never averages a day of samples.
-- The blockchain panel has a turning wireframe block, the storm panel has a
-  ridgeline, the connection panel has an aerial and a strength ramp, and the
-  share panel has a legend that matches its ring. All of it is Unicode and
-  ANSI; none of it needs an image protocol.
-- The event log can be paused, scrolled, filtered by level or by text, and
-  cleared — and "cleared" means *stopped being shown*, never thrown away. The
-  panel border goes amber whenever the view is doing anything other than
-  following, because a paused log and a quiet log look identical.
-- A start-up transition that reports NODE, CPU, GPU and TELEMETRY as each comes
-  up. It draws **between** the start-up steps, not before them, so it adds one
-  frame each and delays nothing.
-- The terminal window title becomes `DEROSTORM | 248.68 KH/s | MINING`, rewritten
-  once a second rather than once a frame.
-- Colour now degrades properly: 24-bit where the terminal has it, the xterm-256
-  palette where it does not, the sixteen ANSI colours below that, and nothing
-  at all below that. `--color` overrides the detection.
+| CUDA, complete production searches, RTX 5080 | Before | After | Median |
+|---|---:|---:|---:|
+| Block-wide bucket scan, 16K batch, 336 / 504 blocks | 199,908 / 200,505 H/s | 201,489 / 202,187 H/s | **+0.8%** |
+| Fused offset scan, 336 / 420 / 504 blocks, 5 rounds | 225,940 / 226,022 / 225,779 H/s | 227,110 / 227,703 / 227,335 H/s | **+0.5–0.7%**, 15/15 samples |
+| Merge trim (two-list hoist + final-round redirect), 336 blocks, 20 rounds | 200,507 H/s | 205,445 H/s | **~+2%**, 15/20 pairs |
+| Text prefetch stride 64 → 32, 336 / 504 blocks | 214,747 / 214,282 H/s | 215,390 / 215,271 H/s | **~+0.3%**, 10/10 clean pairs |
+| All four stacked vs the 1.9.4 kernels, 420 blocks (this card's ceiling) | 221,709 H/s | 226,730 H/s | **+2.3%**, 4/5 |
 
-What is new to do:
+**The CPU: constant columns now stream through the two-block path.** Equal
+keys reuse the general walk's span emitter instead of dispatching per column;
+differing keys through a constant prepend emit back to back with keys slid in
+registers, stopping where the order can move or the keys converge. The
+converge handoff is equality-preserving by construction, and the new path is
+compiled only in the measured AVX2 configuration — every other build keeps
+the original code.
 
-| | |
-|---|---|
-| `--tui-refresh=<fps>` | console frames per second, 2 to 30, default 8 |
-| `--no-animation` | the same dashboard with nothing moving |
-| `--no-title` | leave the terminal title alone |
-| `--color=<mode>` | `auto`, `truecolor`, `256`, `16`, `none` |
-| `--tui` | now actually forces the console when stdout is not a terminal, which it has always claimed to do |
-| `Space` `F` `X` `←` `→` `[` `]` `G` `A` `?` `Shift-Tab` | pause, filter, clear, chart window, next GPU, animation, help, back a screen |
-| `filter` `range` `refresh` `animation` | the same, from the command line |
+**The portable sort: hoisted radix bookkeeping.** The histogram unrolls into
+two explicit digit increments and both scatter passes hoist the row pointer
+and the element copy out of the indexing. Same 2×12-bit LSD radix over the
+same 24 key bits, so the order is unchanged; the 332-input hash test still
+matches the reference sorter byte for byte.
 
-What it costs:
+**The GPU: four trims, no new traffic.** The packed bucket scan spreads over
+the whole block instead of one warp (bank conflicts); the offset scan reads
+lengths out of the sorted words instead of storing and rereading them (one
+write, one read and one barrier gone per hash); wide two-list groups skip the
+block handoff for a serial merge with no barriers; the final merge round
+writes straight into place when its input already sits in scratch. The text
+prefetch stride halves to 32. The merge gain concentrates at 336 blocks and
+reads flat at 420; the stacked number above is the honest total.
 
-| | |
-|---|---:|
-| One frame, full 170x48 dashboard | ~118 µs |
-| At the default 8 fps | **0.09 % of one core** |
-| Hashrate, console vs `--no-tui` | no measurable difference |
-
-The architecture that makes that true has not changed and is the reason it can
-be true: mining threads publish into atomics, a sampler builds one immutable
-`Snapshot` eight times a second, and the console renders whatever snapshot is
-current on a completely separate ticker. Two things did get cheaper on the way:
-the run loop no longer copies the four-hundred-entry event ring on every frame
-(the ring is append-only and is never rewritten in place, so a snapshot carries
-the slice itself), and the sampling tick and the paint tick are now separate, so
-turning the frame rate down changes the redraw and nothing else.
-
-Two real bugs fell out of writing the tests:
-
-- `theme <name>` typed into the full-screen console dereferenced a nil pointer
-  and took the miner down with it. The full-screen console has no compact-panel
-  object, and the command reached through it for the current theme name.
-- At sixteen colours several themes mapped their panel borders to plain black,
-  which is the background colour of most terminals — so on a 16-colour terminal
-  the borders were simply invisible.
+**Measured, reverted, recorded.** A +2.6% sort-level merge rework and a +14%
+sort-level slide widening both read flat at complete-hash and were reverted —
+the microbenchmark sorts L3-resident texts the miner never sees. Radix
+prefetch/split/ILP, streaming cache policy (-5%), 12-bit MSD buckets (-6.6%),
+paired rank loads, pinning modes, batch/occupancy retunes and the host
+pipeline all measured at or below zero. The portable win does not transfer to
+C (MSVC already holds the same values in registers; the parity build
+confirms). No AMD, macOS or arm64 speedup is claimed — those need their own
+hardware, though the portable gain ships everywhere the fallback runs.
 
 ### 1.9.2 — a faster CPU sort, a flat GPU, an honest round
 
@@ -528,23 +501,12 @@ While it is mining, one key does one thing. Nothing needs Enter.
 
 | Key | What it does |
 |---|---|
-| `M` `S` `N` `T` `C` `L` `P` `H` | Mining, statistics, network, threads, config, logs, pools, help. Pressing the same key again comes back. |
+| `M` `S` `N` `T` `C` `L` `P` `H` | Mining, statistics, network, threads, config, logs, pools, help. |
 | `Esc` or `D` | Back to the dashboard. |
-| `Tab` / `Shift-Tab` | Cycle the screens forwards and back. |
-| `?` | Help. |
-| `↑` `↓`, `j` `k`, `PgUp`, `PgDn`, `Home` | Scroll the event log. `End` returns it to live. |
-| `Space` | Pause and resume the event log. |
-| `F` | Cycle the log filter: all → shares and better → warnings and better → errors only. |
-| `X` | Clear the log *view*. Nothing is thrown away; the log file and the ring behind it are untouched. |
-| `←` `→`, or `[` `]` | Hashrate chart window: 5M, 15M, 1H, 6H, 24H. |
-| `G` | Next GPU, on a rig with more than one. |
-| `A` | Turn the decorative animation on and off. |
+| `Tab` | Cycle the screens. |
+| arrows, `PgUp`, `PgDn` | Scroll the event log. `End` returns it to live. |
 | `:` | Open the command line. |
 | `Q` or `Ctrl-C` | Stop mining and print a session summary. |
-
-Scrolling the log back pauses the follow, and `End` resumes it. That is
-deliberate: a reader who scrolls up to read a line and then watches it get
-pushed off the top has been given a scrollbar that does not work.
 
 Press `:` first for anything that takes an argument, then type and press Enter:
 
@@ -552,22 +514,12 @@ Press `:` first for anything that takes an argument, then type and press Enter:
 |---|---|
 | `threads <n>` | Change the thread count live (`0` turns the CPU off). Also accepts `+2` or `-4`. |
 | `theme <name>` | Switch colour theme. |
-| `filter <text>` | Show only log lines whose message or tag contains this. `filter off` clears it. |
-| `range <5m…24h>` | Hashrate chart window. |
-| `refresh <fps>` | Console frames per second, 2 to 30. Changes nothing but the redraw. |
-| `animation on\|off` | Decorative animation. |
-| `save` | Write the current settings to the config file, including the console ones. |
+| `save` | Write the current settings to the config file. |
 | `config` | Show the active settings and where they came from. |
 | `quit` | Stop mining and exit. |
 
 Thread changes take effect immediately and are remembered for the session; run
 `save` to make them permanent.
-
-`save` also records the harmless console preferences — the screen you are on,
-the chart window, the frame rate, the theme and whether the animation is
-running — under a separate `ui` object in `derostorm.json`. Nothing in that
-object can change how the miner mines, which is why it is kept apart from the
-settings that can.
 
 The full-screen console is the default on an interactive terminal. Two other
 modes exist for the cases it does not suit:
@@ -576,50 +528,10 @@ modes exist for the cases it does not suit:
 |---|---|
 | `--classic` | The compact in-place panel. It scrolls with the shell, so the scrollback above it survives. |
 | `--no-tui` | Plain scrolling lines. No cursor movement at all — for `tmux` logs, `systemd` units and CI. |
-| `--tui-refresh=<fps>` | Console frames per second, 2 to 30. Default 8. |
-| `--no-animation` | The same dashboard with nothing moving in it. |
-| `--no-title` | Do not rewrite the terminal window title. |
 
 Colour and cursor control are switched off automatically when output is not a
 terminal or when `NO_COLOR` is set, so piping to a log file or running as a
 service produces clean text with no flags at all.
-
-### What the console costs
-
-The rule the whole design is built around is that the console is a low-priority
-observer and mining is the only thing that matters. It never touches a mining
-thread, never takes a lock a hashing thread holds, and never asks hardware a
-question while a frame is being drawn. It reads a `Snapshot` that has already
-been assembled, on its own timer, from its own goroutine.
-
-Measured on a 9800X3D at the full 170x48 dashboard:
-
-| | Cost |
-|---|---|
-| One frame, everything drawn | ~118 µs |
-| At the default 8 frames a second | **0.09 % of one core** |
-| On a 16-thread machine | 0.006 % of the machine |
-| Memory the console holds | under 1.5 MB, including all five chart histories |
-
-`--tui-refresh=2` takes that to a quarter. There is no measurable hashrate
-difference between running with the console and running with `--no-tui`; the
-run-to-run spread of the miner itself is about ten times larger than the
-console's entire cost.
-
-The pieces that make that true, in case any of them is ever tempting to change:
-
-- Mining threads publish into atomic counters. Nothing else.
-- The sampler reads those counters eight times a second and builds one
-  immutable `Snapshot`. That cadence is fixed, because every rolling average in
-  the program is defined in terms of it.
-- The console renders whatever `Snapshot` is current, on a separate ticker at
-  whatever `--tui-refresh` says. The two are completely decoupled.
-- Hardware sensors are polled on their own slow timer and cached; the renderer
-  reads a struct.
-- The event log is an append-only ring the run loop never rewrites in place, so
-  a `Snapshot` carries the slice itself and no frame copies anything.
-- Every frame is diffed against the last one and only the cells that changed
-  are written, so a still screen costs almost nothing on the wire.
 
 ---
 
@@ -635,31 +547,12 @@ derostorm --preview --theme=aurora --screen=network --size=140x44
 
 | Theme | Look |
 |---|---|
-| `storm` | neon cyan into violet on deep navy, with magenta for the few things that have to be louder. **The default.** |
-| `cyber` | neon cyan + violet on black — the previous default. |
+| `cyber` | neon cyan + violet on black — the control-centre look. **The default.** |
 | `default` | cyan + violet on near-black. Quieter than `cyber`. |
 | `copper` | burnt copper + slate on charcoal. |
 | `aurora` | emerald + ice on deep green-black. |
 | `ember` | amber + rose on warm black. |
 | `mono` | no colour at all — for logs, CI and dumb terminals. |
-
-### Colour depth
-
-A theme is authored once as a table of RGB triples and rendered at whatever the
-terminal can actually show:
-
-| Depth | What it uses |
-|---|---|
-| 24-bit | the colours as written |
-| 256 | the nearest xterm palette entry, with the grey ramp checked separately so a near-grey label does not come out tinted |
-| 16 | the nearest of the eight ANSI colours, chosen by hue with brightness from luminance, and never plain black — a border that maps to colour 0 is invisible on most terminals |
-| none | no escape sequences at all |
-
-The depth is detected from `COLORTERM`, `WT_SESSION`, `TERM_PROGRAM` and `TERM`,
-in that order, and the guess is deliberately conservative: a 256-colour
-approximation on a truecolor terminal is a slightly duller dashboard, whereas
-24-bit escapes on a terminal that cannot parse them is a screen of garbage.
-`--color=truecolor|256|16|none` overrides it, and so does `DEROSTORM_COLOR`.
 
 `--preview` draws one real frame through the same code the live console uses,
 with representative data in it. A preview with a rendering path of its own would
@@ -883,20 +776,13 @@ derostorm [options]
   --gpu-blocks=<n>                  Grid blocks in the GPU suffix kernel.
                                     Default: runtime occupancy ceiling
                                     (504 on an RTX 5080).
-  --theme=<name>                    storm, cyber, default, copper, aurora,
-                                    ember or mono.
-  --tui                             Force the full-screen console, even when
-                                    stdout is not a terminal. Already the
+  --theme=<name>                    cyber, default, copper, aurora, ember
+                                    or mono.
+  --tui                             Force the full-screen console. Already the
                                     default on an interactive terminal.
   --classic                         The compact in-place panel instead.
   --no-tui                          Plain scrolling output, no console at all.
                                     --no-dashboard is the same thing.
-  --tui-refresh=<fps>               Console frames per second, 2 to 30.
-                                    Default 8. Affects nothing but the redraw.
-  --no-animation                    Draw the console with nothing moving.
-  --no-title                        Do not rewrite the terminal window title.
-  --color=<mode>                    auto, truecolor, 256, 16 or none.
-                                    Default auto, from COLORTERM and TERM.
   --testnet                         Use the DERO testnet.
   --debug                           Verbose logging to the log file.
   --bench                           Benchmark the hash function and exit.
@@ -3220,13 +3106,10 @@ derostorm/
 │   ├── engine.go           getwork + the mining threads
 │   ├── target.go           allocation-free difficulty check
 │   ├── tui.go              the full-screen console: input, frame, resize
-│   ├── tui_state.go        chart window, GPU selection, log view, window title
-│   ├── tui_splash.go       the start-up transition
-│   ├── tui_layout.go       the header, and which panels fit at this size
+│   ├── tui_layout.go       which panels fit, at this window size
 │   ├── tui_panels.go       every panel on the dashboard
 │   ├── tui_screens.go      the other seven screens
 │   ├── tui_preview.go      --preview: one frame, sample data, no node
-│   ├── tui_test.go         every screen at every size, keys, filters, cost
 │   ├── dashboard.go        the compact in-place panel (--classic)
 │   ├── theme.go            palette lookup, over internal/ui
 │   ├── commands.go         runtime command line
@@ -3263,12 +3146,10 @@ derostorm/
 │   ├── panel.go            bordered boxes and their titles
 │   ├── chart.go            sparklines, bars, the braille history plot
 │   ├── gauge.go            rings, meters and dials
-│   ├── art.go              the wordmark, the big digits, the small marks
-│   ├── art_storm.go        the DERO badge, ridgelines, moon, wire cube
+│   ├── art.go              the wordmark, the cloud, the block glyphs
 │   ├── text.go             wrapping, truncation, alignment
 │   ├── format.go           hashrates, counts, durations
-│   ├── theme.go            the palettes, and the 24-bit → 256 → 16 fallback
-│   └── ui_test.go          colour degradation, measurement, the cell grid
+│   └── theme.go            the six palettes
 ├── native/                 the C suffix sort
 │   ├── derostorm_sa.c      the C API: sort, version, self-test
 │   ├── descriptor.c        the structure-exploiting suffix sort

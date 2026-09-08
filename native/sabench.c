@@ -154,7 +154,7 @@ static int check_singleton_runs(void)
 {
     enum { capacity = 8193 };
     uint8_t text[capacity];
-    int32_t got[capacity], want[capacity];
+    int32_t got[capacity + 8], want[capacity];
     const int lengths[] = {249, 250, 251, 252, 253, 254, 255, 256, 257,
                            258, 259, 260, 261, 262, 263, 511, 512, 513,
                            767, 768, 769, 8191, 8192, 8193};
@@ -173,11 +173,18 @@ static int check_singleton_runs(void)
         uint8_t* exact = (uint8_t*)malloc((size_t)n);
         if (!exact) return 0;
         memcpy(exact, text, (size_t)n);
+        for (int z = 0; z < 8; z++) got[n + z] = 0x13579bdf;
         if (libsais(exact, want, n, 0, NULL) != 0 ||
             dsa_descriptor_suffix_array(exact, got, n) != 0 ||
             memcmp(got, want, (size_t)n * sizeof(*got)) != 0) {
             printf("  singleton boundary MISMATCH at %d bytes\n", n);
             ok = 0;
+        }
+        for (int z = 0; z < 8; z++) {
+            if (got[n + z] != 0x13579bdf) {
+                printf("  singleton output overrun at %d bytes, lane %d\n", n, z);
+                ok = 0;
+            }
         }
         free(exact);
     }
@@ -380,4 +387,3 @@ int main(int argc, char** argv)
 #endif
     return desc_ok ? 0 : 1;
 }
-

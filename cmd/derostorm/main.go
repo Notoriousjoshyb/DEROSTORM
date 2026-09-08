@@ -32,7 +32,7 @@ import (
 	"github.com/notoriousjoshyb/derostorm/internal/ui"
 )
 
-const version = "1.9.4"
+const version = "1.9.5"
 
 const usage = `DeroStorm ` + version + `
 AstroBWTv3 miner for DERO. Mines on the CPU, and on NVIDIA or AMD GPUs as well
