@@ -774,8 +774,9 @@ derostorm [options]
                                     off. NVIDIA cards first, then AMD.
   --gpu-batch=<n>                   Nonces per GPU launch.
   --gpu-blocks=<n>                  Grid blocks in the GPU suffix kernel.
-                                    Default: runtime occupancy ceiling
-                                    (504 on an RTX 5080).
+                                    Default: measured while mining — a short
+                                    sweep pins the fastest setting (504 on an
+                                    RTX 5080).
   --theme=<name>                    cyber, default, copper, aurora, ember
                                     or mono.
   --tui                             Force the full-screen console. Already the
@@ -2323,7 +2324,9 @@ Resident blocks matter more than anything else, and the curve is not flat:
 
 The top of that curve is within noise of itself — a second run picked 672 blocks
 at 50,736 H/s — so the miner measures it while mining rather than shipping a
-constant. Pin it with `--gpu-blocks=<n>` if you would rather it did not.
+constant. The first minutes of an unpinned run read TUNING GPU while it does;
+the curve it settles on is the one `--bench` draws. Pin it with
+`--gpu-blocks=<n>` if you would rather it did not.
 
 The suffix sort is ~95% of GPU hash time, so everything below is about it.
 
@@ -2980,9 +2983,11 @@ consensus-critical path. Left alone.
   mining has the getwork socket, the console, and the thread that feeds a GPU.
   Ask for the last one with `--mining-threads=16` if the machine is doing
   nothing else.
-- **The GPU grid comes from the loaded kernel's runtime occupancy.** The default
-  is one queued row beyond physical occupancy: 504 blocks on the RTX 5080 used
-  here. Pin it with `--gpu-blocks=<n>` if you would rather use a smaller count.
+- **The GPU grid is measured while mining, not assumed.** The sweep starts at
+  the runtime occupancy ceiling (one queued row beyond physical: 504 blocks on
+  the RTX 5080 used here) and settles on the fastest candidate — which on an
+  integrated Radeon 8060S is 80, well below its 180-block ceiling. Pin it with
+  `--gpu-blocks=<n>` if you would rather skip the sweep.
 - Threads are pinned to CPUs automatically, spreading over physical cores before
   using SMT siblings.
 - **Faster RAM is not worth buying for this.** See *What does not help* above:

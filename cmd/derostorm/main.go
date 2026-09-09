@@ -69,7 +69,8 @@ Options:
                                   AMD. Overrides the saved setting.
   --gpu-batch=<n>                 Nonces per GPU launch. Default: fill VRAM.
   --gpu-blocks=<n>                Grid blocks in the GPU suffix kernel.
-                                  Default: runtime occupancy ceiling (504 on a 5080).
+                                  Default: measured while mining (fastest of a
+                                  short sweep; 504 on a 5080).
   --theme=<name>                  storm, cyber, default, copper, aurora, ember
                                   or mono.
   --tui                           Force the full-screen console, even when

@@ -6,11 +6,21 @@ package main
 // too many spend memory on work that cannot become resident. The GPU library
 // reports a runtime-derived ceiling one row beyond physical occupancy: 504 on
 // the 84-SM 5080, where five rows are resident and the queued sixth smooths the
-// tail. Mining starts at that ceiling and --bench still sweeps below it.
+// tail.
 //
-// --bench still sweeps, because the peak has moved before. Settings are
-// interleaved and the first batch after each switch is discarded, so a GPU
-// that is also driving a display does not just report the order it ran them in.
+// The ceiling is where the curve lands on discrete cards, but it is not a law:
+// on an integrated Radeon 8060S (gfx1151) the curve peaks near 80 blocks and
+// reads 11% slower at the 180-block ceiling, whose extra resident rows fight
+// the sort for memory bandwidth. So mining sweeps blockCandidates, exactly the
+// curve --bench draws, and pins the fastest setting. Settings are interleaved
+// and the first batch after each switch is discarded, so a GPU that is also
+// driving a display does not just report the order it ran them in. After one
+// full round, candidates below half the best rate so far are pruned: they got
+// their one fair interleaved pass, and re-measuring a floor wastes minutes.
+//
+// --bench sweeps too, because the peak has moved before: it was at four blocks
+// per SM, then at half a block per SM, then at the top of the range. Whatever
+// the shape is on a given card, guessing it has a poor record.
 
 import (
 	"fmt"
@@ -23,10 +33,17 @@ const (
 	tuneWarmup = 1
 	// tuneTimed is batches counted on each visit.
 	tuneTimed = 2
-	// tuneRounds is visits per setting. Three passes over several candidates
-	// is a couple of minutes of mining, which is long enough for the
-	// interleaving to cancel the drift it is there to cancel.
-	tuneRounds = 3
+	// tuneRounds is visits per setting. Two interleaved passes sample every
+	// candidate at two different times, which is what the interleaving is for,
+	// and with round-boundary pruning the survivors are the only cost after
+	// that. Three read measurably better on no card we have seen, and the
+	// sweep runs at mining speed: every extra round is a minute of a slower
+	// miner.
+	tuneRounds = 2
+	// tuneTie is how close two candidates have to read before the smaller
+	// block count wins. The ceiling costs real VRAM, and a setting within a
+	// per cent of the fastest buys nothing with it.
+	tuneTie = 0.01
 )
 
 // blockTuner cycles a list of candidate block counts, timing each, then pins
@@ -74,8 +91,8 @@ func blockCandidates(sms, maxBlocks int) []int {
 	return out
 }
 
-// newBlockTuner sets the grid-block count and returns nil. Mining does not
-// sweep; --bench builds its own curve from blockCandidates.
+// newBlockTuner pins an explicit --gpu-blocks, and otherwise sweeps
+// blockCandidates while mining and settles on the fastest setting.
 func newBlockTuner(g *GPUContext, dev int, pinned int,
 	post func(LogLevel, string, string, ...interface{})) *blockTuner {
 
@@ -94,16 +111,35 @@ func newBlockTuner(g *GPUContext, dev int, pinned int,
 		return nil
 	}
 
-	// Unpinned: use the runtime-derived grid ceiling. It already accounts for
-	// this architecture's occupancy and the VRAM budget.
-	n := g.MaxBlocks()
-	if err := g.SetBlocks(n); err != nil {
-		post(LogWarn, "gpu", "device %d: %v — leaving the block count alone", dev, err)
-	} else {
-		post(LogInfo, "gpu", "device %d: %d suffix blocks (auto) · pin with --gpu-blocks=%d",
-			dev, n, n)
+	// Unpinned: start at the runtime-derived ceiling and sweep down the same
+	// candidate list --bench draws its curve from, then pin the fastest. One
+	// candidate means the sweep would only ever re-measure the ceiling, so
+	// skip it and mine.
+	cands := blockCandidates(g.SMs(), g.MaxBlocks())
+	if len(cands) < 2 {
+		n := g.MaxBlocks()
+		if err := g.SetBlocks(n); err != nil {
+			post(LogWarn, "gpu", "device %d: %v — leaving the block count alone", dev, err)
+		} else {
+			post(LogInfo, "gpu", "device %d: %d suffix blocks (auto)", dev, n)
+		}
+		return nil
 	}
-	return nil
+	n := cands[len(cands)-1]
+	if err := g.SetBlocks(n); err != nil {
+		post(LogWarn, "gpu", "device %d: %v — not sweeping, leaving the block count alone", dev, err)
+		return nil
+	}
+	post(LogInfo, "gpu", "device %d: measuring %d suffix-block settings — the console says TUNING GPU until this ends",
+		dev, len(cands))
+	return &blockTuner{
+		g:     g,
+		post:  post,
+		dev:   dev,
+		cands: cands,
+		sum:   make([]float64, len(cands)),
+		n:     make([]int, len(cands)),
+	}
 }
 
 // observe records one batch and advances the sweep. d is how long the batch
@@ -129,6 +165,11 @@ func (t *blockTuner) observe(d time.Duration, hashes int) {
 	if t.idx >= len(t.cands) {
 		t.idx = 0
 		t.round++
+		t.prune()
+		if len(t.cands) == 1 {
+			t.settle() // one survivor: the sweep already has its answer
+			return
+		}
 		if t.round >= tuneRounds {
 			t.settle()
 			return
@@ -147,14 +188,57 @@ func (t *blockTuner) rate(i int) float64 {
 	return t.sum[i] / float64(t.n[i])
 }
 
+// prune drops candidates that, after a full interleaved round, have no chance
+// of winning: their mean rate is below half the best so far. The sweep exists
+// to find the peak, not to document the floor, and on a card where a small
+// grid crawls — an APU spreads the same batch over far fewer blocks — the
+// hopeless settings cost minutes of tuning time at a terrible hashrate.
+// Pruning happens only at round boundaries, so every candidate gets the same
+// one fair interleaved pass before it can be cut.
+func (t *blockTuner) prune() {
+	if len(t.cands) <= 2 {
+		return // nothing worth cutting
+	}
+	best := 0.0
+	for i := range t.cands {
+		if r := t.rate(i); r > best {
+			best = r
+		}
+	}
+	if best <= 0 {
+		return
+	}
+	keep := []int{}
+	for i := range t.cands {
+		if r := t.rate(i); r >= best/2 {
+			keep = append(keep, i)
+		}
+	}
+	if len(keep) == 0 || len(keep) == len(t.cands) {
+		return
+	}
+	cands := make([]int, 0, len(keep))
+	sum := make([]float64, 0, len(keep))
+	n := make([]int, 0, len(keep))
+	for _, i := range keep {
+		cands = append(cands, t.cands[i])
+		sum = append(sum, t.sum[i])
+		n = append(n, t.n[i])
+	}
+	t.cands, t.sum, t.n = cands, sum, n
+}
+
 // settle picks the winner, applies it, and reports the curve so a person can
 // see whether the peak was real or the sweep should have gone further.
 func (t *blockTuner) settle() {
 	t.done = true
+	// bestRate wins outright; a later candidate within tuneTie of it does not
+	// replace it, so the tie-break lands on the smallest block count that is
+	// within noise of the fastest.
 
 	best, bestRate := -1, 0.0
 	for i := range t.cands {
-		if r := t.rate(i); r > bestRate {
+		if r := t.rate(i); r > bestRate*(1+tuneTie) {
 			best, bestRate = i, r
 		}
 	}
