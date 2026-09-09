@@ -432,22 +432,23 @@ func run(o runOpts) {
 			Difficulty:  parseUint(job.Difficulty),
 			// DERO difficulty is already in hashes per second, so the job's
 			// difficulty is the network hashrate. See NodeInfo.NetHashrate.
-			NetHashes:   job.Difficultyuint64,
-			Blocks:      job.Blocks,
-			MiniBlocks:  job.MiniBlocks,
-			Rejected:    job.Rejected,
-			Submitted:   engine.Submitted(),
-			BestShare:   engine.BestShare(),
-			LastShare:   engine.LastShare(),
-			ConnectedAt: engine.ConnectedAt(),
-			LastJob:     engine.LastJob(),
-			BlockEvent:  engine.BlockEvent(),
-			HeightAt:    heightAt,
-			Uptime:      now.Sub(start),
-			Node:        cfg.Node,
-			Testnet:     o.testnet,
-			Log:         logSlice,
-			Frame:       frame,
+			NetHashes:    job.Difficultyuint64,
+			Blocks:       job.Blocks,
+			MiniBlocks:   job.MiniBlocks,
+			Rejected:     job.Rejected,
+			Submitted:    engine.Submitted(),
+			BestShare:    engine.BestShare(),
+			LastShare:    engine.LastShare(),
+			ConnectedAt:  engine.ConnectedAt(),
+			LastJob:      engine.LastJob(),
+			BlockEvent:   engine.BlockEvent(),
+			SendFailures: engine.SendFailures(),
+			HeightAt:     heightAt,
+			Uptime:       now.Sub(start),
+			Node:         cfg.Node,
+			Testnet:      o.testnet,
+			Log:          logSlice,
+			Frame:        frame,
 
 			ConfigPath: o.cfgPath,
 			LogFile:    o.logFile,
@@ -861,6 +862,9 @@ func summary(c *Console, t *Theme, e *Engine, up time.Duration) {
 	line("hashes", ui.Commas(total))
 	line("average", ui.HumanRate(avg))
 	line("shares sent", ui.Commas(e.Submitted()))
+	if f := e.SendFailures(); f > 0 {
+		line("send fails", fmt.Sprintf("%s  (the node never received these)", ui.Commas(f)))
+	}
 	line("miniblocks", ui.Commas(job.MiniBlocks))
 	line("blocks", ui.Commas(job.Blocks))
 	line("rejected", ui.Commas(job.Rejected))
