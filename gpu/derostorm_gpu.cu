@@ -746,10 +746,25 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     // when the suffix kernel was 1.1 s a batch; at current speed that leaves
     // stage 1 and SHA occupancy on the table. Cap at DSG_BATCH_MAX so job
     // latency stays under about half a second on a big card.
+    //
+    // An APU takes a much smaller batch, and not for the latency: it shares
+    // one memory subsystem and one power budget with the CPU threads mining
+    // beside it, and a long batch is stale work. Every job change abandons
+    // whatever the running batch still holds, and on a contended Strix Halo a
+    // 32,768 batch runs ~1.9 s, so a job that lands just after a batch starts
+    // wastes up to that long of GPU hashes on a dead job -- and holds the
+    // memory bandwidth the CPU was about to need. Measured there (gfx1151,
+    // 32 CPU threads + this card at 80 blocks): 32768 a batch read ~48 KH/s
+    // combined; 8,192 read ~58 with the CPU total unchanged. An explicit
+    // --gpu-batch still wins.
     if (batch <= 0) {
         int fit = (int)(forChunk / perChunkHash);
         if (fit > DSG_BATCH_MAX) fit = DSG_BATCH_MAX;
         if (fit < DSG_BATCH) fit = DSG_BATCH;
+#if DSG_HIP
+        if (prop.integrated && fit > DSG_BATCH)
+            fit = DSG_BATCH;
+#endif
         batch = fit;
     }
     batch -= batch % S1_BLOCK;
