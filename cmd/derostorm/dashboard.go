@@ -192,12 +192,13 @@ type Snapshot struct {
 	TotalHashes uint64
 
 	// Share and connection accounting from the engine.
-	Submitted   uint64
-	BestShare   uint64
-	LastShare   time.Time
-	ConnectedAt time.Time
-	LastJob     time.Time
-	BlockEvent  time.Time
+	Submitted    uint64
+	BestShare    uint64
+	LastShare    time.Time
+	ConnectedAt  time.Time
+	LastJob      time.Time
+	SendFailures uint64
+	BlockEvent   time.Time
 
 	// HeightAt is when the chain height last moved, which is the only honest
 	// measure of "time since the last block" available to a miner: getwork

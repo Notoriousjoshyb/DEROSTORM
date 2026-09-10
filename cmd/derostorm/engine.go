@@ -86,11 +86,22 @@ type Engine struct {
 	// loop, which is the one place where a shared cache line would cost
 	// measurable hashrate.
 	submitted    uint64 // shares this miner has sent
+	sendFailures uint64 // shares that could not be handed to the socket
 	bestShare    uint64 // highest difficulty any submitted share has met
 	lastShareNs  int64  // when the last share was sent
 	connectedNs  int64  // when the current connection was established
 	lastJobNs    int64  // when the current job arrived
 	blockEventNs int64  // when a block was last found, for the on-screen event
+
+	// Share-audit state, touched only by the RunGetWork goroutine, so plain
+	// fields are safe. The bases exist because every reconnect resets the
+	// node's per-connection counters while submitted keeps climbing: the gap
+	// that means something is within one connection, not across all of them.
+	auditFresh    bool   // false until the first job of this connection sets the bases
+	auditSentBase uint64 // submitted when this connection's accounting started
+	auditFailBase uint64 // sendFailures when this connection's accounting started
+	auditConfBase uint64 // node-confirmed shares when this connection's accounting started
+	auditLastNs   int64  // last time the audit spoke, so it cannot spam the log
 }
 
 func NewEngine(node, wallet string) *Engine {
@@ -200,6 +211,7 @@ func (e *Engine) RunGetWork() {
 		u := url.URL{Scheme: "wss", Host: e.node, Path: "/ws/" + e.wallet}
 		dialer := *websocket.DefaultDialer
 		dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		dialer.HandshakeTimeout = 15 * time.Second
 
 		conn, _, err := dialer.Dial(u.String(), nil)
 		if err != nil {
@@ -216,6 +228,7 @@ func (e *Engine) RunGetWork() {
 		e.conn = conn
 		e.connMu.Unlock()
 		atomic.StoreInt64(&e.connectedNs, time.Now().UnixNano())
+		e.auditFresh = false // counters are per connection; rebase on the first job
 		e.post(LogGood, "connect", "connected to %s", e.node)
 
 		for {
@@ -240,6 +253,7 @@ func (e *Engine) RunGetWork() {
 			atomic.StoreInt64(&e.lastJobNs, time.Now().UnixNano())
 
 			e.setState(StateMining)
+			e.shareAudit(result)
 
 			if result.LastError != "" {
 				e.post(LogError, "node", "%s", result.LastError)
@@ -258,7 +272,61 @@ func (e *Engine) RunGetWork() {
 				e.post(LogWarn, "rejected", "share rejected (total %d)", result.Rejected)
 			}
 		}
+
+		// The read failed and the loop above is going to redial: cut the socket
+		// out from under the miners now. submit() holds connMu while it writes,
+		// so the next share either sees nil and logs a lost share, or loses the
+		// race and gets a write error it also logs — either way the failure is
+		// counted and visible, never silent.
+		e.connMu.Lock()
+		e.conn = nil
+		e.connMu.Unlock()
+		conn.Close()
 	}
+}
+
+// shareAudit reconciles what this miner sent against what the node says it
+// received. The daemon owns the truth: every share it accepts lands in exactly
+// one of miniblocks/blocks/rejected (see derod's websocket_getwork_server), and
+// it echoes those per-connection counters back on every job. A miner can
+// therefore tell when shares are going into a void — a socket that is open but
+// whose writes nobody reads loses them silently, which is how a 12-hour session
+// ends with 232 sent and 3 confirmed.
+//
+// sent − confirmed − send-failed is zero within a few in-flight shares on a
+// healthy connection. When it is not, and it stays not, something between this
+// miner and the daemon is eating shares, and the log says so while it is
+// happening rather than in a post-mortem. Throttled to once a minute and gated
+// on a real gap so a chatty log cannot bury the mining output.
+func (e *Engine) shareAudit(result rpc.GetBlockTemplate_Result) {
+	conf := result.MiniBlocks + result.Blocks + result.Rejected
+	if !e.auditFresh {
+		e.auditFresh = true
+		e.auditSentBase = atomic.LoadUint64(&e.submitted)
+		e.auditFailBase = atomic.LoadUint64(&e.sendFailures)
+		e.auditConfBase = conf
+		return
+	}
+
+	gap := (atomic.LoadUint64(&e.submitted) - e.auditSentBase) -
+		(conf - e.auditConfBase) -
+		(atomic.LoadUint64(&e.sendFailures) - e.auditFailBase)
+	// Small gaps are shares in flight; ten is safely above what a healthy
+	// connection carries between one job and the next.
+	if gap < 10 {
+		return
+	}
+	now := time.Now().UnixNano()
+	if now-atomic.LoadInt64(&e.auditLastNs) < int64(time.Minute) {
+		return
+	}
+	atomic.StoreInt64(&e.auditLastNs, now)
+	e.post(LogWarn, "submit",
+		"%d shares this connection are unaccounted for (sent %d, node confirmed %d, send failures %d) — the node is not receiving everything",
+		gap,
+		atomic.LoadUint64(&e.submitted)-e.auditSentBase,
+		conf-e.auditConfBase,
+		atomic.LoadUint64(&e.sendFailures)-e.auditFailBase)
 }
 
 // ---------------------------------------------------------------- mining
@@ -406,12 +474,18 @@ func (e *Engine) RunMiner(tid int, stop <-chan struct{}) {
 	}
 }
 
+// submit sends a share that met the job's target.
+//
+// A share that met the target is a real event whether or not the socket was
+// still there to send it on, so it is always counted; but a share the node
+// never hears about is work the network loses, and a miner that swallowed
+// hundreds of those while showing "mining" would be lying by omission. Write
+// failures are therefore counted, logged, and punished once: the socket is
+// closed so the getwork loop notices immediately and redials, instead of the
+// miner grinding on for hours against a connection nobody is reading.
 func (e *Engine) submit(job rpc.GetBlockTemplate_Result, work []byte, powhash *[32]byte) {
 	defer globals.Recover(1)
 
-	// Record the share before anything can fail. A share that met the target
-	// is a real event whether or not the socket was still there to send it on,
-	// and the counters exist to describe what this machine did.
 	atomic.AddUint64(&e.submitted, 1)
 	atomic.StoreInt64(&e.lastShareNs, time.Now().UnixNano())
 	if d := shareDifficulty(powhash); d > atomic.LoadUint64(&e.bestShare) {
@@ -419,15 +493,39 @@ func (e *Engine) submit(job rpc.GetBlockTemplate_Result, work []byte, powhash *[
 	}
 
 	e.connMu.Lock()
-	defer e.connMu.Unlock()
-	if e.conn == nil {
+	conn := e.conn
+	e.connMu.Unlock()
+	if conn == nil {
+		e.shareSendFailed(job, "no connection")
 		return
 	}
+
+	conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 	e.post(LogInfo, "submit", "share at height %d", job.Height)
-	e.conn.WriteJSON(rpc.SubmitBlock_Params{
+	if err := conn.WriteJSON(rpc.SubmitBlock_Params{
 		JobID:                 job.JobID,
 		MiniBlockhashing_blob: fmt.Sprintf("%x", work),
-	})
+	}); err != nil {
+		e.shareSendFailed(job, err.Error())
+	}
+}
+
+// shareSendFailed records a share the node did not receive, says so, and tears
+// the socket down so RunGetWork redials rather than mining into a dead pipe.
+// Registered as a method so it can swap the socket under connMu exactly like
+// RunGetWork does.
+func (e *Engine) shareSendFailed(job rpc.GetBlockTemplate_Result, why string) {
+	atomic.AddUint64(&e.sendFailures, 1)
+	e.post(LogError, "submit", "share NOT delivered at height %d: %s — reconnecting",
+		job.Height, why)
+
+	e.connMu.Lock()
+	conn := e.conn
+	e.conn = nil
+	e.connMu.Unlock()
+	if conn != nil {
+		conn.Close() // the reader errors out, and RunGetWork redials
+	}
 }
 
 // shareDifficulty is the difficulty a hash actually met: floor(2^256 / h).
@@ -471,6 +569,12 @@ func (e *Engine) ThreadHashes(i int) uint64 {
 
 // Submitted is how many shares this miner has sent.
 func (e *Engine) Submitted() uint64 { return atomic.LoadUint64(&e.submitted) }
+
+// SendFailures is how many of those the node never received — a socket that
+// died mid-write, a connection that was already gone. Any number above zero is
+// a connection problem worth investigating, and a number that grows while the
+// state reads Mining is the signature of a miner hashing into a dead socket.
+func (e *Engine) SendFailures() uint64 { return atomic.LoadUint64(&e.sendFailures) }
 
 // BestShare is the highest difficulty any submitted share has met.
 func (e *Engine) BestShare() uint64 { return atomic.LoadUint64(&e.bestShare) }

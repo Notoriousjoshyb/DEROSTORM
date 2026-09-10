@@ -57,6 +57,12 @@ type statsDoc struct {
 	Blocks     uint64 `json:"blocks"`
 	Rejected   uint64 `json:"rejected"`
 
+	// Shares this miner sent that the node never received. Zero on a healthy
+	// connection; anything else is a connection problem the monitor should
+	// see, because the accepted counters alone cannot distinguish "unlucky"
+	// from "shares are going into a void".
+	SendFailures uint64 `json:"send_failures"`
+
 	Height     int64  `json:"height"`
 	Difficulty uint64 `json:"difficulty"`
 	NetHashes  uint64 `json:"net_hashrate"`
@@ -166,10 +172,12 @@ func (w *statsWriter) doc(s Snapshot, version string) statsDoc {
 		MiniBlocks: s.MiniBlocks,
 		Blocks:     s.Blocks,
 		Rejected:   s.Rejected,
-		Height:     s.Height,
-		Difficulty: s.Difficulty,
-		NetHashes:  s.NetHashes,
-		GPUTuning:  s.GPUTuning,
+
+		SendFailures: s.SendFailures,
+		Height:       s.Height,
+		Difficulty:   s.Difficulty,
+		NetHashes:    s.NetHashes,
+		GPUTuning:    s.GPUTuning,
 	}
 
 	gpu := 0

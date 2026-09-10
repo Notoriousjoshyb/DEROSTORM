@@ -94,10 +94,12 @@ extra arguments to override it, and it will honour `--gpu=off` and
 16 is the hard ceiling. Beyond that the extra cards are refused with a log line
 rather than counted and left idle, which is what 1.5.9 and earlier did.
 
-**Block count needs no tuning.** The suffix kernel plateaus at four resident
-blocks per SM and stays flat above it — measured 134,209 H/s at 336 blocks
-against 134,214 at 672 and 133,597 at 1,344 on a 5080. The default is already
-the plateau. `--gpu-blocks=N` is there if you want to pin it.
+**Block count tunes itself.** The suffix kernel plateaus at four resident
+blocks per SM and stays flat above it on a discrete card — measured 134,209 H/s
+at 336 blocks against 134,214 at 672 and 133,597 at 1,344 on a 5080. Integrated
+GPUs are another matter: an 8060S reads 11% faster at 80 blocks than at its
+180-block ceiling. So the miner sweeps while mining and pins the fastest
+setting; `--gpu-blocks=N` pins it from the start and skips the sweep.
 
 **What has not been measured, honestly.** Every Linux figure here was taken
 under WSL, which virtualises the GPU. Four runs on the same binary read

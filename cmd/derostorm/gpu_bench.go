@@ -4,9 +4,9 @@ package main
 //
 // It exists because the GPU's throughput depends on how many suffix blocks
 // are in its grid (see gpu_tune.go), and someone tuning a machine wants to see
-// that curve. Mining uses the runtime ceiling; this still sweeps, so a new kernel
-// can move the peak without anyone guessing. It also checks a kernel change
-// without connecting to a node.
+// that curve. Mining sweeps the same curve on its own; this sweeps it again on
+// demand, so a new kernel can move the peak without anyone guessing. It also
+// checks a kernel change without connecting to a node.
 //
 // Every batch is a real search against a real target, so this drives exactly
 // the path mining drives: the same three kernels, the same difficulty check, the
@@ -55,9 +55,10 @@ func runGPUBench(t *Theme, device int, batch int) float64 {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	// blocks=0 takes the runtime occupancy/VRAM ceiling, which is also what
-	// mining uses (see gpu_tune.go). The sweep below re-measures each
-	// candidate with Search so one setting's timing cannot blur into another's.
+	// blocks=0 takes the runtime occupancy/VRAM ceiling, which is also the top
+	// of the candidate list mining sweeps (see gpu_tune.go). The sweep below
+	// re-measures each candidate with Search so one setting's timing cannot
+	// blur into another's.
 	g, err := NewGPUContext(device, batch, 0)
 	if err != nil {
 		fmt.Printf("  %s\n\n", t.C(t.Err, err.Error()))
@@ -156,14 +157,14 @@ func runGPUBench(t *Theme, device int, batch int) float64 {
 	if best > 0 {
 		fmt.Printf("\n  %s\n", t.C(t.Accent+t.Bold,
 			fmt.Sprintf("best %s at %d blocks", humanRate(best), bestBlocks)))
-		if bestBlocks == g.MaxBlocks() {
-			fmt.Printf("  %s\n", t.C(t.Dim,
-				"the peak is at the runtime ceiling, which is already the mining default — no flag needed"))
-		} else {
-			fmt.Printf("  %s\n", t.C(t.Dim, fmt.Sprintf(
-				"pin it with --gpu-blocks=%d — mining otherwise uses the ceiling at %d blocks",
-				bestBlocks, g.MaxBlocks())))
-		}
+	if bestBlocks == g.MaxBlocks() {
+		fmt.Printf("  %s\n", t.C(t.Dim,
+			"the peak is at the runtime ceiling — mining's own sweep lands here too, no flag needed"))
+	} else {
+		fmt.Printf("  %s\n", t.C(t.Dim, fmt.Sprintf(
+			"pin it with --gpu-blocks=%d to skip the sweep — mining otherwise finds this itself within minutes",
+			bestBlocks)))
+	}
 	}
 	fmt.Println()
 	return best
