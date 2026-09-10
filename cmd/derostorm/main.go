@@ -68,7 +68,7 @@ Options:
                                   off. NVIDIA cards are numbered first, then
                                   AMD. Overrides the saved setting.
   --gpu-batch=<n>                 Nonces per GPU launch. Default: fill VRAM on
-                                  discrete cards, 8,192 on an APU (short batches
+                                  discrete cards, 4,096 on an APU (short batches
                                   waste far less work when a new job lands).
   --gpu-blocks=<n>                Grid blocks in the GPU suffix kernel.
                                   Default: measured while mining (fastest of a

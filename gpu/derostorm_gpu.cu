@@ -754,16 +754,16 @@ extern "C" DSG_API int dsg_init(int device, int batch, int blocks, dsg_context**
     // 32,768 batch runs ~1.9 s, so a job that lands just after a batch starts
     // wastes up to that long of GPU hashes on a dead job -- and holds the
     // memory bandwidth the CPU was about to need. Measured there (gfx1151,
-    // 32 CPU threads + this card at 80 blocks): 32768 a batch read ~48 KH/s
-    // combined; 8,192 read ~58 with the CPU total unchanged. An explicit
-    // --gpu-batch still wins.
+    // 32 CPU threads + this card at 80 blocks, cool starts): 32,768 read
+    // ~48 KH/s combined, 8,192 ~60-61, 2,048 ~58 -- 4,096 took it, reading
+    // ~61-63. An explicit --gpu-batch still wins.
     if (batch <= 0) {
         int fit = (int)(forChunk / perChunkHash);
         if (fit > DSG_BATCH_MAX) fit = DSG_BATCH_MAX;
         if (fit < DSG_BATCH) fit = DSG_BATCH;
 #if DSG_HIP
-        if (prop.integrated && fit > DSG_BATCH)
-            fit = DSG_BATCH;
+        if (prop.integrated && fit > DSG_BATCH / 2)
+            fit = DSG_BATCH / 2;
 #endif
         batch = fit;
     }
